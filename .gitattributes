@@ -1,0 +1,22 @@
+# 默认：文本一律存 LF，避免 Windows 上 core.autocrlf 把 sha256 校验骗过去
+* text=auto eol=lf
+
+# 事件日志是漫游的真相源，必须是逐行可合并的 LF 文本
+*.jsonl text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+
+# 二进制
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.zip  binary
+*.tar  binary
+*.gz   binary
+
+# 不参与语言统计 / diff 的第三方生成物
+package-lock.json linguist-generated=true

@@ -1,0 +1,45 @@
+# ── 依赖 ────────────────────────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+
+# ── 构建产物（一律不进仓库；发布走 npm 的 files 白名单）────────────────────
+lib/
+.test-build/
+*.tsbuildinfo
+preview/out/
+
+# ── 运行时数据（真机上由插件在 ~/.dsh 下写，兜底防误提交）──────────────────
+memory.db
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+journal/
+snapshots/
+
+# ── 本地 UI 预览的临时截图（正式截图在 docs/screenshots/）─────────────────
+preview/*.png
+preview/shot-*.png
+
+# ── 秘密与本地配置 ──────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ── 编辑器 / 系统 ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 日志与覆盖率 ────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+coverage/
+.nyc_output/

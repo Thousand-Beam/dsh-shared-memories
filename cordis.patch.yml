@@ -1,0 +1,96 @@
+# ============================================================================
+# dsh-shared-memories — bundle patch（宿主层）
+# ============================================================================
+# 这个文件只做一件事：把**宿主侧**插件挂进 profile 的层栈。
+# 客户端（Web 面板）不在这里，也不该在这里 —— 见文件末尾的说明。
+#
+# 安装：
+#   dsh plugin --profile desktop add link:D:/path/to/dsh-shared-memories
+# 然后把 "dsh-shared-memories" 加进 profile package.json 的 dsh.profile.bundles，
+# 因为"装了依赖"和"这一层被叠加"是两件事。
+#
+# 这里写的每一项都覆盖 src/config.ts 的 Schema 默认值。原则：只写"用户一眼就该改"
+# 的那几个；写多了等于把默认值复制一份到 YAML 里，将来两边必然漂移。
+# ============================================================================
+
+- insert:
+    - id: dsh-shared-memories
+      name: dsh-shared-memories
+      config:
+        # ── 仓库（真相源）──────────────────────────────────────────────────
+        # remote 留空 = 纯本地模式：快照只落在本机，一个字节都不出网。
+        # 想跨设备漫游再填 git 地址（SSH 或 https 均可）。
+        repo:
+          path: ~/.dsh/shared-memories
+          remote: ''
+          branch: main
+          # 留空则由宿主补齐；写死一个稳定值可以让同一台机器在重装后
+          # 仍然被识别成同一设备（journal 按 deviceId 分片，换 id 等于换一条时间线）。
+          deviceId: ''
+
+        # ── 同步节拍 ──────────────────────────────────────────────────────
+        sync:
+          # 定时快照间隔（秒）。UI 上可改，改完写回 sync_state。
+          intervalSec: 300
+          # 空闲防抖：交互停止 30s 才允许触发 idle 快照，避免边打字边存盘。
+          idleDebounceSec: 30
+          retries: 3
+          timeoutMs: 30000
+          pullStrategy: ff-only
+
+        # ── 快照池 ────────────────────────────────────────────────────────
+        snapshot:
+          # 滑动窗口：只保留最近 5 份，FIFO 清最老；被 Pin 的永不清理。
+          keep: 5
+          pinProtected: true
+          triggers:
+            interval: true
+            idle: true
+            shutdown: true
+            manual: true
+          # 单份快照上限 256 MiB，超过就拒绝写入而不是把仓库撑爆。
+          maxBytes: 268435456
+
+        # ── 冷启动恢复 ────────────────────────────────────────────────────
+        restore:
+          # 恢复完成前拒绝新对话（强一致性）。关掉它等于允许在脏状态上继续写。
+          blockUntilReady: true
+          timeoutMs: 30000
+          # 断网时：degraded-readonly（只读，绝不静默降级为可写）
+          #        / local-only（用本地库继续，之后补拉）
+          #        / block（直接不放行）
+          offlinePolicy: degraded-readonly
+
+        # ── 工作区隔离 ────────────────────────────────────────────────────
+        isolation:
+          # 严格模式：SQL 层强制注入 workspace_id，越界结果集直接抛 ScopeViolation。
+          strict: true
+          # 全局检索默认关闭；打开后仍需带 GlobalToken 并写审计日志。
+          allowGlobalSearch: false
+          globalSearchTtlMs: 600000
+
+        # ── 人格与底线 ────────────────────────────────────────────────────
+        persona:
+          startAge: 10
+          # 单次对话自然漂移的上限；越大越"性格不稳定"。
+          traitShiftMax: 0.05
+          # 规则升格必须用户确认（AI 不能自己把一条观察变成铁律）。
+          requireRuleConfirmation: true
+
+# ============================================================================
+# 客户端行在哪？
+# ============================================================================
+# 不在这个文件里。DSH 的 Web 端插件由包清单声明，而不是由 patch 插入：
+#
+#   "dsh": {
+#     "client": {
+#       "entry": "./lib/client.js",   ← 必须是带 __ModuleLoader__ 外壳的单文件
+#       "platform": "web",            ← 只有 web 平台才装载它（tui/headless 忽略）
+#       "immediately": true,          ← 不等用户点开，随宿主一起注册座位
+#       "inject": ["slots", "locale"] ← 客户端侧要用的服务名，不是包名
+#     }
+#   }
+#
+# 如果哪天真的需要在本文件里再插一条客户端节点，那一定是因为要**覆盖**某个
+# 客户端插件的座位顺序或配置——纯粹的"加载"从来不需要写在这里。
+# ============================================================================

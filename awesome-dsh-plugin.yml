@@ -1,0 +1,104 @@
+# ---------------------------------------------------------------------------
+# awesome-dsh-plugin 收录条目 · dsh-shared-memories
+# ---------------------------------------------------------------------------
+# 提交方式（二选一，按仓库当时的规范）：
+#   A. 直接把下面 `plugins:` 数组里的那一项追加到目标仓库的 `data/plugins.yaml`
+#   B. 若它要求「一个插件一个文件」，把该项单独存成 `plugins/dsh-shared-memories.yml`
+# 然后提 PR，标题：`feat(plugins): add dsh-shared-memories`
+#
+# 字段说明：
+#   - `repo` / `description` / `tags` / `author` 是各版本都认的最小集
+#   - `engines` / `install` / `screenshots` / `features` 为增强字段，多余的键
+#     一般会被忽略，不影响解析；若目标 schema 更严格，只留最小集即可
+#   - `tags` 必含：memory, git, state-roaming, multi-agent
+# ---------------------------------------------------------------------------
+
+schema: 1
+plugins:
+  - name: dsh-shared-memories
+    displayName: 共享记忆 · Shared Memories
+    author: YG
+    repo: https://github.com/YG/dsh-shared-memories
+    homepage: https://github.com/YG/dsh-shared-memories#readme
+    license: MIT
+    version: 0.1.0
+    status: beta
+
+    summary: >-
+      Git-native external brain and full-state roaming engine for DeepSeek
+      Harness — snapshot persona, memories and workspace sessions on shutdown,
+      restore them byte-for-byte on another machine at boot.
+
+    description: >-
+      把「性格 + 记忆 + 工作区会话」当成可版本化状态，用 Git 当传输层。
+      关机时打包快照、校验 sha256、提交、打 tag、按滑窗轮转并推送；换机开机时
+      pull → verify → replay → 重建人格，恢复完成前拒绝任何新对话。
+      真相源是 append-only JSONL 事件日志（SQLite 只是物化视图），多设备并发写入
+      按设备分片，合并退化成文件并集而非二进制冲突；任何一次整理错了都能 git revert。
+      记忆是时间树，只切分不覆盖；工作区隔离在 SQL 编译期强制；跨 Agent 检索需显式
+      令牌并留审计；外部内容默认低信任度，命中底线突破立即进隔离区。
+
+    engines:
+      dsh: ">=0.2.1-rc.3"
+      node: ">=22.5.0"
+
+    install:
+      npm: npm i dsh-shared-memories
+      config: cordis.patch.yml        # 插件自带，insert 一条即可
+      note: 纯本地模式无需任何 Git 远程；云端模式只需填 repo.remote
+
+    tags:
+      - memory
+      - git
+      - state-roaming
+      - multi-agent
+      - dsh-plugin
+      - snapshot
+      - temporal-tree
+      - persona
+
+    categories:
+      - memory
+      - storage
+
+    platforms:
+      - web
+
+    capabilities:
+      - 全状态漫游：人格 + 记忆 + 工作区会话，恢复完成前拒绝新对话
+      - 快照池滑窗（默认保留 5 个）· Pin 保护 · 一键回退
+      - 时间树记忆：valid_from / valid_until，历史只切分不覆盖
+      - 归档蒸馏 + 结构化情感归因（置信度 < 0.6 整条丢弃）
+      - 夜间整理：精确去重 · Jaccard ≥ 0.85 近似合并 · 低显著度降级
+      - 工作区强隔离在 SQL 编译期完成，跨 Agent 检索需令牌 + 审计
+      - 踩坑四段演进：现象 → 经验 → 模式 → 规则，升格需人工确认
+      - 记忆污染防御：低信任度准入 + 隔离区 + 放行即重新 openVersion
+      - 多端冲突解决：按设备分片的 append-only journal
+      - 记忆导入：JSON / Markdown / 自动识别
+
+    ui:
+      platform: web
+      slots:
+        - sidebar.panellist
+        - main
+      theme: 跟随宿主 --dsw-alias-* 令牌，深浅色自适应
+      assets: 原生 CSS 运行时注入，零 CDN、零外链字体
+      locale: zh-CN（界面枚举全套汉化）
+
+    screenshots:
+      - docs/screenshots/console-memory-dark.png
+      - docs/screenshots/console-memory-light.png
+      - docs/screenshots/console-snapshots-light.png
+      - docs/screenshots/console-rules-light.png
+
+    security:
+      sandbox: none           # 不提供沙箱，也不尝试突破宿主沙箱
+      credentials: keychain-ref   # 只存 credentialRef 引用名，不落盘明文
+      jailbreak: defensive-only   # 隔离区是防御机制，不提供越狱或注入增强
+      recommendation: 记忆含隐私数据，请使用私有仓库
+
+    notes: >-
+      Local-only mode works without any Git remote. Credentials are never stored
+      in config: `repo.credentialRef` is a keychain key name, not a secret.
+      Snapshot repos are forced to core.autocrlf=false so sha256 is not fooled by
+      CRLF drift.

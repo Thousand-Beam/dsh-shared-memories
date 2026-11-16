@@ -1,0 +1,20 @@
+{
+  "//": "仅用于把 src/client + preview 编成浏览器可直接 ESM 加载的 .js（预览用途，不进 npm 包）",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noUncheckedIndexedAccess": true,
+    "rootDir": "..",
+    "outDir": "out",
+    "declaration": false,
+    "sourceMap": true,
+    "noEmitOnError": false
+  },
+  "include": ["../src/client/**/*.ts", "../src/client/**/*.tsx", "../src/shared/**/*.ts", "main.tsx"]
+}

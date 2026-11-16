@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": ".test-build",
+    "declaration": true,
+    "declarationDir": ".test-build/types",
+    "noEmit": false,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  // src/client 走 tsconfig.client.json（JSX + DOM lib）。测试是 Node 环境，
+  // 把 .tsx 吃进来只会得到 `--jsx is not set` 和一堆 DOM 类型缺失的噪音。
+  "exclude": ["node_modules", "lib", ".test-build", "src/client"]
+}

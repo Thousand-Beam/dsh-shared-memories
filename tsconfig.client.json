@@ -1,0 +1,15 @@
+{
+  "//": "客户端构建。outDir 与 server 同为 lib，是为了让产物落在 lib/client/index.js —— 这个路径必须与 package.json 的 exports['./client'] 逐字一致，否则宿主解析不到客户端入口。",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib",
+    "declarationDir": "lib/types",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "noEmit": false
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/shared/**/*.ts"],
+  "exclude": ["lib", "node_modules", "test"]
+}
