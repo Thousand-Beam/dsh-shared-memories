@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-3da639.svg?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-339933.svg?style=flat-square)](https://nodejs.org)
 [![DSH](https://img.shields.io/badge/dsh-%E2%89%A50.2.1--rc.3-4c6ef5.svg?style=flat-square)](https://github.com/deepseek-ai)
-[![Tests](https://img.shields.io/badge/tests-69%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-77%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
 [![No CDN](https://img.shields.io/badge/frontend-%E9%9B%B6%E5%A4%96%E9%93%BE%E3%80%81%E9%9B%B6%20CDN-8957e5.svg?style=flat-square)](#控制台)
 
 <img src="docs/screenshots/console-memory-dark.png" alt="记忆控制台 · 深色" width="880">
@@ -335,6 +335,54 @@ npm run self-test   # 第 ⑤ 段：换 Agent 记得你，换工作区读不到�
 
 ---
 
+## 会话 id ≠ 人格 id：为什么"新建会话"会失忆
+
+这是 v0.2.2 修掉的最严重的一个 bug，值得单独写一节，因为它的根因在宿主里，不在插件里。
+
+DSH 的 agent 与 session 是同一个东西——宿主 `dsh-agent` 的 `enter()` 里有这么一句：
+
+```js
+const id = agent.id
+if (id !== agent.session.id) throw new Error('agent id "..." does not match session id "..."')
+```
+
+也就是说 **`agent.id === agent.session.id`**。你在界面上点一次「新建会话」，就是一个全新的 agent id。
+
+而人格、记忆、技能、隔离区、规则，全都按 `agent_id` 存。于是：
+
+| 现象 | 真实原因 |
+|---|---|
+| 新会话自称"小代码酱" | 新 agent id 在 `persona_state` 里没有行，`ensureAgentRow` 建了一行空人格 |
+| 记忆总览显示"这个 Agent 还没有任何记忆" | 新 id 在 `memory_entity` 里当然一条都没有 |
+| 顶部下拉却还写着「翟千瑶」 | 下拉框读的是另一行 `persona_state`（旧会话那行），列表读的是新 id |
+
+**不能**把记忆表改成按 `workspace_id` 存——那会毁掉多 Agent 隔离（一个工作区里本来就允许并存几个不同的人）。正确做法是加一层指针：
+
+```
+会话 id（会变）  ──persona_identity──▶  人格 id（稳定）
+   session-8cc2…                         lead / 翟千瑶
+```
+
+`persona_identity(agent_id PRIMARY KEY, workspace_id, persona_id, bound_at, last_seen_at)` 就是这张表。读侧只有一个入口 `resolvePersonaId(db, agentId)`：
+
+- `PromptAssembler` 组装提示前先 `resolve`，人格/技能/规则/画像全用解析后的人格 id 取数；
+- HTTP 的 `scopeOf()` 同样先解析，所以控制台点「翟千瑶」和模型看到的是同一份数据；
+- 写入侧 `agent/created` 走 `PersonaIdentityStore.touch()`：本工作区已有活跃人格时**继承**它，没有才自立门户。
+
+三个必须知道的细节：
+
+1. **继承有窗口**：`identity.inheritOnNewSession`（默认 `true`）+ `identity.inheritWindowMs`（默认 7 天）。关掉开关就是旧的「一会话一人格」行为。
+2. **不跨工作区继承**。A 项目的人格绝不会被 B 项目的新会话认领——这和记忆隔离是同一条底线。
+3. **绑定也要漫游**。绑定写 journal（`persona.bind`）+ `state/persona-identity.json`，换机器冷启动后回灌。不回灌的话，B 机上点新建会话又是白纸一张。
+
+老库升级不用手动操作：启动时 `backfillPersonaIdentities()` 会给每个工作区选一个锚点人格（记忆最多 → 有真名字 → 最早登记），把「没名字且没记忆」的历史空壳会话并到锚点上，有名字/有记忆的保持独立，只补指针、不搬业务数据。
+
+```bash
+npm run self-test   # 第 ⑥ 段：新建会话继承同一人格，且用解析后的 id 读得到旧记忆
+```
+
+---
+
 ## 安全边界
 
 写在 README 里，也写在代码里。
@@ -371,7 +419,7 @@ npm run self-test   # 第 ⑤ 段：换 Agent 记得你，换工作区读不到�
 npm run build        # tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/wrap-client.mjs
 npm run typecheck    # 两份 tsconfig 都 --noEmit
 npm test             # tsc -p tsconfig.test.json && node --test .test-build/test/**/*.spec.js
-npm run self-test    # 端到端自测：真 git 仓库 + 真 SQLite + 冷启动恢复，50 条断言
+npm run self-test    # 端到端自测：真 git 仓库 + 真 SQLite + 冷启动恢复，57 条断言
 npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ http://127.0.0.1:5199/
 ```
 
@@ -396,7 +444,7 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 
 最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
-- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），69 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、journal 合并、HTTP 路由、端到端漫游。
+- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），77 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。
 - 运行时缺 `node:sqlite` 时测试**跳过而非失败**——CI 该红在真 bug 上，不该红在 Node 版本上。
 - 发布流程（打 tag、推 GitHub、发 npm、提 awesome 收录）见 [docs/PUBLISH.md](docs/PUBLISH.md)。

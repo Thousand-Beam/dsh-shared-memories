@@ -214,6 +214,7 @@ async function main() {
     { SkillRegistry, readSkillBindings, countSkills },
     { UserProfileStore },
     { renderUserProfile },
+    { PersonaIdentityStore, resolvePersonaId },
   ] = await Promise.all([
     import('../lib/shared/journal.js'),
     import('../lib/host/storage/schema.js'),
@@ -227,6 +228,7 @@ async function main() {
     import('../lib/host/memory/skill-registry.js'),
     import('../lib/host/memory/user-profile.js'),
     import('../lib/host/prompt/sections.js'),
+    import('../lib/host/memory/persona-identity.js'),
   ])
 
   const db = await openDb(schema)
@@ -396,8 +398,40 @@ async function main() {
 
   const profilesInSnapshot = () => profiles.all()
 
-  /* ── ⑥ 快照 + 冷启动恢复 ───────────────────────────────────────────── */
-  step('⑥ 快照漫游：A 关机落盘 → 推到裸仓库 → B 冷启动恢复')
+  /* ── ⑥ 换会话不失忆 ─────────────────────────────────────────────────── */
+  step('⑥ 换会话不失忆：新会话继承同一人格，旧记忆照样搜得到')
+
+  const identity = new PersonaIdentityStore({ db, journal, clock: () => NOW })
+  // 宿主里 agent.id === session.id，所以每点一次"新建会话"就是一个新 id。
+  // 这里模拟用户第一次在会话里把人格命名成 "lead"（记忆都挂在它下面）。
+  await identity.bindTo('session-first', WORKSPACE, 'lead', 'user')
+  check(identity.resolve('session-first') === 'lead', '第一个会话绑到已命名的人格上', identity.resolve('session-first'))
+  const secondSession = await identity.touch('session-second', WORKSPACE)
+  check(
+    secondSession === 'lead',
+    '新建会话继承同一个人格（真机"改名后新会话变回小代码酱"的正面修复）',
+    secondSession,
+  )
+  check(
+    resolvePersonaId(db, 'session-second') === 'lead',
+    '落库路径同样解析到人格 id（不是只在界面上显示对）',
+  )
+  const hitsViaNewSession = new ScopedQuery(
+    db,
+    { workspaceId: WORKSPACE, agentId: resolvePersonaId(db, 'session-second'), deviceId: DEVICE_A },
+    { clock: () => NOW },
+  ).search({ text: 'AONLY', limit: 10 })
+  check(hitsViaNewSession.length === 3, '新会话用解析后的 id 读得到旧记忆', `实际 ${hitsViaNewSession.length}`)
+  const personaSummary = identity.personas(WORKSPACE)[0]
+  check(
+    identity.personas(WORKSPACE).length === 1 && personaSummary?.sessionCount === 2,
+    '两个会话合并成一个人格（下拉框不再一人一格）',
+    `${identity.personas(WORKSPACE).length} 个人格`,
+  )
+  const identitiesInSnapshot = () => identity.all()
+
+  /* ── ⑦ 快照 + 冷启动恢复 ───────────────────────────────────────────── */
+  step('⑦ 快照漫游：A 关机落盘 → 推到裸仓库 → B 冷启动恢复')
 
   const bare = await makeBareRemote()
   const engine = new SnapshotEngine({
@@ -427,6 +461,7 @@ async function main() {
         },
       ],
       userProfiles: profilesInSnapshot(),
+      personaIdentities: identitiesInSnapshot(),
     }),
   })
 
@@ -514,6 +549,18 @@ async function main() {
   check(
     snapshot.manifest.files.some((file) => file.path === 'state/user-profile.json'),
     '快照里有 state/user-profile.json（画像按工作区存，不属于任何 Agent）',
+  )
+
+  // 身份绑定：换机器后"新会话仍继承同一人格"这条也必须成立，
+  // 否则 B 机上点新建会话，人格又变回一张白纸。
+  check(
+    snapshot.manifest.files.some((file) => file.path === 'state/persona-identity.json'),
+    '快照里有 state/persona-identity.json（会话 → 人格的映射也跟着走）',
+  )
+  check(
+    resolvePersonaId(dbB, 'session-second') === 'lead',
+    'B 机上新建会话同样继承到原名人格',
+    resolvePersonaId(dbB, 'session-second'),
   )
 
   // 篡改检测：改一个字节，恢复必须降级成只读，而不是"带病 ready"。

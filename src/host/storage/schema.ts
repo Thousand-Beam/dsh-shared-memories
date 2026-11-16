@@ -17,7 +17,7 @@ import type { SqlDriver } from '../../shared/types.js'
  * v2 → v3：`agent_skill`（技能挂载关系随 (workspace, agent) 隔离，并跟着快照漫游）。
  * 因为 v1 从未发布，这里用"建表时就带列 + 老库补一列"的双保险写法。
  */
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 
 /**
  * 全量 DDL。全部 `IF NOT EXISTS`，可以在任何状态下重复执行。
@@ -186,6 +186,31 @@ CREATE TABLE IF NOT EXISTS user_profile (
   updated_by        TEXT NOT NULL DEFAULT 'user'
 );
 
+-- 会话身份 → 人格身份 的映射：**换会话不等于换人**。
+--
+-- 为什么必须有这张表：
+--   宿主的 Agent id 就是 Session id（agent.id === agent.session.id），所以每点一次
+--   「新建会话」，agent/created 就会给一个全新的 id。而人格与记忆是按 agent_id 存的，
+--   于是新会话一开口就是"我是谁？我没有记忆"——用户看到的是"换个会话人格就丢了"。
+--
+-- 设计：
+--   agent_id   本次会话的 id（一次性、会一直变）
+--   persona_id 稳定人格 id（= 这个工作区里**第一个**登记的那个会话 id，之后所有人沿用它）
+--   绑定是幂等的：同一个会话重复 bind 不会产生第二行；换会话则新增一行指向同一个人格。
+--   读取侧统一走 resolve(agentId)，拿不到映射就退回 agent_id 本身（老库无需迁移数据）。
+--
+-- 为什么不直接把记忆表的 agent_id 改写成 persona_id：
+--   那是一次不可逆的数据搬迁，且一旦判错就永久串台。绑定表是"加一层指针"，
+--   指针错了删一行就能修正，原始数据一行不动。
+CREATE TABLE IF NOT EXISTS persona_identity (
+  agent_id     TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  persona_id   TEXT NOT NULL,
+  bound_at     INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_persona_identity_scope ON persona_identity(workspace_id, persona_id);
+
 -- 审计：全局检索、记忆修正、隔离区操作都必须留痕
 CREATE TABLE IF NOT EXISTS audit_log (
   audit_id       TEXT PRIMARY KEY,
@@ -250,6 +275,10 @@ export function migrate(db: SqlDriver, target = SCHEMA_VERSION): { from: number;
     // v3 → v4：user_profile 表同样是纯新增，无数据搬迁。
     // 老库第一次启动时它是空的 —— 空画像会走"别猜名字，直接问"的兜底提示，
     // 而不是退回"从仓库署名里猜个人名"的老路。
+  }
+  if (from > 0 && from < 5) {
+    // v4 → v5：persona_identity 表纯新增。老库没有映射，读取侧 resolve() 会
+    // 退回 agent_id 本身 —— 即"行为与升级前完全一致"，等下一次 agent/created 再建绑定。
   }
   try {
     db.exec(`PRAGMA user_version = ${target}`)

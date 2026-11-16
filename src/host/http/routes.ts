@@ -28,6 +28,7 @@ import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeSkillId, normalizeSkillVersion } from '../../shared/skills.js'
 import { SkillRegistry, countSkills, readSkillBindings } from '../memory/skill-registry.js'
 import { UserProfileStore } from '../memory/user-profile.js'
+import { PersonaIdentityStore, resolvePersonaId } from '../memory/persona-identity.js'
 import { profileAddress, type UserProfile } from '../../shared/user-profile.js'
 // 值导入：错误映射要靠 instanceof。域错误一旦漏成 500，前端就分不清
 // "你参数错了"和"插件炸了"——这两种情况在 UI 上必须长得不一样。
@@ -51,6 +52,7 @@ import type {
   SkillBindingDto,
   SkillsBundle,
   UserProfileDto,
+  IdentityBundle,
 } from '../../shared/console-api.js'
 
 /** webServer 服务的最小面（真实实现由宿主提供）。 */
@@ -108,6 +110,13 @@ export interface MemoriesApiDeps {
    * 画像才能在不打快照的情况下也随 journal 漫游。
    */
   userProfile?(): UserProfileStore | undefined
+  /**
+   * 会话 → 人格 绑定表（带 journal 的那一个）。
+   *
+   * 控制台用它做两件事：①把下拉框里的"人格"和底层 agent_id 对齐（换会话不换人）；
+   * ②显示"这个 Agent 由几个会话共用"——这是验证继承是否真的在工作的唯一可见证据。
+   */
+  identity?(): PersonaIdentityStore | undefined
 }
 
 export const API_PREFIX = '/dsh/shared-memories'
@@ -173,6 +182,14 @@ async function dispatch(
       const body = await readJson(req)
       deps.barrier.assertWritable('user-profile-edit')
       return sendJson(res, 200, ok(await writeUserProfile(deps, body)))
+    }
+    if (method === 'GET' && path === '/identity') {
+      return sendJson(res, 200, ok(readIdentities(deps)))
+    }
+    if (method === 'POST' && path === '/identity') {
+      const body = await readJson(req)
+      deps.barrier.assertWritable('identity-edit')
+      return sendJson(res, 200, ok(await writeIdentity(deps, body)))
     }
     if (method === 'GET' && path === '/rules') {
       return sendJson(res, 200, ok(readRules(deps, url)))
@@ -316,20 +333,42 @@ export function listAgents(deps: MemoriesApiDeps): AgentSummary[] {
       name: string
       age: number
       traits: string
+      memory_count: number
     }>(
-      `SELECT agent_id, workspace_id, name, age, traits FROM persona_state
-        WHERE workspace_id = ? ORDER BY agent_id`,
+      // 排序：记忆多的排前面。控制台默认选第一个，所以要选"真的在用的那个人格"，
+      // 而不是按 id 字典序第一个（旧实现会让某个空壳会话抢走默认选中）。
+      `SELECT p.agent_id, p.workspace_id, p.name, p.age, p.traits,
+              (SELECT COUNT(*) FROM memory_entity e
+                WHERE e.workspace_id = p.workspace_id AND e.agent_id = p.agent_id) AS memory_count
+         FROM persona_state p
+        WHERE p.workspace_id = ?
+        ORDER BY memory_count DESC, p.agent_id`,
       [deps.workspaceId],
     )
-    return rows.map((row) => ({
+    const identities = deps.identity?.()
+    // 过滤掉"历史遗留的空壳会话行"：既没名字、又没记忆、也不是任何绑定的人格。
+    // 不过滤的话，下拉框里会一直挂着一串 uuid（真机反馈的原话是"满屏幕的代号"）。
+    const personaIds = new Set((identities?.all() ?? []).map((identity) => identity.personaId))
+    return rows
+      .filter((row) => {
+        const memoryCount = Number(row.memory_count ?? 0)
+        const named = row.name.trim() !== ''
+        if (named || memoryCount > 0) return true
+        return personaIds.size === 0 ? true : personaIds.has(row.agent_id)
+      })
+      .map((row) => ({
       agentId: row.agent_id,
       workspaceId: row.workspace_id,
-      name: row.name || row.agent_id,
+      // 名字缺省时不要回退成 agent_id：那是一串 session uuid，用户看不懂。
+      name: row.name || '',
       age: row.age,
       traits: parseTraits(row.traits),
       // 只要数量，不要清单：总览页要显示"挂了几个技能"，但跨 Agent 的清单本身
       // 就是信息泄漏（能看到别人装了什么），所以这里不给。
       skillCount: countSkills(db, { workspaceId: row.workspace_id, agentId: row.agent_id }),
+      memoryCount: Number(row.memory_count ?? 0),
+      // 这个人格底下挂了几个会话（≥2 说明"换会话会继承"正在工作）。
+      sessionCount: identities ? Math.max(1, identities.sessionsOf(row.agent_id).length) : 1,
     }))
   } catch {
     return []
@@ -738,9 +777,18 @@ function parseTraits(raw: string): Record<string, number> {
   }
 }
 
-/** 控制台里所有写请求的作用域：workspace 恒定，agent 由调用方指定。 */
+/**
+ * 控制台里所有写请求的作用域：workspace 恒定，agent 由调用方指定。
+ *
+ * 这里必须过一次 `resolvePersonaId`：界面上传下来的是**人格 id**（下拉框里那份），
+ * 但历史数据也可能是某个具体会话 id。解析是幂等的——人格 id 解析回自己。
+ * 少了这一步，前端换会话后传新 id，后端就查不到旧记忆（真机表现："列表 0 条"）。
+ */
 function scopeOf(deps: MemoriesApiDeps, agentId: string): Scope {
-  return { workspaceId: deps.workspaceId, agentId: agentId || 'default', deviceId: deps.deviceId }
+  const raw = agentId || 'default'
+  const db = deps.db()
+  const resolved = db ? resolvePersonaId(db, raw) : raw
+  return { workspaceId: deps.workspaceId, agentId: resolved, deviceId: deps.deviceId }
 }
 
 
@@ -756,8 +804,64 @@ function scopeOf(deps: MemoriesApiDeps, agentId: string): Scope {
  * "preferredAddress 优先、否则 displayName"的规则，两处实现迟早会不一致，
  * 而不一致的后果是"提示里叫老张、界面上叫张三"。
  */
-function readUserProfile(deps: MemoriesApiDeps): UserProfileDto {
-  const store = deps.userProfile?.() ?? (deps.db() ? new UserProfileStore({ db: deps.db() as SqlDriver }) : undefined)
+/**
+ * 身份绑定总览：哪个人格下面挂了哪些会话。
+ *
+ * 这是"换会话会不会继承"唯一能被看见的证据——界面不做这层展示，
+ * 用户就只能靠"它还记得我吗"这种体感去猜。
+ */
+function readIdentities(deps: MemoriesApiDeps): IdentityBundle {
+  const db = deps.db()
+  const empty: IdentityBundle = { workspaceId: deps.workspaceId, personas: [], sessions: [] }
+  if (!db) return empty
+  const store = deps.identity?.() ?? new PersonaIdentityStore({ db })
+  try {
+    return {
+      workspaceId: deps.workspaceId,
+      personas: store.personas(deps.workspaceId).map((persona) => ({
+        personaId: persona.personaId,
+        sessionCount: persona.sessionCount,
+        lastSeenAt: persona.lastSeenAt,
+      })),
+      sessions: store
+        .all()
+        .filter((identity) => identity.workspaceId === deps.workspaceId)
+        .map((identity) => ({
+          agentId: identity.agentId,
+          personaId: identity.personaId,
+          boundAt: identity.boundAt,
+          lastSeenAt: identity.lastSeenAt,
+        })),
+    }
+  } catch {
+    return empty
+  }
+}
+
+/**
+ * 改绑一个会话。
+ *
+ * - `bind`：把这个会话挂到指定人格下（"它不是新人，接着上一个人格继续"）；
+ * - `split`：反过来，让它成为独立人格（用户明确想并行两个不同人设时用）。
+ *
+ * 两个动作都写 journal：绑定关系本身也是一种需要漫游的状态。
+ */
+async function writeIdentity(deps: MemoriesApiDeps, body: Record<string, unknown>): Promise<IdentityBundle> {
+  const db = deps.db()
+  if (!db) throw new ApiError('db-unavailable', '记忆库尚未就绪', 503)
+  const store = deps.identity?.() ?? new PersonaIdentityStore({ db })
+  const agentId = reqStr(body, 'agentId')
+  const action = str(body.action) ?? 'bind'
+  if (action === 'split') {
+    await store.bindTo(agentId, deps.workspaceId, agentId, 'user')
+  } else {
+    const personaId = str(body.personaId) || store.resolve(agentId)
+    await store.bindTo(agentId, deps.workspaceId, personaId, 'user')
+  }
+  return readIdentities(deps)
+}
+
+function readUserProfile(deps: MemoriesApiDeps): UserProfileDto {  const store = deps.userProfile?.() ?? (deps.db() ? new UserProfileStore({ db: deps.db() as SqlDriver }) : undefined)
   if (!store) {
     return { workspaceId: deps.workspaceId, displayName: '', preferredAddress: '', address: '', notes: '', updatedAt: 0, updatedBy: '' }
   }

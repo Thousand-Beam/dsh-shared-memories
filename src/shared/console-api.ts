@@ -17,6 +17,32 @@ export interface AgentSummary {
   traits: Record<string, number>
   /** 当前工作区下这个 Agent 挂载的技能数（0 表示没挂，undefined 表示老版本宿主没算）。 */
   skillCount?: number
+  /** 这个 Agent 名下的活跃记忆条数（用于排序：默认选中"真的在用"的那个人格）。 */
+  memoryCount?: number
+  /** 这个 Agent 由几个会话共用（≥2 = 换会话会继承，1 = 就一个会话）。 */
+  sessionCount?: number
+}
+
+/** 一条会话 → 人格 的绑定（控制台"这个 Agent 由几个会话共用"的依据）。 */
+export interface SessionAliasDto {
+  agentId: string
+  personaId: string
+  boundAt: number
+  lastSeenAt: number
+}
+
+/** 一个人格 + 它名下的会话数。 */
+export interface PersonaSummaryDto {
+  personaId: string
+  sessionCount: number
+  lastSeenAt: number
+}
+
+/** 身份绑定总览。 */
+export interface IdentityBundle {
+  workspaceId: string
+  personas: PersonaSummaryDto[]
+  sessions: SessionAliasDto[]
 }
 
 /**

@@ -21,6 +21,7 @@ import { join } from 'node:path'
 import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeBindings } from '../../shared/skills.js'
 import type { UserProfile } from '../../shared/user-profile.js'
+import type { PersonaIdentity } from '../../shared/persona-identity.js'
 import {
   assertGitOk,
   backoffDelay,
@@ -72,6 +73,13 @@ export interface SnapshotState {
    * 比丢一条记忆更伤信任。
    */
   readonly userProfiles?: readonly UserProfile[]
+  /**
+   * 会话 → 人格 绑定：落到 `state/persona-identity.json`。
+   *
+   * 少了它，"人格漫游"只成功一半：设备 B 恢复了人物数据，但 B 上开的新会话
+   * 没有任何绑定记录，于是又退回"新会话 = 新人格 = 空记忆"。
+   */
+  readonly personaIdentities?: readonly PersonaIdentity[]
   /** 额外需要纳入快照的仓库相对路径（如自建的 markdown 笔记）。 */
   readonly extraFiles?: readonly string[]
 }
@@ -471,7 +479,40 @@ export class SnapshotEngine {
     )
     await this.#writeSkillState(stateDir, state)
     await this.#writeUserProfileState(stateDir, state)
+    await this.#writeIdentityState(stateDir, state)
     return state
+  }
+
+  /**
+   * 会话 → 人格 绑定落盘。
+   *
+   * 和画像、技能同一个理由：恢复端要能区分"这版快照不记绑定"与"绑定是空的"。
+   * 没这个文件时恢复端一条都不动（老快照不许把本机的继承关系清空）。
+   */
+  async #writeIdentityState(stateDir: string, state: SnapshotState): Promise<void> {
+    const identities = [...(state.personaIdentities ?? [])]
+      .sort((a, b) => (a.workspaceId === b.workspaceId ? a.boundAt - b.boundAt : a.workspaceId.localeCompare(b.workspaceId)))
+      .map((identity) => ({
+        agentId: identity.agentId,
+        workspaceId: identity.workspaceId,
+        personaId: identity.personaId,
+        boundAt: identity.boundAt,
+        lastSeenAt: identity.lastSeenAt,
+      }))
+    await writeFile(
+      join(stateDir, 'persona-identity.json'),
+      `${JSON.stringify(
+        {
+          version: 1,
+          device: this.#deviceId,
+          capturedAt: Date.now(),
+          identities,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    )
   }
 
   /**

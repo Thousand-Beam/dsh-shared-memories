@@ -21,7 +21,7 @@ plugins:
     repo: https://github.com/Thousand-Beam/dsh-shared-memories
     homepage: https://github.com/Thousand-Beam/dsh-shared-memories#readme
     license: MIT
-    version: 0.2.1
+    version: 0.2.2
     status: beta
 
     summary: >-

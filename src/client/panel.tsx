@@ -490,7 +490,8 @@ function QuarantineView(): ReactNode {
 function UserProfileCard(): ReactNode {
   const store = useStore()
   const [profile, setProfile] = useState<UserProfileDto | null>(null)
-  const [name, setName] = useState('')
+  // 界面上只有一个输入框：个人助手的场景里区分「真名」和「昵称」是多余的。
+  // 保存时同时写 display_name 与 preferred_address，读取侧仍按"称呼优先"取值。
   const [address, setAddress] = useState('')
   const [notes, setNotes] = useState('')
   const [busy, setBusy] = useState(false)
@@ -503,8 +504,8 @@ function UserProfileCard(): ReactNode {
       .then((loaded) => {
         if (!alive) return
         setProfile(loaded)
-        setName(loaded.displayName)
-        setAddress(loaded.preferredAddress)
+        // 老数据里两个字段可能不同：以 address（preferredAddress 优先）为准回填。
+        setAddress(loaded.address)
         setNotes(loaded.notes)
       })
       .catch(() => {
@@ -518,12 +519,17 @@ function UserProfileCard(): ReactNode {
   const save = async (): Promise<void> => {
     setBusy(true)
     try {
-      const saved = await api.saveUserProfile({ displayName: name, preferredAddress: address, notes })
+      // 一个输入框，两个字段：主机侧也会做互补，这里显式写全，
+      // 让"只传了一个"的旧客户端同样能存出完整画像。
+      const saved = await api.saveUserProfile({
+        displayName: address,
+        preferredAddress: address,
+        notes,
+      })
       setProfile(saved)
-      setName(saved.displayName)
-      setAddress(saved.preferredAddress)
+      setAddress(saved.address)
       setNotes(saved.notes)
-      store.toast('ok', saved.displayName === '' ? '画像已清空' : `已记住：${saved.address}`)
+      store.toast('ok', saved.address === '' ? '画像已清空' : `已记住：${saved.address}`)
     } catch (cause) {
       store.toast('error', cause instanceof Error ? cause.message : '保存失败')
     } finally {
@@ -531,7 +537,7 @@ function UserProfileCard(): ReactNode {
     }
   }
 
-  const empty = profile !== null && profile.displayName === '' && profile.preferredAddress === '' && profile.notes === ''
+  const empty = profile !== null && profile.address === '' && profile.notes === ''
 
   return (
     <div className='dsm-card dsm-card--flat'>
@@ -551,26 +557,17 @@ function UserProfileCard(): ReactNode {
       ) : (
         <>
           <div className='dsm-form-grid' style={{ marginTop: 10 }}>
-            <div className='dsm-field'>
-              <span className='dsm-caption'>名字</span>
-              <input
-                className='dsm-input'
-                value={name}
-                placeholder='比如 张三'
-                onChange={(event) => setName(event.target.value)}
-              />
-            </div>
-            <div className='dsm-field'>
-              <span className='dsm-caption'>希望怎么称呼</span>
+            <div className='dsm-field' style={{ gridColumn: '1 / -1' }}>
+              <span className='dsm-caption'>怎么称呼我</span>
               <input
                 className='dsm-input'
                 value={address}
-                placeholder='比如 老张（留空就用名字）'
+                placeholder='比如 吃白饭的用户'
                 onChange={(event) => setAddress(event.target.value)}
               />
             </div>
             <div className='dsm-field' style={{ gridColumn: '1 / -1' }}>
-              <span className='dsm-caption'>偏好备注（单行，会被折进提示）</span>
+              <span className='dsm-caption'>全局偏好备注（单行，会被折进提示）</span>
               <input
                 className='dsm-input'
                 value={notes}
@@ -631,6 +628,12 @@ function OverviewView(): ReactNode {
                   </span>
                   <span className='dsm-caption dsm-mono'>#{shortCode(agent.agentId)}</span>
                   {agent.agentId === state.activeAgentId ? <Tag tone='accent'>当前</Tag> : null}
+                  {/* 会话数 > 1 说明这个"人"已经被好几个会话共用：这是修好失忆的可见证据。 */}
+                  {typeof agent.sessionCount === 'number' && agent.sessionCount > 1 ? (
+                    <Tag tone='outline' title={`${agent.sessionCount} 个会话共用这一份人格与记忆`}>
+                      {agent.sessionCount} 个会话
+                    </Tag>
+                  ) : null}
                   {/* 只显示数量：技能清单跨 Agent 不给看，但"他挂了几个"是排障必需。 */}
                   {typeof agent.skillCount === 'number' && agent.skillCount > 0 ? (
                     <Tag tone='ok' title='当前工作区下已启用的技能数'>

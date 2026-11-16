@@ -28,6 +28,8 @@ import type { SkillBinding } from './shared/skills.js'
 import { normalizeBindings } from './shared/skills.js'
 import { profileAddress, type UserProfile } from './shared/user-profile.js'
 import { UserProfileStore } from './host/memory/user-profile.js'
+import { PersonaIdentityStore, backfillPersonaIdentities } from './host/memory/persona-identity.js'
+import type { PersonaIdentity } from './shared/persona-identity.js'
 import { readSkillBindings } from './host/memory/skill-registry.js'
 import { SkillRegistry } from './host/memory/skill-registry.js'
 import { TemporalTree } from './host/memory/timetree.js'
@@ -130,6 +132,13 @@ interface Runtime {
    */
   userProfile?: UserProfileStore
   /**
+   * 会话身份 → 人格身份 的绑定表（带 journal）。
+   *
+   * 宿主里 `agent.id === agent.session.id`：新建会话就是一个新 agent id。
+   * 没有这一层，新会话既读不到旧人格也读不到旧记忆（真机表现："换个会话人格就丢了"）。
+   */
+  identity?: PersonaIdentityStore
+  /**
    * 当前进程里活着的 agent 与会话。
    *
    * 为什么不能只靠 persona_state：`agent/created` 到第一次写记忆之间有一段空窗，
@@ -219,6 +228,14 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       const db = await openSqliteDriver(join(root, 'memory.db'))
       runtime.db = db
       migrate(db, SCHEMA_VERSION)
+      // 老库没有绑定：升级后第一件事是把"人"和"会话"对上号，
+      // 否则用户装完新版本再点新会话，看到的还是"人格丢了"（等于没修）。
+      try {
+        const adopted = backfillPersonaIdentities(db)
+        if (adopted > 0) warn(`身份回填：${adopted} 条会话 → 人格绑定`)
+      } catch (cause) {
+        warn(`身份回填失败（不影响对话）：${cause instanceof Error ? cause.message : String(cause)}`)
+      }
 
       const journal = new Journal({ root, deviceId, onWarn: warn })
       await journal.open()
@@ -249,7 +266,11 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         authorName: config.repo.authorName,
         authorEmail: config.repo.authorEmail,
         onWarn: warn,
-        collectState: () => ({ agents: collectAgents(runtime), userProfiles: collectProfiles(runtime) }),
+        collectState: () => ({
+          agents: collectAgents(runtime),
+          userProfiles: collectProfiles(runtime),
+          personaIdentities: collectIdentities(runtime),
+        }),
       })
 
       runtime.restore = new RestoreEngine({
@@ -284,6 +305,14 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       // 这样"没来得及打快照就换机"也不会丢技能。
       runtime.skills = new SkillRegistry({ db, journal, clock: () => Date.now(), onWarn: warn })
     runtime.userProfile = new UserProfileStore({ db, journal, clock: () => Date.now(), onWarn: warn })
+  runtime.identity = new PersonaIdentityStore({
+    db,
+    journal,
+    clock: () => Date.now(),
+    onWarn: warn,
+    inheritOnNewSession: config.identity.inheritOnNewSession,
+    inheritWindowMs: config.identity.inheritWindowMs,
+  })
 
       const outcome = await runtime.restore.restoreOnBoot()
       runtime.booted = true
@@ -355,6 +384,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       pitfalls: () => runtime.pitfalls,
       skills: () => runtime.skills,
     userProfile: () => runtime.userProfile,
+    identity: () => runtime.identity,
       importMemories: async (input) => {
         if (!runtime.importer) throw new Error('记忆库尚未就绪')
         const report = await runtime.importer.import({
@@ -392,7 +422,18 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     // ③-1 冷启动闸门：serial 事件，await 之后宿主才放行排队中的输入。
     disposers.push(
       host.on('agent/created', async (...args: unknown[]) => {
-        const agentId = readAgentId(args[0])
+        // 宿主里 `agent.id === agent.session.id`：这里的 id 是**会话** id，会随"新建会话"变。
+        // 先把它解析成稳定人格 id，后面的登记/提示词/快照都只认人格 id——
+        // 否则新会话既读不到旧人格也读不到旧记忆（真机事故："换个会话人格就丢了"）。
+        const sessionAgentId = readAgentId(args[0])
+        const agentId = sessionAgentId
+          ? await resolveIdentity(runtime, sessionAgentId, workspaceId)
+          : ''
+        if (sessionAgentId && agentId !== sessionAgentId) {
+          host.logger?.info?.(
+            `[shared-memories] 会话 ${sessionAgentId} 继承人格 ${agentId}`,
+          )
+        }
         // 先登记"这个 Agent 活着"再等闸门：persona_state 里此时可能还没有它
         //（还没写过任何记忆），但快照必须带上，否则换台机器就少一个人。
         trackPresence(runtime, agentId, readSessionId(args[0]))
@@ -429,7 +470,10 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         name: 'shared-memories:persona-and-rules',
         order: 5,
         text: (context: unknown) => {
-          const agentId = readAgentId(context) || 'default'
+          // 这里拿到的是**会话** id：必须先解析成人格 id，否则新建会话读到的
+          // 永远是空缓存（缓存按人格 id 建），表现就是"新会话没有人格"。
+          const raw = readAgentId(context) || 'default'
+          const agentId = runtime.identity?.resolve(raw) ?? raw
           return runtime.promptCache.get(agentId) ?? ''
         },
       }),
@@ -508,6 +552,22 @@ function trackPresence(runtime: Runtime, agentId: string, sessionId: string): vo
 }
 
 /**
+ * 把会话 id 解析成稳定人格 id，并在首次见到这个会话时建绑定。
+ *
+ * 失败时退回会话 id 本身：绑定是"增强"，不是"前置条件"——数据库半迁移、
+ * 表还没建好时，也必须让对话照常进行，只是这一轮不继承。
+ */
+async function resolveIdentity(runtime: Runtime, agentId: string, workspaceId: string): Promise<string> {
+  if (!agentId) return agentId
+  try {
+    if (!runtime.identity) return agentId
+    return await runtime.identity.touch(agentId, workspaceId)
+  } catch {
+    return agentId
+  }
+}
+
+/**
  * 让 `agent/created` 的 Agent 立刻出现在 persona_state 里。
  *
  * 只插不改：`ON CONFLICT DO NOTHING`——已有的人格（用户改过的名字/年龄/特质）
@@ -520,7 +580,7 @@ function ensureAgentRow(runtime: Runtime, agentId: string, workspaceId: string):
       `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
        VALUES (?,?,?,?,?,?,?)
        ON CONFLICT(agent_id, workspace_id) DO NOTHING`,
-      [agentId, workspaceId, agentId, 10, '{}', '', Date.now()],
+      [agentId, workspaceId, '', 10, '{}', '', Date.now()],
     )
   } catch {
     /* 人格表还没迁移完：下一轮 agent/created 再补，不阻塞启动 */
@@ -645,10 +705,12 @@ async function refreshPrompt(runtime: Runtime, config: SharedConfig): Promise<vo
     if (address !== '') {
       lines.push(`- 你的用户：${address}（称呼就用这个，不要改写成别的人名）`)
     } else {
-      lines.push('- 你的用户：名字尚未记录。不要从仓库署名、提交记录或设备名里猜，需要时直接问。')
+      lines.push(
+        '- 你的用户：名字尚未记录。不要从仓库署名、提交记录、设备名、工作区路径或别处出现过的名字里猜，需要时直接问。',
+      )
     }
     lines.push(
-      `- 当前智能体：${persona?.name || agentId}`,
+      `- 当前智能体：${displayName(persona?.name) || '（还没起名）'}`,
     )
     lines.push(`- 工作区：${runtime.workspaceId}`)
     lines.push(`- 底线：${config.persona.baselineNotice}`)
@@ -681,6 +743,21 @@ function safeProfile(runtime: Runtime, workspaceId: string): UserProfile | undef
   }
 }
 
+/**
+ * 会话 → 人格 绑定关系快照采集。
+ *
+ * 不带上它，"人格漫游"只成功一半：设备 B 恢复出了人格数据，但新会话 id 在
+ * B 上没有任何绑定记录，于是又变成"新会话 = 新人格 = 空记忆"。绑定必须一起走。
+ */
+function collectIdentities(runtime: Runtime): PersonaIdentity[] {
+  if (!runtime.db) return []
+  try {
+    return new PersonaIdentityStore({ db: runtime.db }).all()
+  } catch {
+    return []
+  }
+}
+
 function safeHits(query: ScopedQuery, options: Parameters<ScopedQuery['search']>[0]): MemoryHit[] {
   try {
     return query.search(options)
@@ -689,8 +766,21 @@ function safeHits(query: ScopedQuery, options: Parameters<ScopedQuery['search']>
   }
 }
 
-function compact(text: string, limit: number): string {
-  const oneLine = text.replace(/\s+/g, ' ').trim()
+/**
+ * 洗人格名字。
+ *
+ * `agent/created` 会自动登记一行人格，那时名字只能填 agent id（= 会话 uuid）。
+ * 把 uuid 原样写进提示，"当前智能体"就会变成一串 session id，模型还可能把它当名字念。
+ * 所以这里统一把"看起来像会话 id"的名字视为未起名。
+ */
+function displayName(name: string | undefined): string {
+  const value = (name ?? '').trim()
+  if (value === '') return ''
+  const looksLikeId = /^session[-_:]/i.test(value) || /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(value)
+  return looksLikeId ? '' : value
+}
+
+function compact(text: string, limit: number): string {  const oneLine = text.replace(/\s+/g, ' ').trim()
   return oneLine.length <= limit ? oneLine : `${oneLine.slice(0, limit - 1)}…`
 }
 

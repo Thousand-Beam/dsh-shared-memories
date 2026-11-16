@@ -49,8 +49,8 @@ let phase: RestorePhase = initialPhase
 let degradedReason = 'snapshot-corrupt：快照 sha256 与本地文件不一致，写入已被拦截'
 
 const agents: ConsoleBootstrap['agents'] = [
-  { agentId: 'lead', workspaceId: WORKSPACE, name: '大肥鱼', age: 11, traits: { curiosity: 0.82, warmth: 0.74 }, skillCount: 2 },
-  { agentId: 'coder', workspaceId: WORKSPACE, name: '小狐狸', age: 9, traits: { rigor: 0.9, patience: 0.42 }, skillCount: 1 },
+  { agentId: 'lead', workspaceId: WORKSPACE, name: '大肥鱼', age: 11, traits: { curiosity: 0.82, warmth: 0.74 }, skillCount: 2, sessionCount: 3, memoryCount: 5 },
+  { agentId: 'coder', workspaceId: WORKSPACE, name: '小狐狸', age: 9, traits: { rigor: 0.9, patience: 0.42 }, skillCount: 1, sessionCount: 1, memoryCount: 2 },
   {
     agentId: 'session-8cc26eb7-a58c-4921-998e-a55187dfca93',
     workspaceId: 'ws-3f7a91c2-8b21-4d3e-9a55-1c2d3e4f5a6b',
@@ -396,11 +396,14 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Res
   if (path === '/user-profile') {
     if (method === 'POST') {
       const body = safeBody(init)
+      // 与宿主侧 normalizeProfileInput 一致：只传一个时另一侧自动取相同值。
+      const displayName = String(body.displayName ?? body.preferredAddress ?? '')
+      const preferredAddress = String(body.preferredAddress ?? body.displayName ?? '')
       userProfile = {
         workspaceId: WORKSPACE,
-        displayName: String(body.displayName ?? ''),
-        preferredAddress: String(body.preferredAddress ?? ''),
-        address: String(body.preferredAddress ?? '') || String(body.displayName ?? ''),
+        displayName,
+        preferredAddress,
+        address: preferredAddress || displayName,
         notes: String(body.notes ?? ''),
         updatedAt: Date.now(),
         updatedBy: 'user',

@@ -160,9 +160,21 @@ export interface Config {
     requireAudit: boolean
   }
 
+  /**
+   * 会话身份 ↔ 人格身份。
+   *
+   * 宿主里 `agent.id === agent.session.id`，新建会话就是一个全新的 agent id。
+   * 打开继承后，同工作区的新会话会自动挂到最近活跃的那份人格上（人格/记忆/技能一起继承）；
+   * 关掉则回到"一个会话一个人格"的旧行为（多 Agent 并行、互不相干时用）。
+   */
+  identity: {
+    inheritOnNewSession: boolean
+    /** 一次会话最长认领间隔（毫秒）：超过这个时间没出现的会话不算"同一轮连续使用"。 */
+    inheritWindowMs: number
+  }
+
   /** 涌现式人格（PRD 9） */
-  persona: {
-    enabled: boolean
+  persona: {    enabled: boolean
     /** 起始心智年龄，默认 10 岁探索者。 */
     startAge: number
     /** 单次交互允许的最大特质位移 [character-sim]，防止人格突变。 */
@@ -322,9 +334,21 @@ export const Config: Schema<Config> = Schema.object({
     requireAudit: Schema.boolean().default(true).description('全局检索必须落审计。'),
   }).description('工作区隔离'),
 
+  identity: Schema.object({
+    inheritOnNewSession: Schema.boolean()
+      .default(true)
+      .description(
+        '新建会话是否继承本工作区最近活跃的人格（人格/记忆/技能/隔离区一起继承）。关掉 = 一会话一人格。',
+      ),
+    inheritWindowMs: Schema.natural()
+      .min(60_000)
+      .max(30 * 24 * 3_600_000)
+      .default(7 * 24 * 3_600_000)
+      .description('认领上一个会话人格的时间窗：超过这么久没出现的会话不再被继承。'),
+  }).description('会话身份与人格身份'),
+
   persona: Schema.object({
-    enabled: Schema.boolean().default(true).description('是否启用涌现式人格。'),
-    startAge: Schema.natural().min(1).max(100).default(10).description(
+    enabled: Schema.boolean().default(true).description('是否启用涌现式人格。'),    startAge: Schema.natural().min(1).max(100).default(10).description(
       '内部字段 age 的初值：只存库、随快照漫游，不参与提示渲染（人格由 traits 驱动）。',
     ),
     traitShiftMax: Schema.number().min(0).max(0.2).default(0.05).description('单次特质最大位移。'),

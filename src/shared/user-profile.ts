@@ -53,9 +53,14 @@ export const PROFILE_FIELD_MAX = 200
  * 就等于允许"往提示里插段落"——和技能名过正则同一个道理。
  */
 export function normalizeProfileInput(input: UserProfileInput): UserProfileInput {
+  const displayName = clean(input.displayName)
+  const preferredAddress = clean(input.preferredAddress)
   return {
-    displayName: clean(input.displayName),
-    preferredAddress: clean(input.preferredAddress),
+    // 界面上只有一个「怎么称呼我」：只传一个时另一侧自动取相同值，
+    // 这样 `profileAddress()` 无论走哪条分支都拿得到同一个称呼。
+    // 老数据里两者不同也没问题——读取侧永远优先 preferredAddress。
+    displayName: displayName !== '' ? displayName : preferredAddress,
+    preferredAddress: preferredAddress !== '' ? preferredAddress : displayName,
     notes: clean(input.notes),
   }
 }

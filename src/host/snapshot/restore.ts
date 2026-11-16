@@ -21,6 +21,7 @@ import { readManifest, snapshotIdOf } from './manifest.js'
 import { rehydratePersonaFromRepo } from '../prompt/persona-rehydrate.js'
 import { rehydrateSkillsFromRepo } from '../prompt/skill-rehydrate.js'
 import { rehydrateUserProfilesFromRepo } from '../prompt/user-profile-rehydrate.js'
+import { rehydratePersonaIdentitiesFromRepo } from '../prompt/persona-identity-rehydrate.js'
 import { createHash } from 'node:crypto'
 
 /** 结构化恢复错误：`code` 直接映射成 UI 上的原因。 */
@@ -72,6 +73,7 @@ interface ReplayStats {
   quarantined: number
   skills: number
   userProfiles: number
+  personaIdentities: number
   deferred: number
   skipped: number
 }
@@ -99,6 +101,7 @@ export class ReplayApplier {
       quarantined: 0,
       skills: 0,
       userProfiles: 0,
+      personaIdentities: 0,
       deferred: 0,
       skipped: 0,
     }
@@ -224,6 +227,29 @@ export class ReplayApplier {
               [workspaceId, agentId, skillId],
             )
             stats.skills++
+            break
+          }
+          case 'persona.bind': {
+            // 会话 → 人格 绑定：这一条掉了，新会话在恢复后的机器上又变成"新人格"，
+            // 表现就是"人格与记忆都在，但新建会话读不到"。
+            const identityAgent = str(record.agentId)
+            const workspaceId = str(record.workspaceId)
+            const personaId = str(record.personaId)
+            if (!identityAgent || !workspaceId || !personaId) {
+              stats.skipped++
+              break
+            }
+            const at = num(record.at) ?? Date.now()
+            this.#db.run(
+              `INSERT INTO persona_identity (agent_id, workspace_id, persona_id, bound_at, last_seen_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(agent_id) DO UPDATE SET
+                 workspace_id = excluded.workspace_id,
+                 persona_id   = excluded.persona_id,
+                 last_seen_at = MAX(persona_identity.last_seen_at, excluded.last_seen_at)`,
+              [identityAgent, workspaceId, personaId, at, at],
+            )
+            stats.personaIdentities++
             break
           }
           case 'user_profile.set': {
@@ -480,6 +506,18 @@ export class RestoreEngine {
     })
     if (profiles.present) {
       this.#onWarn(`用户画像回灌：${profiles.profiles} 个工作区`)
+    }
+
+    // 身份绑定回灌：走 state/persona-identity.json。
+    // 顺序放在最后：它不依赖人格数据，但必须晚于人格回灌，这样"新会话继承谁"
+    // 拿到的是恢复后的人格 id，而不是本机残留的旧 id。
+    const identities = await rehydratePersonaIdentitiesFromRepo({
+      db: this.#db,
+      root: this.#root,
+      onWarn: this.#onWarn,
+    })
+    if (identities.present) {
+      this.#onWarn(`身份绑定回灌：${identities.identities} 个会话`)
     }
 
     await this.#journal.open()
