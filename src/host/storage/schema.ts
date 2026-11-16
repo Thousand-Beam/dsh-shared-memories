@@ -14,9 +14,10 @@ import type { SqlDriver } from '../../shared/types.js'
  * 当前 schema 版本；恢复流程会把 `PRAGMA user_version` 与它比对。
  *
  * v1 → v2：`memory_entity.last_recalled_at`（夜间整理判断"90 天没被用到"的依据）。
+ * v2 → v3：`agent_skill`（技能挂载关系随 (workspace, agent) 隔离，并跟着快照漫游）。
  * 因为 v1 从未发布，这里用"建表时就带列 + 老库补一列"的双保险写法。
  */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 /**
  * 全量 DDL。全部 `IF NOT EXISTS`，可以在任何状态下重复执行。
@@ -150,6 +151,22 @@ CREATE TABLE IF NOT EXISTS persona_state (
   PRIMARY KEY (agent_id, workspace_id)
 );
 
+-- 技能绑定：Agent 挂了哪些工具。
+-- 存的是**绑定关系**（谁、什么版本、开着吗、参数），不是技能本体；
+-- 作用域与记忆同构 (workspace_id, agent_id)，所以 A 的工具表在库里对 B 不可见。
+CREATE TABLE IF NOT EXISTS agent_skill (
+  agent_id       TEXT NOT NULL,
+  workspace_id   TEXT NOT NULL,
+  skill_id       TEXT NOT NULL,
+  version        TEXT NOT NULL DEFAULT '',
+  enabled        INTEGER NOT NULL DEFAULT 1,
+  config         TEXT NOT NULL DEFAULT '{}',
+  granted_by     TEXT NOT NULL DEFAULT 'user',
+  updated_at     INTEGER NOT NULL,
+  PRIMARY KEY (agent_id, workspace_id, skill_id)
+);
+CREATE INDEX IF NOT EXISTS ix_agent_skill_scope ON agent_skill(workspace_id, agent_id);
+
 -- 审计：全局检索、记忆修正、隔离区操作都必须留痕
 CREATE TABLE IF NOT EXISTS audit_log (
   audit_id       TEXT PRIMARY KEY,
@@ -205,6 +222,10 @@ export function migrate(db: SqlDriver, target = SCHEMA_VERSION): { from: number;
     } catch {
       /* 已经有这列了 */
     }
+  }
+  if (from > 0 && from < 3) {
+    // v2 → v3：agent_skill 表由上面的 SCHEMA_SQL（IF NOT EXISTS）建好，没有数据要搬。
+    // 这里显式留一段，是为了让"加表"也走迁移路径，而不是靠"反正每次都执行全量 DDL"。
   }
   try {
     db.exec(`PRAGMA user_version = ${target}`)

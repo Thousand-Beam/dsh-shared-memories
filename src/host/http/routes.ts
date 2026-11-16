@@ -24,6 +24,9 @@ import type { RestoreEngine } from '../snapshot/restore.js'
 import type { PitfallRow, PitfallStore, PromotionRequest } from '../memory/pitfall.js'
 import type { EmotionAttribution } from '../../shared/types.js'
 import { EMOTION_LABELS, isEmotionLabel } from '../../shared/types.js'
+import type { SkillBinding } from '../../shared/skills.js'
+import { normalizeSkillId, normalizeSkillVersion } from '../../shared/skills.js'
+import { SkillRegistry, countSkills, readSkillBindings } from '../memory/skill-registry.js'
 // 值导入：错误映射要靠 instanceof。域错误一旦漏成 500，前端就分不清
 // "你参数错了"和"插件炸了"——这两种情况在 UI 上必须长得不一样。
 import { RestoreBlockedError, RestoreStateError } from '../snapshot/barrier.js'
@@ -43,6 +46,8 @@ import type {
   RulesBundle,
   RuleStage,
   SnapshotNode,
+  SkillBindingDto,
+  SkillsBundle,
 } from '../../shared/console-api.js'
 
 /** webServer 服务的最小面（真实实现由宿主提供）。 */
@@ -86,6 +91,13 @@ export interface MemoriesApiDeps {
   }): Promise<void>
   /** 踩坑库（四段式观察 → 规则），「规则与人格」视图的升格入口。 */
   pitfalls?(): PitfallStore | undefined
+  /**
+   * 技能注册表（带 journal 的那一个）。
+   *
+   * 为什么必须由宿主注入而不是路由里自己 new：只有带 journal 的实例才会把
+   * `skill.bind` 写进事件日志，技能变更才能在不打快照的情况下也跟着漫游。
+   */
+  skills?(): SkillRegistry | undefined
 }
 
 export const API_PREFIX = '/dsh/shared-memories'
@@ -135,6 +147,14 @@ async function dispatch(
       const body = await readJson(req)
       deps.barrier.assertWritable('persona-edit')
       return sendJson(res, 200, ok(writePersona(deps, body)))
+    }
+    if (method === 'GET' && path === '/skills') {
+      return sendJson(res, 200, ok(readSkills(deps, url)))
+    }
+    if (method === 'POST' && path === '/skills') {
+      const body = await readJson(req)
+      deps.barrier.assertWritable('skill-edit')
+      return sendJson(res, 200, ok(writeSkills(deps, body)))
     }
     if (method === 'GET' && path === '/rules') {
       return sendJson(res, 200, ok(readRules(deps, url)))
@@ -289,6 +309,9 @@ export function listAgents(deps: MemoriesApiDeps): AgentSummary[] {
       name: row.name || row.agent_id,
       age: row.age,
       traits: parseTraits(row.traits),
+      // 只要数量，不要清单：总览页要显示"挂了几个技能"，但跨 Agent 的清单本身
+      // 就是信息泄漏（能看到别人装了什么），所以这里不给。
+      skillCount: countSkills(db, { workspaceId: row.workspace_id, agentId: row.agent_id }),
     }))
   } catch {
     return []
@@ -703,6 +726,81 @@ function scopeOf(deps: MemoriesApiDeps, agentId: string): Scope {
 }
 
 
+
+/**
+ * 读技能绑定。**只读当前 (workspace, agent)**，没有"列出全部 Agent 的技能"这种用法：
+ * 控制台如果想显示别的 Agent，必须自己带上那个 agentId 逐个问，且每次都留审计。
+ */
+function readSkills(deps: MemoriesApiDeps, url: URL): SkillsBundle {
+  const agentId = url.searchParams.get('agentId') ?? 'default'
+  const db = deps.db()
+  const empty: SkillsBundle = { agentId, workspaceId: deps.workspaceId, items: [] }
+  if (!db) return empty
+  const scope = scopeOf(deps, agentId)
+  return { agentId, workspaceId: deps.workspaceId, items: toSkillDtos(readSkillBindings(db, scope)) }
+}
+
+/** 内→外：剥掉 config，版本缺省补空串（DTO 里不用可选字段，前端少一个分支）。 */
+function toSkillDtos(bindings: readonly SkillBinding[]): SkillBindingDto[] {
+  return bindings.map((skill) => ({
+    skillId: skill.skillId,
+    version: skill.version ?? '',
+    enabled: skill.enabled,
+    grantedBy: skill.grantedBy ?? 'user',
+    updatedAt: skill.updatedAt ?? 0,
+  }))
+}
+
+/**
+ * 改技能绑定：`action = 'bind' | 'unbind' | 'toggle'`。
+ *
+ * 三种动作共用一条路由，因为它们都只动 `agent_skill` 的一行或几行，且都要过
+ * `assertWritable`（恢复中禁止写）。skillId 在入口就规范化，非法 id 直接 400 ——
+ * 技能名是要进 System Prompt 的，不能让它变成提示词注入的入口。
+ */
+function writeSkills(deps: MemoriesApiDeps, body: Record<string, unknown>): SkillsBundle {
+  const db = deps.db()
+  if (!db) throw new ApiError('db-unavailable', '记忆库尚未就绪', 503)
+  const agentId = str(body.agentId) ?? 'default'
+  const scope = scopeOf(deps, agentId)
+  const registry =
+    deps.skills?.() ??
+    new SkillRegistry({
+      db,
+      onWarn: () => {
+        /* 写日志失败不该拦住用户的编辑 */
+      },
+    })
+  const action = str(body.action) ?? 'bind'
+  const skillId = normalizeSkillId(str(body.skillId))
+  if (skillId === '') {
+    throw new ApiError('bad-skill-id', '技能 id 只能是 1-64 位的字母、数字、点、下划线或连字符', 400)
+  }
+  if (action === 'unbind') {
+    registry.unbind(scope, skillId)
+  } else if (action === 'toggle') {
+    const enabled = body.enabled !== false
+    registry.setEnabled(scope, skillId, enabled)
+  } else {
+    registry.bind(scope, {
+      skillId,
+      version: normalizeSkillVersion(str(body.version)),
+      enabled: body.enabled !== false,
+      config: plainObject(body.config),
+    })
+  }
+  return {
+    agentId,
+    workspaceId: deps.workspaceId,
+    items: toSkillDtos(readSkillBindings(db, scope)),
+  }
+}
+
+/** 只接受纯对象当技能参数；`null`/数组/字符串一律当没传。 */
+function plainObject(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  return value as Record<string, unknown>
+}
 
 /**
  * 读人格。`baseline_hash` 一起返回，是为了让 UI 能显示那把"锁"：

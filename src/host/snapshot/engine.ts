@@ -18,6 +18,8 @@
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
 import { join } from 'node:path'
+import type { SkillBinding } from '../../shared/skills.js'
+import { normalizeBindings } from '../../shared/skills.js'
 import {
   assertGitOk,
   backoffDelay,
@@ -39,7 +41,7 @@ import {
   type SnapshotTrigger,
 } from './manifest.js'
 
-/** 多智能体总览：快照时必须覆盖**所有**已注册 agent 的人格与会话。 */
+/** 多智能体总览：快照时必须覆盖**所有**已注册 agent 的人格、技能与会话。 */
 export interface SnapshotAgentState {
   readonly agentId: string
   readonly workspaceIds?: readonly string[]
@@ -47,6 +49,15 @@ export interface SnapshotAgentState {
   readonly persona?: Readonly<Record<string, unknown>>
   /** 活跃会话 id 列表，用于"开机后把会话也接回去"。 */
   readonly sessions?: readonly string[]
+  /**
+   * 技能绑定：落到 `state/skills.json`。
+   *
+   * 为什么单独一个文件而不是塞进 agents.json：
+   *   - agents.json 是**指针**（谁存在、有哪些工作区/会话），给人和工具快速读；
+   *   - skills.json 是**状态**（谁挂了什么、版本、开关、参数），体量随技能数增长，
+   *     而且恢复时要整体替换。混在一起会让"读指针"这件事变贵，也让 diff 变脏。
+   */
+  readonly skills?: readonly SkillBinding[]
 }
 
 export interface SnapshotState {
@@ -428,7 +439,7 @@ export class SnapshotEngine {
       join(stateDir, 'agents.json'),
       `${JSON.stringify(
         {
-          version: 1,
+          version: 2,
           device: this.#deviceId,
           capturedAt: this.#clock(),
           agents: state.agents.map((agent) => ({
@@ -436,6 +447,11 @@ export class SnapshotEngine {
             workspaceIds: agent.workspaceIds ?? [],
             sessions: agent.sessions ?? [],
             hasPersona: Boolean(agent.persona),
+            // 只放数量与 id：完整绑定（版本/开关/参数）在 state/skills.json。
+            skillCount: agent.skills?.length ?? 0,
+            enabledSkillIds: (agent.skills ?? [])
+              .filter((skill) => skill.enabled)
+              .map((skill) => skill.skillId),
           })),
         },
         null,
@@ -443,7 +459,36 @@ export class SnapshotEngine {
       )}\n`,
       'utf8',
     )
+    await this.#writeSkillState(stateDir, state)
     return state
+  }
+
+  /**
+   * 技能绑定落盘。
+   *
+   * 三件必须做对的事：
+   *   1. 即使某个 Agent 一个技能都没有，也要写一条空记录 —— 否则恢复端无法区分
+   *      "这人没有技能"和"这个版本的快照不记技能"，前者要清空、后者要保留本机现状。
+   *   2. 按 id 排序（`normalizeBindings` 已保证）：顺序抖动会让每次快照都产生 diff。
+   *   3. 带上 `workspaceIds`：绑定是 (workspace, agent) 二元组，不能丢维度。
+   */
+  async #writeSkillState(stateDir: string, state: SnapshotState): Promise<void> {
+    const agents = state.agents.map((agent) => ({
+      agentId: agent.agentId,
+      workspaceIds: agent.workspaceIds ?? [],
+      skills: normalizeBindings(agent.skills ?? []).map((skill) => ({
+        skillId: skill.skillId,
+        version: skill.version ?? '',
+        enabled: skill.enabled,
+        config: skill.config ?? {},
+        grantedBy: skill.grantedBy ?? 'user',
+      })),
+    }))
+    await writeFile(
+      join(stateDir, 'skills.json'),
+      `${JSON.stringify({ version: 1, device: this.#deviceId, capturedAt: this.#clock(), agents }, null, 2)}\n`,
+      'utf8',
+    )
   }
 
   /** 递归收集状态文件（排除派生数据与快照自身）。 */

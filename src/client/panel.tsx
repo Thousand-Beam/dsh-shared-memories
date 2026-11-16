@@ -12,13 +12,14 @@
  *      恢复链路是后台推进的，前端不会收到推送。
  */
 
-import { createElement, useEffect, useState, type ReactNode } from 'react'
+import { createElement, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import type { AgentSummary } from '../shared/console-api.js'
 import { api } from './api.js'
 import { ConsoleContext, ConsoleStore, useConsole, useStore, type ViewKey } from './state.js'
 import { installConsoleStyles } from './styles.js'
 import { phaseLabel, reasonLabel, traitLabel } from './i18n.js'
-import { agentLabel, formatRelative, shortCode } from './format.js'
+import { agentLabel, formatRelative, shortCode, workspaceLabel } from './format.js'
 import { HistoryView } from './history.js'
 import { MemoryView } from './memory-list.js'
 import { RulesView } from './rules.js'
@@ -209,8 +210,8 @@ function Panel(): ReactNode {
         </nav>
 
         <div className='dsm-sidebar-foot'>
-          <div className='dsm-truncate' title={state.workspaceId}>
-            工作区 <span className='dsm-mono'>{shortCode(state.workspaceId)}</span>
+          <div className='dsm-truncate' title={state.workspaceId === '' ? '尚未挂到具体目录' : state.workspaceId}>
+            {workspaceLabel(state.workspaceId)}
           </div>
           <div className='dsm-truncate' title={state.deviceId}>
             设备 {state.deviceId === '' ? '—' : shortCode(state.deviceId, 6)}
@@ -276,40 +277,130 @@ function Panel(): ReactNode {
 
 /* ── Agent 切换 ───────────────────────────────────────────────────────── */
 
+/**
+ * 下拉菜单必须挂到 `document.body`。
+ *
+ * 为什么绝对定位怎么调都不行：面板内部到处都是 `overflow: hidden` / `auto`
+ * 的滚动容器，顶部 header 还带 `backdrop-filter`（自成层叠上下文）。
+ * 只要菜单是这些元素的后代，z-index 写得再大也只在自己那一层里比大小，
+ * 出了这一层照样被后面的内容区盖住 —— 这是层叠上下文，不是 z-index 不够。
+ *
+ * 所以改成 Portal + `position: fixed` + 按钮实测坐标：菜单不再属于任何
+ * 祖先的裁剪盒，只剩全局一个 z-index（1000）要管。窗口缩放/滚动时重算坐标。
+ */
 function AgentSwitcher(props: {
   agents: AgentSummary[]
   activeAgentId: string
   onPick: (agentId: string) => void
 }): ReactNode {
   const [open, setOpen] = useState(false)
+  const [anchor, setAnchor] = useState<{ top: number; left: number; minWidth: number } | null>(null)
+  const buttonRef = useRef<HTMLButtonElement | null>(null)
+  const menuRef = useRef<HTMLDivElement | null>(null)
+
   const active = props.agents.find((agent) => agent.agentId === props.activeAgentId)
   const label = active === undefined ? '未选择 Agent' : agentLabel(active)
 
+  const measure = useMemo(
+    () => (): void => {
+      const el = buttonRef.current
+      if (el === null) return
+      const rect = el.getBoundingClientRect()
+      const MENU_MAX = 320
+      const GUTTER = 12
+      const width = Math.min(MENU_MAX, Math.max(220, rect.width))
+      // 右边放不下就朝左对齐，保证永远不出窗口。
+      const left = Math.max(GUTTER, Math.min(rect.left, window.innerWidth - width - GUTTER))
+      setAnchor({ top: Math.round(rect.bottom + 6), left: Math.round(left), minWidth: Math.round(width) })
+    },
+    [],
+  )
+
   useEffect(() => {
-    if (!open) return
+    if (!open) {
+      setAnchor(null)
+      return
+    }
+    measure()
     const onDown = (event: MouseEvent): void => {
       const target = event.target
-      if (target instanceof Element && target.closest('.dsm-menu-wrap') !== null) return
+      if (!(target instanceof Node)) return
+      // 菜单在 body 上，不再是按钮的兄弟节点，判定要连着两棵树一起看。
+      if (buttonRef.current !== null && buttonRef.current.contains(target)) return
+      if (menuRef.current !== null && menuRef.current.contains(target)) return
       setOpen(false)
     }
     // Esc 关菜单：键盘用户不该被一个只能用鼠标关的浮层困住。
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') setOpen(false)
     }
-    document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
+    const onScroll = (): void => measure()
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    window.addEventListener('resize', onScroll)
+    // capture 阶段收滚动：面板内滚动容器不会冒泡到 window。
+    window.addEventListener('scroll', onScroll, true)
     return () => {
-      document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('resize', onScroll)
+      window.removeEventListener('scroll', onScroll, true)
     }
-  }, [open])
+  }, [open, measure])
+
+  const menu =
+    open && anchor !== null
+      ? createPortal(
+          <div
+            ref={menuRef}
+            className='dsm-menu dsm-menu--portal'
+            data-dsm-menu='true'
+            role='menu'
+            style={{ top: anchor.top, left: anchor.left, minWidth: anchor.minWidth }}
+          >
+            {props.agents.length === 0 ? (
+              <div className='dsm-menu-empty'>还没有注册任何 Agent</div>
+            ) : (
+              props.agents.map((agent) => {
+                // 名字缺失时说「未命名会话」，代号只留一份在右侧，别同一行写两遍。
+                const named = (agent.name ?? '').trim()
+                const shortName = named !== '' ? named : '未命名会话'
+                return (
+                  <button
+                    key={agent.agentId}
+                    type='button'
+                    role='menuitem'
+                    className='dsm-menu-item'
+                    data-active={agent.agentId === props.activeAgentId}
+                    title={agent.agentId}
+                    onClick={() => {
+                      setOpen(false)
+                      props.onPick(agent.agentId)
+                    }}
+                  >
+                    <span className='dsm-avatar' aria-hidden='true'>
+                      {shortName.slice(0, 1)}
+                    </span>
+                    <span className='dsm-menu-name'>{shortName}</span>
+                    <span className='dsm-menu-meta'>{`#${shortCode(agent.agentId)}`}</span>
+                  </button>
+                )
+              })
+            )}
+          </div>,
+          document.body,
+        )
+      : null
 
   return (
     <div className='dsm-menu-wrap'>
       <button
+        ref={buttonRef}
         type='button'
         className='dsm-agent-btn'
-        title={active === undefined ? undefined : `${label}（代号 ${shortCode(active.agentId)}）`}
+        aria-haspopup='menu'
+        aria-expanded={open}
+        title={active === undefined ? undefined : `${agentLabel(active)}（完整 id：${active.agentId}）`}
         onClick={() => setOpen((value) => !value)}
       >
         <span className='dsm-avatar' aria-hidden='true'>
@@ -320,35 +411,7 @@ function AgentSwitcher(props: {
         </span>
         <ChevronIcon open={open} />
       </button>
-      {open ? (
-        <div className='dsm-menu'>
-          {props.agents.length === 0 ? (
-            <div className='dsm-menu-empty'>还没有注册任何 Agent</div>
-          ) : (
-            props.agents.map((agent) => (
-              <button
-                key={agent.agentId}
-                type='button'
-                className='dsm-menu-item'
-                data-active={agent.agentId === props.activeAgentId}
-                title={agent.agentId}
-                onClick={() => {
-                  setOpen(false)
-                  props.onPick(agent.agentId)
-                }}
-              >
-                <span className='dsm-avatar' aria-hidden='true'>
-                  {agentLabel(agent).slice(0, 1)}
-                </span>
-                <span className='dsm-menu-name'>{agentLabel(agent)}</span>
-                <span className='dsm-menu-meta'>
-                  {shortCode(agent.agentId)} · {agent.age} 岁
-                </span>
-              </button>
-            ))
-          )}
-        </div>
-      ) : null}
+      {menu}
     </div>
   )
 }
@@ -443,22 +506,28 @@ function OverviewView(): ReactNode {
         <div className='dsm-stack'>
           {state.agents.map((agent) => {
             const traits = Object.entries(agent.traits).slice(0, 6)
-            const label = agentLabel(agent)
+            // 标题只说人话，代号只在后面出现一次：`未命名会话 · #2b81` + `#2b81` 太吵。
+            const title = (agent.name ?? '').trim() !== '' ? (agent.name ?? '').trim() : '未命名会话'
             return (
               <article className='dsm-card' key={agent.agentId}>
                 <div className='dsm-card-head'>
                   <span className='dsm-avatar' aria-hidden='true'>
-                    {label.slice(0, 1)}
+                    {title.slice(0, 1)}
                   </span>
                   <span className='dsm-card-title' title={agent.agentId}>
-                    {label}
+                    {title}
                   </span>
                   <span className='dsm-caption dsm-mono'>#{shortCode(agent.agentId)}</span>
-                  <Tag tone='outline'>心理年龄 {agent.age}</Tag>
                   {agent.agentId === state.activeAgentId ? <Tag tone='accent'>当前</Tag> : null}
+                  {/* 只显示数量：技能清单跨 Agent 不给看，但"他挂了几个"是排障必需。 */}
+                  {typeof agent.skillCount === 'number' && agent.skillCount > 0 ? (
+                    <Tag tone='ok' title='当前工作区下已启用的技能数'>
+                      技能 {agent.skillCount}
+                    </Tag>
+                  ) : null}
                   <span className='dsm-spacer' />
-                  <span className='dsm-caption dsm-mono' title={agent.workspaceId}>
-                    工作区 {shortCode(agent.workspaceId)}
+                  <span className='dsm-caption' title={agent.workspaceId}>
+                    {workspaceLabel(agent.workspaceId)}
                   </span>
                 </div>
 

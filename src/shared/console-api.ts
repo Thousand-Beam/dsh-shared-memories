@@ -15,6 +15,28 @@ export interface AgentSummary {
   name: string
   age: number
   traits: Record<string, number>
+  /** 当前工作区下这个 Agent 挂载的技能数（0 表示没挂，undefined 表示老版本宿主没算）。 */
+  skillCount?: number
+}
+
+/**
+ * 技能绑定的对外形状。
+ *
+ * 故意**不含** `config` 的具体内容：技能参数里可能有 token / 路径 / 私有地址，
+ * 控制台只需要知道"挂了什么、开没开"，改参数应当走各技能自己的配置入口。
+ */
+export interface SkillBindingDto {
+  skillId: string
+  version: string
+  enabled: boolean
+  grantedBy: string
+  updatedAt: number
+}
+
+export interface SkillsBundle {
+  agentId: string
+  workspaceId: string
+  items: SkillBindingDto[]
 }
 
 export interface MemoryCard {

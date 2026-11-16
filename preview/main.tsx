@@ -37,14 +37,23 @@ let phase: RestorePhase = initialPhase
 let degradedReason = 'snapshot-corrupt：快照 sha256 与本地文件不一致，写入已被拦截'
 
 const agents: ConsoleBootstrap['agents'] = [
-  { agentId: 'lead', workspaceId: WORKSPACE, name: '大肥鱼', age: 11, traits: { curiosity: 0.82, warmth: 0.74 } },
-  { agentId: 'coder', workspaceId: WORKSPACE, name: '小狐狸', age: 9, traits: { rigor: 0.9, patience: 0.42 } },
+  { agentId: 'lead', workspaceId: WORKSPACE, name: '大肥鱼', age: 11, traits: { curiosity: 0.82, warmth: 0.74 }, skillCount: 2 },
+  { agentId: 'coder', workspaceId: WORKSPACE, name: '小狐狸', age: 9, traits: { rigor: 0.9, patience: 0.42 }, skillCount: 1 },
   {
     agentId: 'session-8cc26eb7-a58c-4921-998e-a55187dfca93',
     workspaceId: 'ws-3f7a91c2-8b21-4d3e-9a55-1c2d3e4f5a6b',
     name: '阿甲',
     age: 10,
     traits: { warmth: 0.88 },
+  },
+  // 故意留一个没有名字的会话：界面上必须显示「未命名会话 · #代号」，
+  // 而不是把 36 位 uuid 直接糊在标题上（这正是用户吐槽过的那一条）。
+  {
+    agentId: 'session-2b81986b-f1fb-4dfd-a5e5-ade2c7593654',
+    workspaceId: 'ws-3f7a91c2-8b21-4d3e-9a55-1c2d3e4f5a6b',
+    name: '',
+    age: 0,
+    traits: {},
   },
 ]
 

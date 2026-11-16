@@ -38,6 +38,8 @@ export type JournalOp =
   | 'persona.shift'
   | 'quarantine.add'
   | 'memory.forget'
+  | 'skill.bind'
+  | 'skill.unbind'
 
 /** 磁盘上的完整记录（含信封字段）。 */
 export interface JournalRecord {

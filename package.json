@@ -63,7 +63,8 @@
     "test": "node --test \".test-build/test/**/*.spec.js\"",
     "test:watch": "tsc -p tsconfig.test.json --watch --preserveWatchOutput",
     "preview:build": "tsc -p preview/tsconfig.preview.json",
-    "preview": "npm run preview:build && node preview/server.mjs 5199"
+    "preview": "npm run preview:build && node preview/server.mjs 5199",
+    "self-test": "node scripts/self-test.mjs"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "~3.18.5",

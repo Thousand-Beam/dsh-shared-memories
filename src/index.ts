@@ -24,6 +24,10 @@ import { Config, isLocalOnly, type Config as SharedConfig } from './config.js'
 import { Journal } from './shared/journal.js'
 import { deriveWorkspaceId, type Scope } from './shared/scope.js'
 import type { SqlDriver } from './shared/types.js'
+import type { SkillBinding } from './shared/skills.js'
+import { normalizeBindings } from './shared/skills.js'
+import { readSkillBindings } from './host/memory/skill-registry.js'
+import { SkillRegistry } from './host/memory/skill-registry.js'
 import { TemporalTree } from './host/memory/timetree.js'
 import { ScopedQuery, type MemoryHit } from './host/memory/scoped-query.js'
 import { migrate, SCHEMA_VERSION } from './host/storage/schema.js'
@@ -114,6 +118,7 @@ interface Runtime {
   guard?: PoisonGuard
   importer?: Importer
   pitfalls?: PitfallStore
+  skills?: SkillRegistry
   /**
    * 当前进程里活着的 agent 与会话。
    *
@@ -265,6 +270,10 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       // 过期即作废——这是"改 System Prompt 必须当下确认"的实现约束。
       runtime.pitfalls = new PitfallStore({ db, journal, onWarn: warn })
 
+      // 技能注册表带 journal：控制台上的挂载/卸载/开关都会写 `skill.*` 事件，
+      // 这样"没来得及打快照就换机"也不会丢技能。
+      runtime.skills = new SkillRegistry({ db, journal, clock: () => Date.now(), onWarn: warn })
+
       const outcome = await runtime.restore.restoreOnBoot()
       runtime.booted = true
       if (outcome.status === 'ready') {
@@ -333,6 +342,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       },
       setIntervalSec: applyInterval,
       pitfalls: () => runtime.pitfalls,
+      skills: () => runtime.skills,
       importMemories: async (input) => {
         if (!runtime.importer) throw new Error('记忆库尚未就绪')
         const report = await runtime.importer.import({
@@ -522,11 +532,11 @@ function collectAgents(runtime: Runtime): SnapshotAgentState[] {
       traits: string
       baseline_hash: string
     }>(`SELECT agent_id, workspace_id, name, age, traits, baseline_hash FROM persona_state`)
-    const byAgent = new Map<string, { agentId: string; workspaceIds: string[]; persona: Record<string, unknown>; sessions: string[] }>()
+    const byAgent = new Map<string, { agentId: string; workspaceIds: string[]; persona: Record<string, unknown>; sessions: string[]; skills: SkillBinding[] }>()
     for (const row of rows) {
       const current =
         byAgent.get(row.agent_id) ??
-        { agentId: row.agent_id, workspaceIds: [], persona: {}, sessions: [] as string[] }
+        { agentId: row.agent_id, workspaceIds: [], persona: {}, sessions: [] as string[], skills: [] }
       current.workspaceIds.push(row.workspace_id)
       current.persona = {
         name: row.name,
@@ -541,18 +551,22 @@ function collectAgents(runtime: Runtime): SnapshotAgentState[] {
     for (const [agentId, entry] of runtime.liveAgents) {
       const current =
         byAgent.get(agentId) ??
-        ({ agentId, workspaceIds: [], persona: {}, sessions: [] as string[] } as {
-          agentId: string
-          workspaceIds: string[]
-          persona: Record<string, unknown>
-          sessions: string[]
-        })
+        { agentId, workspaceIds: [], persona: {}, sessions: [] as string[], skills: [] }
       if (!current.workspaceIds.includes(runtime.workspaceId)) {
         current.workspaceIds.push(runtime.workspaceId)
       }
       // 会话指针并集：人格表里存不下"这台机器上开过哪些会话"，只能靠内存登记。
       current.sessions = [...new Set([...current.sessions, ...entry.sessions])]
       byAgent.set(agentId, current)
+    }
+    // 技能绑定：按 (workspace, agent) 逐个取，绝不跨 Agent 合并。
+    // 一个 Agent 可能横跨多个工作区且各挂不同技能，所以是"每个工作区各取一份再并集"。
+    for (const current of byAgent.values()) {
+      const merged: SkillBinding[] = []
+      for (const workspaceId of current.workspaceIds) {
+        merged.push(...readSkillBindings(runtime.db, { workspaceId, agentId: current.agentId }))
+      }
+      current.skills = normalizeBindings(merged)
     }
     return [...byAgent.values()]
   } catch {
@@ -602,6 +616,16 @@ async function refreshPrompt(runtime: Runtime, config: SharedConfig): Promise<vo
     )
     lines.push(`- 工作区：${runtime.workspaceId}`)
     lines.push(`- 底线：${config.persona.baselineNotice}`)
+    // 技能段：按 (workspaceId, agentId) 精确取，缺一个条件就会串台。
+    const skills = readSkillBindings(runtime.db, scope)
+    if (skills.length > 0) {
+      lines.push('')
+      lines.push('### 这个 Agent 当前挂载的技能')
+      for (const skill of skills) {
+        const version = skill.version ? ` ${skill.version}` : ''
+        lines.push(`- \`${skill.skillId}\`${version}${skill.enabled ? '' : ' · 已停用'}`)
+      }
+    }
     if (rules.length > 0) {
       lines.push('')
       lines.push('### 已确认的规则与偏好（优先级高于一般记忆）')

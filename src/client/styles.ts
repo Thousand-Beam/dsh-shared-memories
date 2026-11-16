@@ -663,6 +663,29 @@ export const CONSOLE_CSS = `
 }
 /* 触发按钮靠右时用这个，菜单改成向左展开，避免顶出右边界。 */
 .dsm-menu--right { left: auto; right: 0; }
+
+/* Portal 版本：菜单挂在 <body> 上，用 position: fixed + 计算出的坐标定位。
+   为什么不继续用绝对定位：header 有 backdrop-filter，任何祖先只要带
+   overflow/transform/filter 就会把绝对定位的子元素裁在层叠上下文里。
+   挂到 body 之后，祖先的 clip 与 stacking context 全部不再参与，只剩一个
+   全局 z-index 需要自己管好。 */
+.dsm-menu--portal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 1000;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(320px, calc(100vw - 24px));
+  max-height: min(60vh, 360px);
+  overflow: auto;
+  /* 挂到 body 之后不再继承 .dsm-root 的字体/行高，这里显式接回来。 */
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--dsm-text);
+  text-align: left;
+}
 .dsm-menu-item {
   display: flex;
   align-items: center;

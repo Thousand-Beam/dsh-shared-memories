@@ -82,13 +82,31 @@ export function shortCode(id: string | null | undefined, length = 4): string {
 }
 
 /**
- * Agent 的展示名：**永远优先人名**，没有名字才退回代号。
- * 界面上看到的应该是「大肥鱼」，而不是一串 uuid。
+ * Agent 的展示名：**永远优先人名**，没有名字才退回「未命名会话 · #代号」。
+ *
+ * 为什么不是「Agent · 8cc2」：用户看到的是一排会话，不是一排注册表条目。
+ * 没名字就说「未命名会话」，代号缩成 `#8cc2` 当脚注——完整 uuid 只进 `title`。
  */
 export function agentLabel(agent: { name?: string | null; agentId: string }): string {
   const name = (agent.name ?? '').trim()
   if (name !== '') return name
-  return `Agent · ${shortCode(agent.agentId)}`
+  return `未命名会话 · #${shortCode(agent.agentId)}`
+}
+
+/** 紧凑版名字：只给人名，没有名字就 `#代号`（下拉框第二列、卡片角标用）。 */
+export function agentNameOnly(agent: { name?: string | null; agentId: string }): string {
+  const name = (agent.name ?? '').trim()
+  return name !== '' ? name : `#${shortCode(agent.agentId)}`
+}
+
+/**
+ * 工作区名：不显示 uuid。
+ * 空 id = 还没挂到具体目录（冷启动早期），直接说「本地工作区」。
+ */
+export function workspaceLabel(workspaceId: string | null | undefined): string {
+  const id = (workspaceId ?? '').trim()
+  if (id === '') return '本地工作区'
+  return `工作区 · ${shortCode(id)}`
 }
 
 /** 0.873 → `87%`（信任度/显著度用）。 */

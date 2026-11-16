@@ -186,7 +186,9 @@ export function RulesView(): ReactNode {
                 />
               </label>
               <label className='dsm-field'>
-                <span className='dsm-field-label'>心理年龄</span>
+                <span className='dsm-field-label' title='内部字段 age：人格演化的基线刻度，不在卡片上展示'>
+                  成长刻度
+                </span>
                 <input
                   className='dsm-input dsm-input--sm dsm-num'
                   type='number'

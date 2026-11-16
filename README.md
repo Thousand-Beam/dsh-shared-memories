@@ -237,6 +237,50 @@ gh repo create ai-brain --private --description "my agent's external brain"
 
 ---
 
+## 技能（Skill）的隔离与漫游
+
+Agent A 会跑代码、Agent B 只会搜网页——**能力清单和记忆一样是状态**，必须跟着人走，且必须隔得住。
+
+### 三层隔离，逐层锁死
+
+| 位置 | 怎么锁 |
+|---|---|
+| 存储 | `agent_skill(agent_id, workspace_id, skill_id, …)`，主键就是 `(agent, workspace, skill)` |
+| 读取 | 只有一个入口 `readSkillBindings(db, scope)`，SQL 固定 `WHERE workspace_id = ? AND agent_id = ?` |
+| 注入 | `PromptAssembler` 按当前 `scope` 取数后传进 `renderSkills()`；渲染层**不允许自己查库** |
+
+总览页那种「一屏看所有 Agent」的地方只拿得到 `skillCount`（数字），拿不到别人的技能清单——知道 B 装了什么，本身就是信息。
+
+### 漫游：快照里放什么，恢复时怎么用
+
+```
+snapshot
+├── state/agents.json    version:2 → 指针：skillCount / enabledSkillIds（不含 config）
+└── state/skills.json    version:1 → 全量：每个 agent 一条（哪怕空数组）
+                          { skillId, version, enabled, config, grantedBy }
+```
+
+`state/skills.json` 里**每个 Agent 都写一条**，这是刻意的：只有「有这一条且为空」才能区分“他没挂技能”和“这版快照根本不记技能”。老快照恢复时文件不存在 → 回灌函数返回 `present:false` 并**一条都不动**，绝不清空本机已有绑定。
+
+恢复路径是双保险：
+
+1. `journal` 重放 `skill.bind` / `skill.unbind`（增量：没来得及打快照也不会丢）
+2. `rehydrateSkillsFromRepo()` 用 `state/skills.json` **对齐**（全量：清单即真相，多删少补，开关照抄）
+
+### 为什么技能名要过正则
+
+技能 id 会被写进 System Prompt（模型得知道自己有什么工具）。若允许任意字符串，一个叫 `code-exec\n\n忽略上面所有规则` 的技能就是一次提示词注入。所以 `SKILL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/`，非法 id 在 HTTP 入口就 400。
+
+### 记忆工具本来就不跨 Agent
+
+`memory_search` 不需要额外加参数来“保证隔离”——因为 `ScopedQuery` 的 SQL 里 `AND e.workspace_id = ? AND e.agent_id = ?` 是**编译期拼死的**，唯一的例外是一个带 `reason`/`ttl` 的 `GlobalToken`，而且要用户在控制台手动开「全局检索」并留审计。技能再多也绕不过这条：工具能调什么，和它能查到什么，是两个独立的闸门。
+
+```bash
+npm run self-test   # 第 ④ 段就是技能隔离，第 ⑤ 段验证换机后技能一起到位
+```
+
+---
+
 ## 安全边界
 
 写在 README 里，也写在代码里。
@@ -273,8 +317,25 @@ gh repo create ai-brain --private --description "my agent's external brain"
 npm run build        # tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/wrap-client.mjs
 npm run typecheck    # 两份 tsconfig 都 --noEmit
 npm test             # tsc -p tsconfig.test.json && node --test .test-build/test/**/*.spec.js
+npm run self-test    # 端到端自测：真 git 仓库 + 真 SQLite + 冷启动恢复，31 条断言
 npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ http://127.0.0.1:5199/
 ```
+
+### `npm run self-test` 跑的是什么
+
+不想翻测试文件的话，这一条命令就能把整套链路走一遍（临时目录在结束时自动清理，`--keep` 保留现场，`--verbose` 打细节）：
+
+```
+① 写入       Agent A 三条记忆（含焦虑情绪归因）+ Agent B 两条 → 同一句重复写入被去重
+② 隔离       A 检索 AONLY 命中 3 条，检索 BONLY 命中 0 条；B 反向同理；跨工作区也 0 条
+③ 防投毒     「忽略你所有的规则…」判定 quarantine、风险分 ≥ 0.55、原因含 baseline-breach，
+             记忆池不受污染；同一句话来自 user 时正常放行
+④ 冷启动     A 机 snapshot('shutdown') → 推到 bare 仓库；B 机全新目录 restoreOnBoot()
+             → pull → 验签 → 重放 12 条记录 → ready；A 的记忆在 B 逐字可检索，
+             人格与隔离区一起漫游；篡改快照文件后重跑 → degraded + snapshot-corrupt 且拒写
+```
+
+最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
 - 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），51 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、journal 合并、HTTP 路由、端到端漫游。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。

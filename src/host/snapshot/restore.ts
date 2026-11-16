@@ -19,6 +19,7 @@ import { RestoreBarrier, type RestorePhase } from './barrier.js'
 import { assertGitOk, backoffDelay, defaultSleep, type GitRunner, type SleepFn } from './git.js'
 import { readManifest, snapshotIdOf } from './manifest.js'
 import { rehydratePersonaFromRepo } from '../prompt/persona-rehydrate.js'
+import { rehydrateSkillsFromRepo } from '../prompt/skill-rehydrate.js'
 import { createHash } from 'node:crypto'
 
 /** 结构化恢复错误：`code` 直接映射成 UI 上的原因。 */
@@ -67,6 +68,8 @@ interface ReplayStats {
   versions: number
   closed: number
   forgotten: number
+  quarantined: number
+  skills: number
   deferred: number
   skipped: number
 }
@@ -91,6 +94,8 @@ export class ReplayApplier {
       versions: 0,
       closed: 0,
       forgotten: 0,
+      quarantined: 0,
+      skills: 0,
       deferred: 0,
       skipped: 0,
     }
@@ -135,9 +140,93 @@ export class ReplayApplier {
             stats.forgotten++
             break
           }
+          case 'quarantine.add': {
+            // 隔离条目必须跟着漫游：换台机器后，"这条被拦过"同样要可见。
+            // 之前这里落到 default 只统计数量，结果 B 机隔离区凭空清空 ——
+            // 拦截记录消失，比拦截本身失败更难排查。
+            const quarantineId = str(record.quarantineId)
+            const workspaceId = str(record.workspaceId)
+            const agentId = str(record.agentId)
+            if (!quarantineId || !workspaceId || !agentId) {
+              stats.skipped++
+              break
+            }
+            this.#db.run(
+              `INSERT INTO quarantine (quarantine_id, workspace_id, agent_id, payload, reason, score, status, created_at)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(quarantine_id) DO NOTHING`,
+              [
+                quarantineId,
+                workspaceId,
+                agentId,
+                JSON.stringify({
+                  text: str(record.text) ?? '',
+                  kind: str(record.kind) ?? 'fact',
+                  source: str(record.source) ?? 'external',
+                  subjectKey: str(record.subjectKey) ?? null,
+                  emotion: record.emotion ?? null,
+                }),
+                str(record.reason) ?? '',
+                num(record.score) ?? 0,
+                'pending',
+                num(record.at) ?? Date.now(),
+              ],
+            )
+            stats.quarantined++
+            break
+          }
+          case 'skill.bind': {
+            // 技能绑定必须跟着漫游：A 挂了 code-exec，B 开机就得有。
+            // 只落 SQLite 不重放 = "换机后模型突然不会它本来会的事"，且无报错。
+            const agentId = str(record.agentId)
+            const workspaceId = str(record.workspaceId)
+            const skillId = str(record.skillId)
+            if (!agentId || !workspaceId || !skillId) {
+              stats.skipped++
+              break
+            }
+            this.#db.run(
+              `INSERT INTO agent_skill (agent_id, workspace_id, skill_id, version, enabled, config, granted_by, updated_at)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(agent_id, workspace_id, skill_id) DO UPDATE SET
+                 version    = excluded.version,
+                 enabled    = excluded.enabled,
+                 config     = excluded.config,
+                 granted_by = excluded.granted_by,
+                 updated_at = MAX(agent_skill.updated_at, excluded.updated_at)`,
+              [
+                agentId,
+                workspaceId,
+                skillId,
+                str(record.version) ?? '',
+                record.enabled === false ? 0 : 1,
+                JSON.stringify(record.config ?? {}),
+                str(record.grantedBy) ?? 'user',
+                num(record.at) ?? Date.now(),
+              ],
+            )
+            stats.skills++
+            break
+          }
+          case 'skill.unbind': {
+            const agentId = str(record.agentId)
+            const workspaceId = str(record.workspaceId)
+            const skillId = str(record.skillId)
+            if (!agentId || !workspaceId || !skillId) {
+              stats.skipped++
+              break
+            }
+            this.#db.run(
+              `DELETE FROM agent_skill WHERE workspace_id = ? AND agent_id = ? AND skill_id = ?`,
+              [workspaceId, agentId, skillId],
+            )
+            stats.skills++
+            break
+          }
           default: {
-            // persona.shift / quarantine.add / pitfall.promote 由各自模块消费，
-            // 恢复阶段只统计数量，保证"没有悄悄丢掉日志"这件事可观测。
+            // persona.shift / pitfall.promote 由各自模块消费（它们本来就把状态
+            // 落在 persona/*.json、pitfalls 表里，恢复阶段单独回灌）。
+            // 这里只统计数量，保证"没有悄悄丢掉日志"这件事可观测。
             stats.deferred++
             break
           }
@@ -336,6 +425,18 @@ export class RestoreEngine {
     })
     if (personas.agents > 0) {
       this.#onWarn(`人格回灌：${personas.agents} 个 Agent / ${personas.personas} 条工作区人格`)
+    }
+
+    // 技能回灌：走 state/skills.json（对齐语义），journal 里的 skill.* 事件已在上
+    // 面重放过了 —— 两条路径都保留，因为老快照可能没有 skills.json，而新设备
+    // 可能只拿到了 journal。present=false 时这里什么都不做。
+    const skills = await rehydrateSkillsFromRepo({
+      db: this.#db,
+      root: this.#root,
+      onWarn: this.#onWarn,
+    })
+    if (skills.present) {
+      this.#onWarn(`技能回灌：${skills.agents} 个 Agent / ${skills.bindings} 条绑定`)
     }
 
     await this.#journal.open()

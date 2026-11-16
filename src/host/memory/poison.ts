@@ -199,6 +199,13 @@ export class PoisonGuard {
       reason: assessment.reasons.join(','),
       score: assessment.risk,
       at: now,
+      // 正文/来源也进 journal：换台机器重放时，隔离区要能原样长回来。
+      // 只记 id 的话，B 机上就只剩一条"被拦过"的空壳。
+      text: input.text,
+      kind: input.kind ?? 'fact',
+      source: input.source,
+      subjectKey: input.subjectKey ?? null,
+      emotion: input.emotion ?? null,
     })
     return { assessment, quarantineId }
   }

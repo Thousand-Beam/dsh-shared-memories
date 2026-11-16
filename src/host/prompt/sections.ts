@@ -3,11 +3,13 @@
  * ---------------------------------------------------------------------------
  * PRD 9 + 多智能体需求。顺序是**硬编码的**，不可由配置打乱：
  *
- *   [1 基础底线] → [2 该 Agent 的 Persona] → [3 Pinned rules/patterns] → [4 检索到的记忆]
+ *   [1 基础底线] → [2 该 Agent 的 Persona] → [3 该 Agent 的技能] → [4 Pinned rules] → [5 检索到的记忆]
  *
  * 为什么顺序不能改：
  *   - 底线在最前，任何后文都无法"覆盖"它（模型对靠前的强约束更稳）；
  *   - Persona 在规则前，因为规则是"针对这个人的行为约束"，读起来才连贯；
+ *   - 技能紧跟在人格后面：先知道"我是谁"，再知道"我手上有什么工具"，
+ *     否则工具清单会被读成通用能力，模型会去用自己根本没有的技能；
  *   - 记忆放最后，且带明确的"可能过时/低置信"标注，避免模型把检索结果当指令。
  *
  * 这个文件是**纯函数 + 一个取数的 assembler**，不碰 cordis：这样能单测，
@@ -15,22 +17,33 @@
  */
 
 import type { Scope } from '../../shared/scope.js'
+import type { SkillBinding } from '../../shared/skills.js'
+import { renderSkillLines } from '../../shared/skills.js'
 import type { SqlDriver } from '../../shared/types.js'
 import type { MemoryHit } from '../memory/scoped-query.js'
 import type { PitfallStore } from '../memory/pitfall.js'
+import { readSkillBindings } from '../memory/skill-registry.js'
 
 /** 注入段落的名字（会出现在 `ctx.systemPrompt.section({name})` 里）。 */
 export const SECTION_NAMES = {
   baseline: 'shared-memories:baseline',
   persona: 'shared-memories:persona',
+  skills: 'shared-memories:skills',
   rules: 'shared-memories:rules',
   memories: 'shared-memories:memories',
 } as const
 
-/** 段落顺序：越小越靠前。 */
+/**
+ * 段落顺序：越小越靠前。
+ *
+ * `skills` 排在 persona 之后、rules 之前：模型需要先知道"我是谁"，再知道
+ * "我手上有什么"，最后才是"我学到过什么"。反过来会让工具列表读起来像
+ * 通用能力清单，而不是"这个人的能力"。
+ */
 export const SECTION_ORDERS = {
   baseline: 5,
   persona: 10,
+  skills: 15,
   rules: 20,
   memories: 30,
 } as const
@@ -54,6 +67,13 @@ export interface PromptInputs {
   /** 基础底线声明（来自 config.persona.baselineNotice）。 */
   readonly baseline: string
   readonly persona?: PersonaSnapshot | undefined
+  /**
+   * 该 Agent 在当前工作区**已挂载**的技能绑定（只含已启用的也行，渲染函数会标开关）。
+   *
+   * 这里刻意要求调用方显式传入，而不是在 `buildSections` 内部自己查库：
+   * 一旦渲染层能"顺手查一下"，跨 Agent 串台就只是少写一个 `agentId` 的距离。
+   */
+  readonly skills?: readonly SkillBinding[]
   readonly rules: readonly string[]
   readonly patterns: readonly string[]
   /** 待确认的规则条数：让模型知道自己"还有东西没学到"。 */
@@ -111,6 +131,11 @@ export function buildSections(input: PromptInputs): PromptSectionSpec[] {
       name: SECTION_NAMES.persona,
       order: SECTION_ORDERS.persona,
       text: renderPersona(input.persona, input.scope),
+    },
+    {
+      name: SECTION_NAMES.skills,
+      order: SECTION_ORDERS.skills,
+      text: renderSkills(input.skills ?? []),
     },
     {
       name: SECTION_NAMES.rules,
@@ -189,6 +214,26 @@ export function renderRules(
   return blocks.join('\n\n')
 }
 
+/**
+ * 技能段：只列**这个 Agent 在当前工作区**挂载过的东西。
+ *
+ * 为什么值得单独一段，而不是把工具表直接丢给模型：
+ *   模型对"我有哪些工具"的认知只来自提示词。一旦这里混进别的 Agent 的技能，
+ *   它就会去调用一个实际不可用的工具 —— 表现为反复报错或凭空编造结果，
+ *   而日志上看不出任何异常（工具调用被框架拒了，但模型已经"以为"自己有）。
+ *
+ * 已停用的技能**照样列出来但标注"已停用"**：这比彻底隐藏更有用 ——
+ * 模型知道"这个能力存在但我现在不能用"，就不会绕着弯去模拟它。
+ */
+export function renderSkills(bindings: readonly SkillBinding[]): string {
+  if (bindings.length === 0) return ''
+  return [
+    '## 当前可用技能',
+    ...renderSkillLines(bindings),
+    '只能使用上面列出的技能；未列出的能力即便看起来相关，也不要假装已经执行。',
+  ].join('\n')
+}
+
 /** 记忆段：每条都带作用域、时间与置信度，让模型知道"这可能不适用于当前项目"。 */
 export function renderMemories(hits: readonly MemoryHit[], limit: number): string {
   if (hits.length === 0) return ''
@@ -228,6 +273,8 @@ export class PromptAssembler {
       scope,
       baseline: this.#baseline,
       persona: loadPersona(this.#db, scope),
+      // 技能只按 (workspaceId, agentId) 取，SQL 里两个条件都写死，见 readSkillBindings。
+      skills: readSkillBindings(this.#db, scope),
       rules,
       patterns,
       pendingRules: this.#pitfalls.pending().length,
@@ -241,6 +288,7 @@ export class PromptAssembler {
       scope,
       baseline: this.#baseline,
       persona: loadPersona(this.#db, scope),
+      skills: readSkillBindings(this.#db, scope),
       rules: this.#pitfalls.injectable(scope).rules,
       patterns: this.#pitfalls.injectable(scope).patterns,
       pendingRules: this.#pitfalls.pending().length,
