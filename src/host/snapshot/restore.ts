@@ -20,6 +20,7 @@ import { assertGitOk, backoffDelay, defaultSleep, type GitRunner, type SleepFn }
 import { readManifest, snapshotIdOf } from './manifest.js'
 import { rehydratePersonaFromRepo } from '../prompt/persona-rehydrate.js'
 import { rehydrateSkillsFromRepo } from '../prompt/skill-rehydrate.js'
+import { rehydrateUserProfilesFromRepo } from '../prompt/user-profile-rehydrate.js'
 import { createHash } from 'node:crypto'
 
 /** 结构化恢复错误：`code` 直接映射成 UI 上的原因。 */
@@ -70,6 +71,7 @@ interface ReplayStats {
   forgotten: number
   quarantined: number
   skills: number
+  userProfiles: number
   deferred: number
   skipped: number
 }
@@ -96,6 +98,7 @@ export class ReplayApplier {
       forgotten: 0,
       quarantined: 0,
       skills: 0,
+      userProfiles: 0,
       deferred: 0,
       skipped: 0,
     }
@@ -221,6 +224,35 @@ export class ReplayApplier {
               [workspaceId, agentId, skillId],
             )
             stats.skills++
+            break
+          }
+          case 'user_profile.set': {
+            // 用户画像必须跟着漫游：换台机器开机，它得记得对面是谁。
+            // 这一条如果掉了，表现出来不是报错，而是"模型开始管用户叫另一个人名"。
+            const workspaceId = str(record.workspaceId)
+            if (!workspaceId) {
+              stats.skipped++
+              break
+            }
+            this.#db.run(
+              `INSERT INTO user_profile (workspace_id, display_name, preferred_address, notes, updated_at, updated_by)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(workspace_id) DO UPDATE SET
+                 display_name      = excluded.display_name,
+                 preferred_address = excluded.preferred_address,
+                 notes             = excluded.notes,
+                 updated_at        = MAX(user_profile.updated_at, excluded.updated_at),
+                 updated_by        = excluded.updated_by`,
+              [
+                workspaceId,
+                str(record.displayName) ?? '',
+                str(record.preferredAddress) ?? '',
+                str(record.notes) ?? '',
+                num(record.at) ?? Date.now(),
+                str(record.updatedBy) ?? 'snapshot',
+              ],
+            )
+            stats.userProfiles++
             break
           }
           default: {
@@ -437,6 +469,17 @@ export class RestoreEngine {
     })
     if (skills.present) {
       this.#onWarn(`技能回灌：${skills.agents} 个 Agent / ${skills.bindings} 条绑定`)
+    }
+
+    // 用户画像回灌：走 state/user-profile.json。同样是对齐语义——
+    // 文件里有的工作区照抄，没有的工作区保持本机现状（老快照不许清空画像）。
+    const profiles = await rehydrateUserProfilesFromRepo({
+      db: this.#db,
+      root: this.#root,
+      onWarn: this.#onWarn,
+    })
+    if (profiles.present) {
+      this.#onWarn(`用户画像回灌：${profiles.profiles} 个工作区`)
     }
 
     await this.#journal.open()

@@ -136,4 +136,4 @@ self-test 覆盖：多 Agent 记忆隔离 · 跨工作区检索为 0 · 投毒�
 
 **完整提交对比**：[`v0.1.0...v0.2.0`](https://github.com/Thousand-Beam/dsh-shared-memories/compare/v0.1.0...v0.2.0)
 
-MIT © 2026 YG
+MIT © 2026 The dsh-shared-memories Authors

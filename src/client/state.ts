@@ -34,6 +34,7 @@ export type {
   RulesBundle,
   RuleStage,
   SnapshotNode,
+  UserProfileDto,
 } from '../shared/console-api.js'
 
 import type {

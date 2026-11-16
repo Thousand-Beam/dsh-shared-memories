@@ -17,6 +17,7 @@ import { api } from './api.js'
 import { useConsole, useStore } from './state.js'
 import { stageLabel, traitLabel } from './i18n.js'
 import { agentLabel, formatDateTime, formatRelative, shortCode } from './format.js'
+import { PERSONA_BEHAVIOUR_TONE, renderTraitLine } from '../shared/persona-tone.js'
 import { CardSkeleton, EmptyState, Modal, Pill, Stat, Tag } from './ui.js'
 
 const STAGES: ReadonlyArray<RuleStage> = ['observation', 'lesson', 'pattern', 'rule']
@@ -185,19 +186,9 @@ export function RulesView(): ReactNode {
                   onChange={(event) => setPersona({ ...persona, name: event.target.value })}
                 />
               </label>
-              <label className='dsm-field'>
-                <span className='dsm-field-label' title='内部字段 age：人格演化的基线刻度，不在卡片上展示'>
-                  成长刻度
-                </span>
-                <input
-                  className='dsm-input dsm-input--sm dsm-num'
-                  type='number'
-                  min={1}
-                  max={99}
-                  value={persona.age}
-                  onChange={(event) => setPersona({ ...persona, age: Number(event.target.value) })}
-                />
-              </label>
+              {/* 「成长刻度」（内部字段 age）已从界面隐去：
+                  它只存库、只随快照漫游，不参与提示渲染。人格由下面的特质驱动，
+                  界面上再放一个数字，只会诱导用户去调它、也诱导模型去念它。 */}
             </div>
 
             <div className='dsm-filter-block'>
@@ -531,18 +522,22 @@ function ConfirmPersonaDialog(props: {
 
 /* ── 注入文本渲染 ─────────────────────────────────────────────────────── */
 
+/**
+ * 预览"真正会注入给模型的文本"。
+ *
+ * 人格段直接复用 `shared/persona-tone.ts` 里那份常量与倾向格式化函数，
+ * 与 `host/prompt/sections.ts` 的 `renderPersona` 是同一份来源——
+ * 预览一旦比真实提示"更漂亮"，用户就会以为模型看到了他看不到的东西。
+ * 这里**不出现年龄**：那个字段只存库、只随快照漫游，不参与渲染。
+ */
 function renderPersonaMarkdown(persona: PersonaDoc, items: RuleItem[]): string {
   const lines: string[] = []
-  lines.push('## 你是一个正在成长的探索者')
+  lines.push('## 当前人格')
   lines.push('')
-  lines.push(`名字：${persona.name}｜心理年龄：${persona.age}`)
+  lines.push(`- 称呼：${persona.name}`)
+  lines.push(renderTraitLine(persona.traits))
+  lines.push(...PERSONA_BEHAVIOUR_TONE)
   lines.push('')
-  const traits = Object.entries(persona.traits)
-  if (traits.length > 0) {
-    lines.push('性格倾向：')
-    for (const [key, value] of traits) lines.push(`- ${key}: ${value.toFixed(2)}`)
-    lines.push('')
-  }
   const patterns = items.filter((item) => item.stage === 'pattern' || item.stage === 'rule')
   if (patterns.length > 0) {
     lines.push('### 经验模式')

@@ -20,6 +20,7 @@ import type {
   RulesBundle,
   RuleStage,
   SnapshotNode,
+  UserProfileDto,
 } from './state.js'
 
 const BASE = '/dsh/shared-memories'
@@ -178,6 +179,18 @@ export const api = {
     request<{ rejected: boolean }>('/rules/reject', {
       method: 'POST',
       body: JSON.stringify({ requestId }),
+    }),
+
+  /**
+   * 用户画像：按工作区存，跨 Agent 共享。
+   * 它不属于某个 Agent——所以调用方不需要、也不该传 agentId。
+   */
+  userProfile: () => request<UserProfileDto>('/user-profile'),
+
+  saveUserProfile: (body: { displayName?: string; preferredAddress?: string; notes?: string }) =>
+    request<UserProfileDto>('/user-profile', {
+      method: 'POST',
+      body: JSON.stringify(body),
     }),
 }
 

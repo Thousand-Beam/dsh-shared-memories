@@ -17,7 +17,7 @@ import type { SqlDriver } from '../../shared/types.js'
  * v2 → v3：`agent_skill`（技能挂载关系随 (workspace, agent) 隔离，并跟着快照漫游）。
  * 因为 v1 从未发布，这里用"建表时就带列 + 老库补一列"的双保险写法。
  */
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 
 /**
  * 全量 DDL。全部 `IF NOT EXISTS`，可以在任何状态下重复执行。
@@ -167,6 +167,25 @@ CREATE TABLE IF NOT EXISTS agent_skill (
 );
 CREATE INDEX IF NOT EXISTS ix_agent_skill_scope ON agent_skill(workspace_id, agent_id);
 
+-- 用户画像：**跨 Agent、按工作区**的那一份"你是谁"。
+--
+-- 为什么不是一张 kind='user_profile' 的记忆卡：
+--   记忆卡的每条 SQL 都硬拼「AND e.agent_id = ?」（隔离的根基）。若为了注入用户画像
+--   去开一条"没有 agent_id"的旁路，那条旁路就是将来串台的入口。
+--   所以它单独成表、只有 workspace 维度，读它的时候**不可能**带错 agent。
+--
+-- 为什么必须有它：
+--   没有这张表之前，模型只能从"训练语料 / 仓库作者名 / 提交记录 / 设备名"里猜用户是谁，
+--   于是出现了把 README 里的署名当成用户名字来叫的事故。名字必须是显式数据。
+CREATE TABLE IF NOT EXISTS user_profile (
+  workspace_id      TEXT PRIMARY KEY,
+  display_name      TEXT NOT NULL DEFAULT '',
+  preferred_address TEXT NOT NULL DEFAULT '',
+  notes             TEXT NOT NULL DEFAULT '',
+  updated_at        INTEGER NOT NULL,
+  updated_by        TEXT NOT NULL DEFAULT 'user'
+);
+
 -- 审计：全局检索、记忆修正、隔离区操作都必须留痕
 CREATE TABLE IF NOT EXISTS audit_log (
   audit_id       TEXT PRIMARY KEY,
@@ -226,6 +245,11 @@ export function migrate(db: SqlDriver, target = SCHEMA_VERSION): { from: number;
   if (from > 0 && from < 3) {
     // v2 → v3：agent_skill 表由上面的 SCHEMA_SQL（IF NOT EXISTS）建好，没有数据要搬。
     // 这里显式留一段，是为了让"加表"也走迁移路径，而不是靠"反正每次都执行全量 DDL"。
+  }
+  if (from > 0 && from < 4) {
+    // v3 → v4：user_profile 表同样是纯新增，无数据搬迁。
+    // 老库第一次启动时它是空的 —— 空画像会走"别猜名字，直接问"的兜底提示，
+    // 而不是退回"从仓库署名里猜个人名"的老路。
   }
   try {
     db.exec(`PRAGMA user_version = ${target}`)

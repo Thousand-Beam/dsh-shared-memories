@@ -26,6 +26,8 @@ import { deriveWorkspaceId, type Scope } from './shared/scope.js'
 import type { SqlDriver } from './shared/types.js'
 import type { SkillBinding } from './shared/skills.js'
 import { normalizeBindings } from './shared/skills.js'
+import { profileAddress, type UserProfile } from './shared/user-profile.js'
+import { UserProfileStore } from './host/memory/user-profile.js'
 import { readSkillBindings } from './host/memory/skill-registry.js'
 import { SkillRegistry } from './host/memory/skill-registry.js'
 import { TemporalTree } from './host/memory/timetree.js'
@@ -119,6 +121,14 @@ interface Runtime {
   importer?: Importer
   pitfalls?: PitfallStore
   skills?: SkillRegistry
+  /**
+   * 用户画像仓库（带 journal）。
+   *
+   * 单独挂在 runtime 上而不是每次 `new UserProfileStore(...)`：HTTP 写入必须走
+   * **同一个带 journal 的实例**，否则接口改完画像、换机器恢复时却看不到这次修改
+   * （journal 里没这条事件，得等下一次整库快照才补上）。
+   */
+  userProfile?: UserProfileStore
   /**
    * 当前进程里活着的 agent 与会话。
    *
@@ -239,7 +249,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         authorName: config.repo.authorName,
         authorEmail: config.repo.authorEmail,
         onWarn: warn,
-        collectState: () => ({ agents: collectAgents(runtime) }),
+        collectState: () => ({ agents: collectAgents(runtime), userProfiles: collectProfiles(runtime) }),
       })
 
       runtime.restore = new RestoreEngine({
@@ -273,6 +283,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       // 技能注册表带 journal：控制台上的挂载/卸载/开关都会写 `skill.*` 事件，
       // 这样"没来得及打快照就换机"也不会丢技能。
       runtime.skills = new SkillRegistry({ db, journal, clock: () => Date.now(), onWarn: warn })
+    runtime.userProfile = new UserProfileStore({ db, journal, clock: () => Date.now(), onWarn: warn })
 
       const outcome = await runtime.restore.restoreOnBoot()
       runtime.booted = true
@@ -343,6 +354,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       setIntervalSec: applyInterval,
       pitfalls: () => runtime.pitfalls,
       skills: () => runtime.skills,
+    userProfile: () => runtime.userProfile,
       importMemories: async (input) => {
         if (!runtime.importer) throw new Error('记忆库尚未就绪')
         const report = await runtime.importer.import({
@@ -575,6 +587,21 @@ function collectAgents(runtime: Runtime): SnapshotAgentState[] {
 }
 
 /**
+ * 用户画像快照采集：整表上行。
+ *
+ * 画像只有 workspace 维度、体积极小（一个工作区一行），所以不做筛选——
+ * 少带一个工作区，就等于那台机器恢复后忘掉一个项目里的称呼。
+ */
+function collectProfiles(runtime: Runtime): UserProfile[] {
+  if (!runtime.db) return []
+  try {
+    return new UserProfileStore({ db: runtime.db }).all()
+  } catch {
+    return []
+  }
+}
+
+/**
  * 重建提示词缓存。
  *
  * 只放"每次对话都值得花钱的"内容：人格摘要 + 已确认规则 + 少量高重要度记忆。
@@ -611,8 +638,17 @@ async function refreshPrompt(runtime: Runtime, config: SharedConfig): Promise<vo
     const rules = safeHits(query, { kinds: ['pitfall', 'preference', 'persona'], limit: 6 })
     const lines: string[] = []
     lines.push('## 你的记忆与人格（dsh-shared-memories）')
+    // 用户画像：**按 workspace 取，与 agent 无关**——换会话、换 Agent 都还是同一个人。
+    // 没有画像时不写"用户是 X"，而是写清"不知道，别猜"：留空等于把猜的权力交还模型。
+    const profile = safeProfile(runtime, runtime.workspaceId)
+    const address = profileAddress(profile)
+    if (address !== '') {
+      lines.push(`- 你的用户：${address}（称呼就用这个，不要改写成别的人名）`)
+    } else {
+      lines.push('- 你的用户：名字尚未记录。不要从仓库署名、提交记录或设备名里猜，需要时直接问。')
+    }
     lines.push(
-      `- 当前智能体：${persona?.name || agentId}${persona?.age ? `（${persona.age} 岁人格基线）` : ''}`,
+      `- 当前智能体：${persona?.name || agentId}`,
     )
     lines.push(`- 工作区：${runtime.workspaceId}`)
     lines.push(`- 底线：${config.persona.baselineNotice}`)
@@ -636,6 +672,15 @@ async function refreshPrompt(runtime: Runtime, config: SharedConfig): Promise<vo
 }
 
 /** 检索失败不该拖垮对话：拿不到记忆就当没有。 */
+function safeProfile(runtime: Runtime, workspaceId: string): UserProfile | undefined {
+  if (!runtime.db) return undefined
+  try {
+    return new UserProfileStore({ db: runtime.db }).get(workspaceId)
+  } catch {
+    return undefined
+  }
+}
+
 function safeHits(query: ScopedQuery, options: Parameters<ScopedQuery['search']>[0]): MemoryHit[] {
   try {
     return query.search(options)

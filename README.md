@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-3da639.svg?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-339933.svg?style=flat-square)](https://nodejs.org)
 [![DSH](https://img.shields.io/badge/dsh-%E2%89%A50.2.1--rc.3-4c6ef5.svg?style=flat-square)](https://github.com/deepseek-ai)
-[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-69%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
 [![No CDN](https://img.shields.io/badge/frontend-%E9%9B%B6%E5%A4%96%E9%93%BE%E3%80%81%E9%9B%B6%20CDN-8957e5.svg?style=flat-square)](#控制台)
 
 <img src="docs/screenshots/console-memory-dark.png" alt="记忆控制台 · 深色" width="880">
@@ -276,7 +276,61 @@ snapshot
 `memory_search` 不需要额外加参数来“保证隔离”——因为 `ScopedQuery` 的 SQL 里 `AND e.workspace_id = ? AND e.agent_id = ?` 是**编译期拼死的**，唯一的例外是一个带 `reason`/`ttl` 的 `GlobalToken`，而且要用户在控制台手动开「全局检索」并留审计。技能再多也绕不过这条：工具能调什么，和它能查到什么，是两个独立的闸门。
 
 ```bash
-npm run self-test   # 第 ④ 段就是技能隔离，第 ⑤ 段验证换机后技能一起到位
+npm run self-test   # 第 ④ 段技能隔离，第 ⑤ 段用户画像，第 ⑥ 段验证换机后两者都到位
+```
+
+---
+
+## 用户画像（User Profile）：它得记得你是谁
+
+有一类翻车比丢记忆更烦人：**模型不知道你叫什么，于是从 README 的署名里捡了一个名字，然后一直那么叫。** 记忆和人格都做了漫游，唯独"你是谁"没存，每次新会话都得重新自我介绍。
+
+### 为什么不复用记忆卡
+
+`kind='user_profile'` 的记忆卡看着更省事，但那是个陷阱：记忆卡的每一条 SQL 都硬拼 `AND e.agent_id = ?`——**按 Agent 隔离是这套插件的根基**。为了注入画像在记忆表上开一个旁路查询，就是将来串台的入口。所以单独一张表：
+
+```sql
+CREATE TABLE user_profile (
+  workspace_id      TEXT PRIMARY KEY,
+  display_name      TEXT NOT NULL DEFAULT '',
+  preferred_address TEXT NOT NULL DEFAULT '',
+  notes             TEXT NOT NULL DEFAULT '',
+  updated_at        INTEGER NOT NULL,
+  updated_by        TEXT NOT NULL DEFAULT 'user'
+);
+```
+
+维度是**工作区**，不是 Agent：
+
+- 换个 Agent → 还是同一个人（你不需要跟小狐狸重新自我介绍）
+- 换个工作区 → 读不到（不同项目可能是不同的人，A 客户的称呼不该漏到 B 客户）
+
+### 三层：存、漫游、注入
+
+| 层 | 实现 |
+|---|---|
+| 存 | `UserProfileStore.save()`：UPSERT + journal `op:'user_profile.set'`，payload 带全字段 |
+| 漫游 | 快照写 `state/user-profile.json`（空画像也写）；恢复时 `journal` 重放 + `rehydrateUserProfilesFromRepo()` 对齐 |
+| 注入 | `SECTION_ORDERS.userProfile = 2`，排在底线与人格**之前**——先知道"你是谁"，再谈"我是谁" |
+
+注入文案两条分支，缺一不可：
+
+```
+有画像：- 用户叫 张三，希望你称呼为「老张」
+        - 就用这个称呼，不要改写成别的人名，也不要给它加额外的演绎或评价
+没画像：- 名字尚未记录。
+        - 不要猜：不要用仓库作者名、git 提交者、设备名、README 署名或记忆里出现的任何人名来称呼用户。
+        - 需要称呼时直接问一句「我该怎么称呼你」。
+```
+
+**没画像时的"不要猜"才是止住幻觉的关键**——光靠"没有数据"它照样会编。
+
+### 在控制台里填
+
+全局总览页顶部有「用户画像」卡片，三个字段（名字 / 希望怎么称呼 / 偏好备注），存进当前工作区。备注会被折叠成一行——因为它要拼进提示，允许换行等于允许往提示里插段落。
+
+```bash
+npm run self-test   # 第 ⑤ 段：换 Agent 记得你，换工作区读不到，没画像时提示要求"别猜"
 ```
 
 ---
@@ -317,7 +371,7 @@ npm run self-test   # 第 ④ 段就是技能隔离，第 ⑤ 段验证换机后
 npm run build        # tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/wrap-client.mjs
 npm run typecheck    # 两份 tsconfig 都 --noEmit
 npm test             # tsc -p tsconfig.test.json && node --test .test-build/test/**/*.spec.js
-npm run self-test    # 端到端自测：真 git 仓库 + 真 SQLite + 冷启动恢复，39 条断言
+npm run self-test    # 端到端自测：真 git 仓库 + 真 SQLite + 冷启动恢复，50 条断言
 npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ http://127.0.0.1:5199/
 ```
 
@@ -332,15 +386,17 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
              记忆池不受污染；同一句话来自 user 时正常放行
 ④ 技能       A 挂 code-exec（启用）与 web-search（停用），B 与换工作区都读不到；
              总览只拿到数量，拿不到别人的技能清单
-⑤ 冷启动     A 机 snapshot('shutdown') → 推到 bare 仓库；B 机全新目录 restoreOnBoot()
-             → pull → 验签 → 重放 14 条记录 → ready；A 的记忆在 B 逐字可检索，
-             人格 / 技能（含停用状态）/ 隔离区一起漫游；篡改快照文件后重跑
+⑤ 画像       工作区记住「张三 / 老张」；换 Agent 还是同一个人，换工作区读不到；
+             提示里有称呼就写称呼、没有就写「不要猜」；空画像不许从仓库署名里捡名字
+⑥ 冷启动     A 机 snapshot('shutdown') → 推到 bare 仓库；B 机全新目录 restoreOnBoot()
+             → pull → 验签 → 重放 15 条记录 → ready；A 的记忆在 B 逐字可检索，
+             人格 / 技能（含停用状态）/ 用户画像 / 隔离区一起漫游；篡改快照文件后重跑
              → degraded + snapshot-corrupt 且拒写
 ```
 
 最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
-- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），56 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、journal 合并、HTTP 路由、端到端漫游。
+- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），69 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、journal 合并、HTTP 路由、端到端漫游。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。
 - 运行时缺 `node:sqlite` 时测试**跳过而非失败**——CI 该红在真 bug 上，不该红在 Node 版本上。
 - 发布流程（打 tag、推 GitHub、发 npm、提 awesome 收录）见 [docs/PUBLISH.md](docs/PUBLISH.md)。
@@ -375,6 +431,6 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 
 ## License
 
-MIT © 2026 YG
+MIT © 2026 The dsh-shared-memories Authors
 
 <div align="center"><sub>关机即快照，开机即还原。你的 AI 不该因为换台电脑就失忆。</sub></div>

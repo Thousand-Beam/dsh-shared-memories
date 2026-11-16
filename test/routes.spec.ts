@@ -375,7 +375,7 @@ test('GET/POST /quarantine：列表用 score 不用 risk，洗白必须重开版
 
   const approved = await call(h.base, '/quarantine/approve', {
     method: 'POST',
-    body: { quarantineId: 'q_1', by: 'yg' },
+    body: { quarantineId: 'q_1', by: 'someone' },
   })
   assert.equal(approved.status, 200)
   assert.equal(h.reopened.length, 1, '洗白必须走 reopenQuarantine，而不是偷偷改状态')

@@ -20,6 +20,7 @@ import type { Dirent } from 'node:fs'
 import { join } from 'node:path'
 import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeBindings } from '../../shared/skills.js'
+import type { UserProfile } from '../../shared/user-profile.js'
 import {
   assertGitOk,
   backoffDelay,
@@ -62,6 +63,15 @@ export interface SnapshotAgentState {
 
 export interface SnapshotState {
   readonly agents: readonly SnapshotAgentState[]
+  /**
+   * 用户画像：落到 `state/user-profile.json`。
+   *
+   * 它是**按 workspace** 的，不属于任何一个 agent，所以不能塞进 agents[]。
+   * 换机器恢复时若丢了它，Agent 人格还在、记忆还在，但它会忘了"对面是谁"——
+   * 于是又开始从 README 署名里猜人名。这类"看起来只是称呼错了"的退化，
+   * 比丢一条记忆更伤信任。
+   */
+  readonly userProfiles?: readonly UserProfile[]
   /** 额外需要纳入快照的仓库相对路径（如自建的 markdown 笔记）。 */
   readonly extraFiles?: readonly string[]
 }
@@ -460,7 +470,41 @@ export class SnapshotEngine {
       'utf8',
     )
     await this.#writeSkillState(stateDir, state)
+    await this.#writeUserProfileState(stateDir, state)
     return state
+  }
+
+  /**
+   * 用户画像落盘。一个工作区一条，**空画像也写**。
+   *
+   * 和技能同一个理由：恢复端必须能区分"这个工作区真的有画像但内容为空"与
+   * "这版快照根本不记画像"。前者应当覆盖、后者必须原样保留本机现状。
+   */
+  async #writeUserProfileState(stateDir: string, state: SnapshotState): Promise<void> {
+    const profiles = [...(state.userProfiles ?? [])]
+      .sort((a, b) => a.workspaceId.localeCompare(b.workspaceId))
+      .map((profile) => ({
+        workspaceId: profile.workspaceId,
+        displayName: profile.displayName,
+        preferredAddress: profile.preferredAddress,
+        notes: profile.notes,
+        updatedAt: profile.updatedAt,
+        updatedBy: profile.updatedBy,
+      }))
+    await writeFile(
+      join(stateDir, 'user-profile.json'),
+      `${JSON.stringify(
+        {
+          version: 1,
+          device: this.#deviceId,
+          capturedAt: this.#clock(),
+          profiles,
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    )
   }
 
   /**

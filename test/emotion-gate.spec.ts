@@ -28,7 +28,7 @@ async function harness(t: import('node:test').TestContext) {
 }
 
 const valid: EmotionAttribution = {
-  subject: 'YG',
+  subject: 'someone',
   trigger: '依赖装不上卡了两小时',
   label: 'anxiety',
   intensity: 0.8,
@@ -43,14 +43,14 @@ test('合格的情感归因：原样入库，并进入 journal', async (t) => {
     scope,
     kind: 'episode',
     subjectKey: 'incident:2026-11-16/dependency-install',
-    text: '依赖安装卡住时 YG 明显焦虑，后来改成 tarball 直链解决',
+    text: '依赖安装卡住时用户明显焦虑，后来改成 tarball 直链解决',
     validFrom: NOW,
     emotion: valid,
     author: 'agent',
   })
   await h.journal.flush()
 
-  assert.equal(opened.version.emo_subject, 'YG')
+  assert.equal(opened.version.emo_subject, 'someone')
   assert.equal(opened.version.emo_trigger, '依赖装不上卡了两小时')
   assert.equal(opened.version.emo_label, 'anxiety')
   assert.equal(opened.version.emo_intensity, 0.8)

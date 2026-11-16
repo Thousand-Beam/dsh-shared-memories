@@ -69,7 +69,7 @@ export type EntityStatus = 'active' | 'merged' | 'quarantined' | 'forgotten'
  * 只有 `confidence >= 阈值` 才会被写入；否则整块置 null，宁可没有也不留幻觉。
  */
 export interface EmotionAttribution {
-  /** 谁产生/承受了这个情绪，如 "YG"、"agent"。 */
+  /** 谁产生/承受了这个情绪，如 "用户"、"agent"。 */
   readonly subject: string
   /** 因为什么事，如 "插件安装卡死 40 分钟"。 */
   readonly trigger: string

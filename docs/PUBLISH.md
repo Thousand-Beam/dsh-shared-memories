@@ -83,10 +83,10 @@ gh repo create dsh-shared-memories --private \
   --description "Git-native external brain and full-state roaming engine for DeepSeek Harness"
 
 # 没有 gh CLI 就用网页建，然后：
-# git remote add origin git@github.com:YG/dsh-shared-memories.git
+# git remote add origin git@github.com:Thousand-Beam/dsh-shared-memories.git
 
 # 3.2 关联（若 gh 已自动加过 origin，跳过这一行）
-git remote add origin git@github.com:YG/dsh-shared-memories.git
+git remote add origin git@github.com:Thousand-Beam/dsh-shared-memories.git
 
 # 3.3 首推：分支 + tag 一起
 git push -u origin main
@@ -144,7 +144,7 @@ npm publish --access public
 
 ```bash
 # fork 目标仓库后
-git clone git@github.com:YG/awesome-dsh-plugin.git
+git clone git@github.com:Thousand-Beam/awesome-dsh-plugin.git
 cd awesome-dsh-plugin
 
 # 情况 A：条目集中在一个文件里
@@ -163,7 +163,7 @@ PR 正文模板：
 ```markdown
 ### 插件
 - 名称：dsh-shared-memories
-- 仓库：https://github.com/YG/dsh-shared-memories
+- 仓库：https://github.com/Thousand-Beam/dsh-shared-memories
 - 许可：MIT
 
 ### 一句话

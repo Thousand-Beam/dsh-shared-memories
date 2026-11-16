@@ -39,6 +39,22 @@ export interface SkillsBundle {
   items: SkillBindingDto[]
 }
 
+/**
+ * 用户画像 DTO。
+ *
+ * 带一个算好的 `address`：有效称呼（preferredAddress 优先，否则 displayName）。
+ * 前端与提示层用同一个字段，避免两处各算一遍导致"界面叫老张、提示叫张三"。
+ */
+export interface UserProfileDto {
+  workspaceId: string
+  displayName: string
+  preferredAddress: string
+  address: string
+  notes: string
+  updatedAt: number
+  updatedBy: string
+}
+
 export interface MemoryCard {
   entityId: string
   versionId: string

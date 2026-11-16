@@ -212,6 +212,8 @@ async function main() {
     { RestoreEngine },
     { ExecGitRunner },
     { SkillRegistry, readSkillBindings, countSkills },
+    { UserProfileStore },
+    { renderUserProfile },
   ] = await Promise.all([
     import('../lib/shared/journal.js'),
     import('../lib/host/storage/schema.js'),
@@ -223,6 +225,8 @@ async function main() {
     import('../lib/host/snapshot/restore.js'),
     import('../lib/host/snapshot/git.js'),
     import('../lib/host/memory/skill-registry.js'),
+    import('../lib/host/memory/user-profile.js'),
+    import('../lib/host/prompt/sections.js'),
   ])
 
   const db = await openDb(schema)
@@ -359,8 +363,41 @@ async function main() {
     coder: readSkillBindings(db, scopeB),
   })
 
-  /* ── ⑤ 快照 + 冷启动恢复 ───────────────────────────────────────────── */
-  step('⑤ 快照漫游：A 关机落盘 → 推到裸仓库 → B 冷启动恢复')
+  /* ── ⑤ 用户画像 ─────────────────────────────────────────────────────── */
+  step('⑤ 用户画像：A 机记住的名字，不属于某个 Agent，也不许靠猜')
+
+  const profiles = new UserProfileStore({ db, journal, clock: () => NOW })
+  await profiles.save(WORKSPACE, {
+    displayName: '张三',
+    preferredAddress: '老张',
+    notes: '偏好简体中文，讨厌废话',
+  })
+
+  const mine = profiles.get(WORKSPACE)
+  check(mine.displayName === '张三', '工作区记住了用户名字', mine.displayName)
+  check(mine.preferredAddress === '老张', '记住了希望被怎么称呼', mine.preferredAddress)
+  // 跨 Agent 共享：换个 Agent 还是同一个人。这是"新会话不失忆"的数据基础。
+  const coderProfile = profiles.get(WORKSPACE)
+  check(coderProfile.displayName === '张三', '换 Agent（coder）读到的还是同一个用户')
+  // 跨工作区隔离：别的项目读不到这个名字。
+  check(
+    profiles.get('ws-other-project').displayName === '',
+    '换工作区读不到（不把 A 项目的称呼泄漏给 B 项目）',
+  )
+
+  const renderedPrompt = renderUserProfile(mine)
+  check(renderedPrompt.includes('老张'), '提示里直接给出称呼「老张」')
+  check(renderedPrompt.includes('不要改写成别的人名'), '提示里明确禁止改名，掐掉"内心戏"')
+  const emptyPrompt = renderUserProfile(undefined)
+  check(
+    emptyPrompt.includes('不要猜') && emptyPrompt.includes('仓库作者名'),
+    '没有画像时提示里写明"不要猜"（这条是 YG 幻觉的正面修复）',
+  )
+
+  const profilesInSnapshot = () => profiles.all()
+
+  /* ── ⑥ 快照 + 冷启动恢复 ───────────────────────────────────────────── */
+  step('⑥ 快照漫游：A 关机落盘 → 推到裸仓库 → B 冷启动恢复')
 
   const bare = await makeBareRemote()
   const engine = new SnapshotEngine({
@@ -371,27 +408,26 @@ async function main() {
     branch: 'main',
     clock: () => NOW,
     // 多智能体：两个 Agent 的人格与技能都要进快照，否则 B 机上"记忆在、能力空"。
-    collectState: () => {
-      const bound = skillsInSnapshot()
-      return {
-        agents: [
-          {
-            agentId: 'lead',
-            workspaceIds: [WORKSPACE],
-            persona: { name: '大肥鱼', age: 11, traits: { curiosity: 0.82 }, baselineHash: 'base-v1' },
-            sessions: ['sess-lead-1'],
-            skills: bound.lead,
-          },
-          {
-            agentId: 'coder',
-            workspaceIds: [WORKSPACE],
-            persona: { name: '小狐狸', age: 9, traits: { rigor: 0.9 }, baselineHash: 'base-v1' },
-            sessions: ['sess-coder-1'],
-            skills: bound.coder,
-          },
-        ],
-      }
-    },
+    // userProfiles 是工作区维度的：它不属于任何 Agent，但必须跟着人一起走。
+    collectState: () => ({
+      agents: [
+        {
+          agentId: 'lead',
+          workspaceIds: [WORKSPACE],
+          persona: { name: '大肥鱼', age: 11, traits: { curiosity: 0.82 }, baselineHash: 'base-v1' },
+          sessions: ['sess-lead-1'],
+          skills: skillsInSnapshot().lead,
+        },
+        {
+          agentId: 'coder',
+          workspaceIds: [WORKSPACE],
+          persona: { name: '小狐狸', age: 9, traits: { rigor: 0.9 }, baselineHash: 'base-v1' },
+          sessions: ['sess-coder-1'],
+          skills: skillsInSnapshot().coder,
+        },
+      ],
+      userProfiles: profilesInSnapshot(),
+    }),
   })
 
   const snapshot = await engine.snapshot('shutdown')
@@ -467,6 +503,19 @@ async function main() {
     '快照里确实有 state/skills.json（技能是"状态"，不是内存里的临时值）',
   )
 
+  // 用户画像：换机器之后依然知道用户叫什么——"新会话失忆"就是在这里被修掉的。
+  const profileOnB = new UserProfileStore({ db: dbB, clock: () => NOW }).get(WORKSPACE)
+  check(profileOnB.displayName === '张三', 'B 机恢复后仍然记得用户叫张三', profileOnB.displayName)
+  check(profileOnB.preferredAddress === '老张', '称呼也一起漫游了', profileOnB.preferredAddress)
+  check(
+    renderUserProfile(profileOnB).includes('老张'),
+    'B 机组出来的提示里直接带着「老张」（新会话不用再问一遍）',
+  )
+  check(
+    snapshot.manifest.files.some((file) => file.path === 'state/user-profile.json'),
+    '快照里有 state/user-profile.json（画像按工作区存，不属于任何 Agent）',
+  )
+
   // 篡改检测：改一个字节，恢复必须降级成只读，而不是"带病 ready"。
   const victim = snapshot.manifest.files.find((file) => file.path.endsWith('.jsonl') || file.path.endsWith('.json'))
   if (victim === undefined) {
@@ -501,8 +550,8 @@ async function main() {
   /* ── 汇总 ───────────────────────────────────────────────────────────── */
   process.stdout.write(`\n${bold('汇总')}：${green(`${passed} 通过`)} / ${failed === 0 ? dim('0 失败') : red(`${failed} 失败`)}\n`)
   if (failed === 0) {
-    process.stdout.write(`${green(bold('全链路通过 ✔'))}  记忆写入 · 多 Agent 隔离 · 防投毒 · 快照冷启动恢复\n`)
-    process.stdout.write(dim('  截图之外的这四条，就是这套插件真正值钱的地方。\n'))
+    process.stdout.write(`${green(bold('全链路通过 ✔'))}  记忆写入 · 多 Agent 隔离 · 防投毒 · 技能与用户画像漫游 · 冷启动恢复\n`)
+    process.stdout.write(dim('  截图之外的这几条，就是这套插件真正值钱的地方。\n'))
   } else {
     process.stdout.write(`${red(bold('有断言失败 ✖'))}  上面每一条都标了期望值与实际值\n`)
     process.exitCode = 1

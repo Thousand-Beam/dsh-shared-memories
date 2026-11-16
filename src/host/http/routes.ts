@@ -27,6 +27,8 @@ import { EMOTION_LABELS, isEmotionLabel } from '../../shared/types.js'
 import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeSkillId, normalizeSkillVersion } from '../../shared/skills.js'
 import { SkillRegistry, countSkills, readSkillBindings } from '../memory/skill-registry.js'
+import { UserProfileStore } from '../memory/user-profile.js'
+import { profileAddress, type UserProfile } from '../../shared/user-profile.js'
 // 值导入：错误映射要靠 instanceof。域错误一旦漏成 500，前端就分不清
 // "你参数错了"和"插件炸了"——这两种情况在 UI 上必须长得不一样。
 import { RestoreBlockedError, RestoreStateError } from '../snapshot/barrier.js'
@@ -48,6 +50,7 @@ import type {
   SnapshotNode,
   SkillBindingDto,
   SkillsBundle,
+  UserProfileDto,
 } from '../../shared/console-api.js'
 
 /** webServer 服务的最小面（真实实现由宿主提供）。 */
@@ -98,6 +101,13 @@ export interface MemoriesApiDeps {
    * `skill.bind` 写进事件日志，技能变更才能在不打快照的情况下也跟着漫游。
    */
   skills?(): SkillRegistry | undefined
+  /**
+   * 用户画像仓库（带 journal 的那一个）。
+   *
+   * 和 skills 同理：只有带 journal 的实例才写得进事件日志，
+   * 画像才能在不打快照的情况下也随 journal 漫游。
+   */
+  userProfile?(): UserProfileStore | undefined
 }
 
 export const API_PREFIX = '/dsh/shared-memories'
@@ -155,6 +165,14 @@ async function dispatch(
       const body = await readJson(req)
       deps.barrier.assertWritable('skill-edit')
       return sendJson(res, 200, ok(writeSkills(deps, body)))
+    }
+    if (method === 'GET' && path === '/user-profile') {
+      return sendJson(res, 200, ok(readUserProfile(deps)))
+    }
+    if (method === 'POST' && path === '/user-profile') {
+      const body = await readJson(req)
+      deps.barrier.assertWritable('user-profile-edit')
+      return sendJson(res, 200, ok(await writeUserProfile(deps, body)))
     }
     if (method === 'GET' && path === '/rules') {
       return sendJson(res, 200, ok(readRules(deps, url)))
@@ -731,6 +749,75 @@ function scopeOf(deps: MemoriesApiDeps, agentId: string): Scope {
  * 读技能绑定。**只读当前 (workspace, agent)**，没有"列出全部 Agent 的技能"这种用法：
  * 控制台如果想显示别的 Agent，必须自己带上那个 agentId 逐个问，且每次都留审计。
  */
+/**
+ * 读用户画像。
+ *
+ * 返回 `address`（有效称呼）是刻意的：前端不该自己再实现一遍
+ * "preferredAddress 优先、否则 displayName"的规则，两处实现迟早会不一致，
+ * 而不一致的后果是"提示里叫老张、界面上叫张三"。
+ */
+function readUserProfile(deps: MemoriesApiDeps): UserProfileDto {
+  const store = deps.userProfile?.() ?? (deps.db() ? new UserProfileStore({ db: deps.db() as SqlDriver }) : undefined)
+  if (!store) {
+    return { workspaceId: deps.workspaceId, displayName: '', preferredAddress: '', address: '', notes: '', updatedAt: 0, updatedBy: '' }
+  }
+  return toProfileDto(store.get(deps.workspaceId))
+}
+
+function toProfileDto(profile: UserProfile): UserProfileDto {
+  return {
+    workspaceId: profile.workspaceId,
+    displayName: profile.displayName,
+    preferredAddress: profile.preferredAddress,
+    address: profileAddress(profile),
+    notes: profile.notes,
+    updatedAt: profile.updatedAt,
+    updatedBy: profile.updatedBy,
+  }
+}
+
+/**
+ * 写用户画像。
+ *
+ * 写审计是硬要求：名字被人改掉而没有人知道，是这个插件里最难查的一类事故
+ * ——模型会立刻开始用新名字称呼用户，而界面上的"人"没有任何变化。
+ */
+async function writeUserProfile(
+  deps: MemoriesApiDeps,
+  body: Record<string, unknown>,
+): Promise<UserProfileDto> {
+  const db = deps.db()
+  if (!db) throw new ApiError('not-ready', '记忆库尚未就绪', 503)
+  const store = deps.userProfile?.() ?? new UserProfileStore({ db })
+  const by = str(body.by) ?? 'user'
+  const profile = await store.save(
+    deps.workspaceId,
+    {
+      displayName: str(body.displayName) ?? '',
+      preferredAddress: str(body.preferredAddress) ?? '',
+      notes: str(body.notes) ?? '',
+    },
+    by,
+  )
+  try {
+    db.run(
+      `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
+       VALUES (?,?,?,?,?,?)`,
+      [
+        `aud_${Date.now().toString(36)}`,
+        deps.workspaceId,
+        '',
+        'user-profile.update',
+        JSON.stringify({ address: profileAddress(profile), by }),
+        Date.now(),
+      ],
+    )
+  } catch {
+    // 审计失败不回滚画像：画像是"用户自己填的"，不该因为写日志失败就丢掉。
+  }
+  return toProfileDto(profile)
+}
+
 function readSkills(deps: MemoriesApiDeps, url: URL): SkillsBundle {
   const agentId = url.searchParams.get('agentId') ?? 'default'
   const db = deps.db()

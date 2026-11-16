@@ -324,7 +324,9 @@ export const Config: Schema<Config> = Schema.object({
 
   persona: Schema.object({
     enabled: Schema.boolean().default(true).description('是否启用涌现式人格。'),
-    startAge: Schema.natural().min(1).max(100).default(10).description('起始心智年龄（十岁探索者）。'),
+    startAge: Schema.natural().min(1).max(100).default(10).description(
+      '内部字段 age 的初值：只存库、随快照漫游，不参与提示渲染（人格由 traits 驱动）。',
+    ),
     traitShiftMax: Schema.number().min(0).max(0.2).default(0.05).description('单次特质最大位移。'),
     baselineNotice: Schema.string()
       .default('不做危害性行为；不提供外挂/绕过类帮助；不伪造身份与凭据。')

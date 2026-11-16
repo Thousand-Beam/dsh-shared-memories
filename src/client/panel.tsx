@@ -14,7 +14,7 @@
 
 import { createElement, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import type { AgentSummary } from '../shared/console-api.js'
+import type { AgentSummary, UserProfileDto } from '../shared/console-api.js'
 import { api } from './api.js'
 import { ConsoleContext, ConsoleStore, useConsole, useStore, type ViewKey } from './state.js'
 import { installConsoleStyles } from './styles.js'
@@ -482,6 +482,117 @@ function QuarantineView(): ReactNode {
 
 /* ── 全局总览 ─────────────────────────────────────────────────────────── */
 
+/**
+ * 用户画像：这是"新会话失忆"的正面修复。
+ * 它按工作区存、跨 Agent 共享，所以这块 UI 不跟随 Agent 切换。
+ * 没有它，模型就只能从 README 署名、设备名里猜一个名字——上一版猜出来的就是仓库作者名。
+ */
+function UserProfileCard(): ReactNode {
+  const store = useStore()
+  const [profile, setProfile] = useState<UserProfileDto | null>(null)
+  const [name, setName] = useState('')
+  const [address, setAddress] = useState('')
+  const [notes, setNotes] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    void api
+      .userProfile()
+      .then((loaded) => {
+        if (!alive) return
+        setProfile(loaded)
+        setName(loaded.displayName)
+        setAddress(loaded.preferredAddress)
+        setNotes(loaded.notes)
+      })
+      .catch(() => {
+        if (alive) setFailed(true)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const save = async (): Promise<void> => {
+    setBusy(true)
+    try {
+      const saved = await api.saveUserProfile({ displayName: name, preferredAddress: address, notes })
+      setProfile(saved)
+      setName(saved.displayName)
+      setAddress(saved.preferredAddress)
+      setNotes(saved.notes)
+      store.toast('ok', saved.displayName === '' ? '画像已清空' : `已记住：${saved.address}`)
+    } catch (cause) {
+      store.toast('error', cause instanceof Error ? cause.message : '保存失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const empty = profile !== null && profile.displayName === '' && profile.preferredAddress === '' && profile.notes === ''
+
+  return (
+    <div className='dsm-card dsm-card--flat'>
+      <div className='dsm-row dsm-row--wrap' style={{ gap: 8 }}>
+        <span className='dsm-h3'>用户画像</span>
+        <Tag tone={empty ? 'idle' : 'ok'} title='按工作区保存，跨 Agent 共享'>
+          {empty ? '未记录' : `已记住 · ${profile?.address ?? ''}`}
+        </Tag>
+        <span className='dsm-spacer' />
+        <span className='dsm-caption'>换会话、换 Agent 都会带上它</span>
+      </div>
+
+      {failed ? (
+        <div className='dsm-caption' style={{ marginTop: 8 }}>
+          读取画像失败，宿主可能还没升级到这一版路由。
+        </div>
+      ) : (
+        <>
+          <div className='dsm-form-grid' style={{ marginTop: 10 }}>
+            <div className='dsm-field'>
+              <span className='dsm-caption'>名字</span>
+              <input
+                className='dsm-input'
+                value={name}
+                placeholder='比如 张三'
+                onChange={(event) => setName(event.target.value)}
+              />
+            </div>
+            <div className='dsm-field'>
+              <span className='dsm-caption'>希望怎么称呼</span>
+              <input
+                className='dsm-input'
+                value={address}
+                placeholder='比如 老张（留空就用名字）'
+                onChange={(event) => setAddress(event.target.value)}
+              />
+            </div>
+            <div className='dsm-field' style={{ gridColumn: '1 / -1' }}>
+              <span className='dsm-caption'>偏好备注（单行，会被折进提示）</span>
+              <input
+                className='dsm-input'
+                value={notes}
+                placeholder='比如 偏好简体中文，回答要短'
+                onChange={(event) => setNotes(event.target.value)}
+              />
+            </div>
+          </div>
+          <div className='dsm-row' style={{ marginTop: 10, gap: 8 }}>
+            <button type='button' className='dsm-btn dsm-btn--primary dsm-btn--sm' onClick={() => void save()} disabled={busy}>
+              {busy ? '保存中…' : '保存画像'}
+            </button>
+            <span className='dsm-caption'>
+              留空保存等于删掉：没记录时提示会明确要求模型「不要猜」，需要时直接问你。
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function OverviewView(): ReactNode {
   const store = useStore()
   const state = useConsole((snapshot) => snapshot)
@@ -504,6 +615,7 @@ function OverviewView(): ReactNode {
         <EmptyState icon='👥' title='还没有 Agent' hint='宿主侧创建 Agent 之后，这里会列出它的人格档案与记忆规模。' />
       ) : (
         <div className='dsm-stack'>
+          <UserProfileCard />
           {state.agents.map((agent) => {
             const traits = Object.entries(agent.traits).slice(0, 6)
             // 标题只说人话，代号只在后面出现一次：`未命名会话 · #2b81` + `#2b81` 太吵。

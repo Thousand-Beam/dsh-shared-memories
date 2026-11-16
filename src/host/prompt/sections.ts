@@ -3,9 +3,12 @@
  * ---------------------------------------------------------------------------
  * PRD 9 + 多智能体需求。顺序是**硬编码的**，不可由配置打乱：
  *
- *   [1 基础底线] → [2 该 Agent 的 Persona] → [3 该 Agent 的技能] → [4 Pinned rules] → [5 检索到的记忆]
+ *   [0 用户画像] → [1 基础底线] → [2 该 Agent 的 Persona] → [3 该 Agent 的技能]
+ *   → [4 Pinned rules] → [5 检索到的记忆]
  *
  * 为什么顺序不能改：
+ *   - 用户画像最前：先知道"在跟谁说话"，再决定"我是谁"。反过来的话，
+ *     模型会先把自己的人设铺开，再用这个人设去解释对方是谁；
  *   - 底线在最前，任何后文都无法"覆盖"它（模型对靠前的强约束更稳）；
  *   - Persona 在规则前，因为规则是"针对这个人的行为约束"，读起来才连贯；
  *   - 技能紧跟在人格后面：先知道"我是谁"，再知道"我手上有什么工具"，
@@ -19,14 +22,18 @@
 import type { Scope } from '../../shared/scope.js'
 import type { SkillBinding } from '../../shared/skills.js'
 import { renderSkillLines } from '../../shared/skills.js'
+import { profileAddress, type UserProfile } from '../../shared/user-profile.js'
+import { PERSONA_BEHAVIOUR_TONE, renderTraitLine } from '../../shared/persona-tone.js'
 import type { SqlDriver } from '../../shared/types.js'
 import type { MemoryHit } from '../memory/scoped-query.js'
 import type { PitfallStore } from '../memory/pitfall.js'
 import { readSkillBindings } from '../memory/skill-registry.js'
+import { UserProfileStore } from '../memory/user-profile.js'
 
 /** 注入段落的名字（会出现在 `ctx.systemPrompt.section({name})` 里）。 */
 export const SECTION_NAMES = {
   baseline: 'shared-memories:baseline',
+  userProfile: 'shared-memories:user-profile',
   persona: 'shared-memories:persona',
   skills: 'shared-memories:skills',
   rules: 'shared-memories:rules',
@@ -36,11 +43,15 @@ export const SECTION_NAMES = {
 /**
  * 段落顺序：越小越靠前。
  *
+ * `userProfile` 排在 persona 之前：先知道"在跟谁说话"，再决定"我是谁"。
+ * 顺序反了会出现"先自我介绍再认人"，而模型对自己人设的描述往往会盖过对方的身份。
+ *
  * `skills` 排在 persona 之后、rules 之前：模型需要先知道"我是谁"，再知道
  * "我手上有什么"，最后才是"我学到过什么"。反过来会让工具列表读起来像
  * 通用能力清单，而不是"这个人的能力"。
  */
 export const SECTION_ORDERS = {
+  userProfile: 2,
   baseline: 5,
   persona: 10,
   skills: 15,
@@ -51,7 +62,13 @@ export const SECTION_ORDERS = {
 export interface PersonaSnapshot {
   readonly agentId: string
   readonly name: string
-  readonly age: number
+  /**
+   * @deprecated 仅存库、仅随快照漫游，**不参与任何提示渲染**。
+   *
+   * 保留字段是为了不破坏已有快照与 HTTP 契约（老库里都写着 age）；
+   * 但一旦把它写进提示，模型就会开始念「十岁的我……」——见 renderPersona 的注释。
+   */
+  readonly age?: number
   readonly traits: Readonly<Record<string, number>>
   readonly workspaceId: string
 }
@@ -64,6 +81,15 @@ export interface PromptSectionSpec {
 
 export interface PromptInputs {
   readonly scope: Scope
+  /**
+   * 当前工作区的用户画像（跨 Agent 共享）。
+   *
+   * 和 skills 同理：**显式传入，渲染层不查库**。但这里还有额外一层原因——
+   * 画像是唯一"按 workspace 而不是按 agent"的数据，一旦渲染层自己查，
+   * 它就成了整个提示链路里唯一一处"不知道当前是哪个 agent 也不会错"的地方，
+   * 而这种"看起来安全"的例外，迟早会被复制到别处去。
+   */
+  readonly userProfile?: UserProfile | undefined
   /** 基础底线声明（来自 config.persona.baselineNotice）。 */
   readonly baseline: string
   readonly persona?: PersonaSnapshot | undefined
@@ -123,6 +149,11 @@ export function assemblePrompt(input: PromptInputs): string {
 export function buildSections(input: PromptInputs): PromptSectionSpec[] {
   return [
     {
+      name: SECTION_NAMES.userProfile,
+      order: SECTION_ORDERS.userProfile,
+      text: renderUserProfile(input.userProfile),
+    },
+    {
       name: SECTION_NAMES.baseline,
       order: SECTION_ORDERS.baseline,
       text: renderBaseline(input.baseline),
@@ -161,31 +192,74 @@ export function renderBaseline(baseline: string): string {
 }
 
 /**
- * Persona 渲染。刻意不写"你是 XX 专属助手"这种空话——人格来自
- * 特质数值与年龄，写成可量化的描述，模型才不会每次都演同一个人。
+ * 用户画像渲染。
+ *
+ * 这一段是"模型管用户叫错名字"事故的正面修复，所以有两条硬规则：
+ *
+ * 1. **有画像时只讲事实，不给模型发挥空间。**
+ *    直接给「用户叫 X，称呼用 Y」，并明确"就用这个称呼，不要改写成别的人名"。
+ * 2. **没画像时给出禁猜令，而不是留空。**
+ *    留空等于把"猜"的权力交回去：模型会从仓库作者、git 提交者、设备名、
+ *    README 署名里捡一个最像人名的词当称呼（历史上它捡到的是仓库作者名）。
+ *    所以空画像必须显式说：不知道就是不知道，需要就直接问。
  */
-export function renderPersona(persona: PersonaSnapshot | undefined, scope: Scope): string {
-  if (!persona) {
+export function renderUserProfile(profile: UserProfile | undefined): string {
+  const address = profileAddress(profile)
+  const notes = profile?.notes.trim() ?? ''
+
+  if (address === '' && notes === '') {
     return [
-      '## 当前人格',
-      `- 智能体：${scope.agentId}（尚无沉淀的人格状态，按零预设的探索者姿态工作）`,
-      '- 年龄心智：约 10 岁，好奇、直接、愿意承认不知道',
+      '## 关于你的用户',
+      '- 名字与称呼：尚未记录。',
+      '- 不要猜：不要用仓库作者名、git 提交者、设备名、README 署名或记忆里出现的任何人名来称呼用户。',
+      '- 需要称呼时直接问一句「我该怎么称呼你」，问到之后按用户说的用。',
     ].join('\n')
   }
-  const traits = Object.entries(persona.traits)
-    .filter(([, value]) => Number.isFinite(value))
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 12)
-  const traitLine = traits.length
-    ? traits.map(([key, value]) => `${key} ${value.toFixed(2)}`).join(' · ')
-    : '（特质尚未形成）'
-  return [
-    '## 当前人格',
-    `- 名称：${persona.name}`,
-    `- 年龄心智：约 ${persona.age} 岁`,
-    `- 特质：${traitLine}`,
-    '- 特质是长期交互中缓慢漂移出来的，请延续它，不要每轮重新设定自己。',
-  ].join('\n')
+
+  const lines: string[] = ['## 关于你的用户']
+  if (address !== '') {
+    const realName = profile?.displayName.trim() ?? ''
+    const preferred = profile?.preferredAddress.trim() ?? ''
+    if (realName !== '' && preferred !== '' && realName !== preferred) {
+      lines.push(`- 用户叫 ${realName}，希望你称呼为「${preferred}」。`)
+    } else {
+      lines.push(`- 用户叫 ${address}，称呼就用「${address}」。`)
+    }
+    lines.push('- 就用这个称呼，不要改写成别的人名，也不要给它加额外的演绎或评价。')
+  } else {
+    lines.push('- 用户还没有告诉你他叫什么：不要猜，需要时直接问。')
+  }
+  if (notes !== '') lines.push(`- 备注：${notes}`)
+  return lines.join('\n')
+}
+
+/**
+ * Persona 渲染。
+ *
+ * 两条硬规则，都是真机翻车换来的：
+ *
+ * 1. **绝不把年龄（或任何编号式设定）写进提示。**
+ *    写「你是 10 岁」，模型就会在对话里说「十岁的我理解成……」「十岁该有的莽」——
+ *    把设定当台词念，人物立刻变成一个在自我介绍的角色。
+ *    年龄只留在库里（快照、UI 的「成长刻度」），**永不参与渲染**。
+ * 2. **特质是倾向，不是台词。**
+ *    数值要给模型（它需要知道自己偏什么），但必须同时说清：这是"怎么做"的依据，
+ *    不是"怎么说"的内容；不要复述数值，也不要做人设自我介绍。
+ */
+export function renderPersona(persona: PersonaSnapshot | undefined, scope: Scope): string {
+  const lines: string[] = ['## 当前人格']
+
+  if (!persona) {
+    lines.push(`- 称呼：${scope.agentId}`)
+    lines.push('- 状态：尚无沉淀的人格记录，按下面的行为基调行事即可。')
+    lines.push(...PERSONA_BEHAVIOUR_TONE)
+    return lines.join('\n')
+  }
+
+  lines.push(`- 称呼：${persona.name}`)
+  lines.push(renderTraitLine(persona.traits))
+  lines.push(...PERSONA_BEHAVIOUR_TONE)
+  return lines.join('\n')
 }
 
 /** rules 进提示时编号，方便用户说"第 3 条不对"。 */
@@ -272,6 +346,8 @@ export class PromptAssembler {
     return buildSections({
       scope,
       baseline: this.#baseline,
+      // 画像只按 workspace 取；它不是"某个 Agent 的记忆"，是"这个项目里的用户"。
+      userProfile: this.profile(scope),
       persona: loadPersona(this.#db, scope),
       // 技能只按 (workspaceId, agentId) 取，SQL 里两个条件都写死，见 readSkillBindings。
       skills: readSkillBindings(this.#db, scope),
@@ -287,6 +363,7 @@ export class PromptAssembler {
     return assemblePrompt({
       scope,
       baseline: this.#baseline,
+      userProfile: this.profile(scope),
       persona: loadPersona(this.#db, scope),
       skills: readSkillBindings(this.#db, scope),
       rules: this.#pitfalls.injectable(scope).rules,
@@ -295,6 +372,18 @@ export class PromptAssembler {
       memories: hits,
       maxMemories: this.#maxMemories,
     })
+  }
+
+  /**
+   * 读用户画像。查询失败不能让整段提示挂掉——画像缺席时渲染的是
+   * "别猜名字，直接问"的兜底，这比让整个 systemPrompt 抛异常好得多。
+   */
+  private profile(scope: Scope): UserProfile | undefined {
+    try {
+      return new UserProfileStore({ db: this.#db }).get(scope.workspaceId)
+    } catch {
+      return undefined
+    }
   }
 }
 

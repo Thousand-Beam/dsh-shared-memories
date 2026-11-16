@@ -40,6 +40,7 @@ export type JournalOp =
   | 'memory.forget'
   | 'skill.bind'
   | 'skill.unbind'
+  | 'user_profile.set'
 
 /** 磁盘上的完整记录（含信封字段）。 */
 export interface JournalRecord {

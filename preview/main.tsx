@@ -23,6 +23,7 @@ import type {
   RulesBundle,
   RestorePhase,
   RuleStage,
+  UserProfileDto,
 } from '../src/shared/console-api.js'
 
 const API_PREFIX = '/dsh/shared-memories'
@@ -32,6 +33,17 @@ const WORKSPACE = 'ws-3f7a91c2-8b21-4d3e-9a55-1c2d3e4f5a6b'
 
 /** 相位由 URL 决定：`?phase=degraded` 直接开屏就是红色横幅。 */
 const url = new URL(window.location.href)
+
+/** 用户画像：按工作区存，跨 Agent 共享。`?profile=empty` 看"未记录"长什么样。 */
+let userProfile: UserProfileDto = {
+  workspaceId: WORKSPACE,
+  displayName: url.searchParams.get('profile') === 'empty' ? '' : '张三',
+  preferredAddress: url.searchParams.get('profile') === 'empty' ? '' : '老张',
+  address: url.searchParams.get('profile') === 'empty' ? '' : '老张',
+  notes: url.searchParams.get('profile') === 'empty' ? '' : '偏好简体中文，回答短一点',
+  updatedAt: NOW,
+  updatedBy: 'user',
+}
 const initialPhase = (url.searchParams.get('phase') ?? 'ready') as RestorePhase
 let phase: RestorePhase = initialPhase
 let degradedReason = 'snapshot-corrupt：快照 sha256 与本地文件不一致，写入已被拦截'
@@ -160,7 +172,7 @@ const snapshots: SnapshotNode[] = [
   {
     snapshotId: '20260115T043000Z',
     createdAt: NOW,
-    device: 'YG-DESKTOP',
+    device: 'DESKTOP-A',
     trigger: 'manual',
     commit: '9f3c1ab4d2e5',
     tag: 'snap/20260115T043000Z',
@@ -172,7 +184,7 @@ const snapshots: SnapshotNode[] = [
   {
     snapshotId: '20260115T031500Z',
     createdAt: NOW - 4_500_000,
-    device: 'YG-DESKTOP',
+    device: 'DESKTOP-A',
     trigger: 'idle',
     commit: '3a77be10cc21',
     tag: 'snap/20260115T031500Z',
@@ -184,7 +196,7 @@ const snapshots: SnapshotNode[] = [
   {
     snapshotId: '20260114T235900Z',
     createdAt: NOW - 20_700_000,
-    device: 'YG-LAPTOP',
+    device: 'LAPTOP-B',
     trigger: 'shutdown',
     commit: 'c1d0e8891f07',
     tag: 'snap/20260114T235900Z',
@@ -196,7 +208,7 @@ const snapshots: SnapshotNode[] = [
   {
     snapshotId: '20260114T120000Z',
     createdAt: NOW - 63_000_000,
-    device: 'YG-LAPTOP',
+    device: 'LAPTOP-B',
     trigger: 'interval',
     commit: '77aa02bce910',
     tag: 'snap/20260114T120000Z',
@@ -341,7 +353,7 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Res
       snapshotKeep: 5,
       allowGlobalSearch: true,
       workspaceId: WORKSPACE,
-      deviceId: 'YG-DESKTOP',
+      deviceId: 'DESKTOP-A',
     }
     return json(boot)
   }
@@ -381,6 +393,21 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Res
   if (method === 'POST' && path === '/rules/confirm') return json(rules.items[0] ?? { ok: true })
   if (method === 'POST' && path === '/rules/reject') return json({ rejected: true })
   if (method === 'POST' && path === '/import') return json({ parsed: 3, written: 2, quarantined: 1, skipped: 0 })
+  if (path === '/user-profile') {
+    if (method === 'POST') {
+      const body = safeBody(init)
+      userProfile = {
+        workspaceId: WORKSPACE,
+        displayName: String(body.displayName ?? ''),
+        preferredAddress: String(body.preferredAddress ?? ''),
+        address: String(body.preferredAddress ?? '') || String(body.displayName ?? ''),
+        notes: String(body.notes ?? ''),
+        updatedAt: Date.now(),
+        updatedBy: 'user',
+      }
+    }
+    return json(userProfile)
+  }
   return fail('not-found', `预览后端没有这个路由：${method} ${path}`, 404)
 }
 
