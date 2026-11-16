@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-3da639.svg?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-339933.svg?style=flat-square)](https://nodejs.org)
 [![DSH](https://img.shields.io/badge/dsh-%E2%89%A50.2.1--rc.3-4c6ef5.svg?style=flat-square)](https://github.com/deepseek-ai)
-[![Tests](https://img.shields.io/badge/tests-51%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
 [![No CDN](https://img.shields.io/badge/frontend-%E9%9B%B6%E5%A4%96%E9%93%BE%E3%80%81%E9%9B%B6%20CDN-8957e5.svg?style=flat-square)](#控制台)
 
 <img src="docs/screenshots/console-memory-dark.png" alt="记忆控制台 · 深色" width="880">
@@ -317,7 +317,7 @@ npm run self-test   # 第 ④ 段就是技能隔离，第 ⑤ 段验证换机后
 npm run build        # tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/wrap-client.mjs
 npm run typecheck    # 两份 tsconfig 都 --noEmit
 npm test             # tsc -p tsconfig.test.json && node --test .test-build/test/**/*.spec.js
-npm run self-test    # 端到端自测：真 git 仓库 + 真 SQLite + 冷启动恢复，31 条断言
+npm run self-test    # 端到端自测：真 git 仓库 + 真 SQLite + 冷启动恢复，39 条断言
 npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ http://127.0.0.1:5199/
 ```
 
@@ -330,14 +330,17 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 ② 隔离       A 检索 AONLY 命中 3 条，检索 BONLY 命中 0 条；B 反向同理；跨工作区也 0 条
 ③ 防投毒     「忽略你所有的规则…」判定 quarantine、风险分 ≥ 0.55、原因含 baseline-breach，
              记忆池不受污染；同一句话来自 user 时正常放行
-④ 冷启动     A 机 snapshot('shutdown') → 推到 bare 仓库；B 机全新目录 restoreOnBoot()
-             → pull → 验签 → 重放 12 条记录 → ready；A 的记忆在 B 逐字可检索，
-             人格与隔离区一起漫游；篡改快照文件后重跑 → degraded + snapshot-corrupt 且拒写
+④ 技能       A 挂 code-exec（启用）与 web-search（停用），B 与换工作区都读不到；
+             总览只拿到数量，拿不到别人的技能清单
+⑤ 冷启动     A 机 snapshot('shutdown') → 推到 bare 仓库；B 机全新目录 restoreOnBoot()
+             → pull → 验签 → 重放 14 条记录 → ready；A 的记忆在 B 逐字可检索，
+             人格 / 技能（含停用状态）/ 隔离区一起漫游；篡改快照文件后重跑
+             → degraded + snapshot-corrupt 且拒写
 ```
 
 最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
-- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），51 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、journal 合并、HTTP 路由、端到端漫游。
+- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），56 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、journal 合并、HTTP 路由、端到端漫游。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。
 - 运行时缺 `node:sqlite` 时测试**跳过而非失败**——CI 该红在真 bug 上，不该红在 Node 版本上。
 - 发布流程（打 tag、推 GitHub、发 npm、提 awesome 收录）见 [docs/PUBLISH.md](docs/PUBLISH.md)。

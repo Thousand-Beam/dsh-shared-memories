@@ -17,6 +17,9 @@ memory.db
 *.sqlite3
 journal/
 snapshots/
+# 快照物化目录（state/agents.json、state/skills.json）：运行时生成，不该进仓库。
+# 注意别把 docs/ 或 src/ 下的同名文件误伤——这里只忽略根级 state/。
+/state/
 
 # ── 本地 UI 预览的临时截图（正式截图在 docs/screenshots/）─────────────────
 preview/*.png

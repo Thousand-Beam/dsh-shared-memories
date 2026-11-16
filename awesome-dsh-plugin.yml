@@ -18,10 +18,10 @@ plugins:
   - name: dsh-shared-memories
     displayName: 共享记忆 · Shared Memories
     author: YG
-    repo: https://github.com/YG/dsh-shared-memories
-    homepage: https://github.com/YG/dsh-shared-memories#readme
+    repo: https://github.com/Thousand-Beam/dsh-shared-memories
+    homepage: https://github.com/Thousand-Beam/dsh-shared-memories#readme
     license: MIT
-    version: 0.1.0
+    version: 0.2.0
     status: beta
 
     summary: >-
