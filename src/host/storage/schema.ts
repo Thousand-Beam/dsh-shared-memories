@@ -17,7 +17,7 @@ import type { SqlDriver } from '../../shared/types.js'
  * v2 → v3：`agent_skill`（技能挂载关系随 (workspace, agent) 隔离，并跟着快照漫游）。
  * 因为 v1 从未发布，这里用"建表时就带列 + 老库补一列"的双保险写法。
  */
-export const SCHEMA_VERSION = 5
+export const SCHEMA_VERSION = 7
 
 /**
  * 全量 DDL。全部 `IF NOT EXISTS`，可以在任何状态下重复执行。
@@ -211,6 +211,29 @@ CREATE TABLE IF NOT EXISTS persona_identity (
 );
 CREATE INDEX IF NOT EXISTS ix_persona_identity_scope ON persona_identity(workspace_id, persona_id);
 
+-- 会话策略：无痕模式 + 归档提取策略。键是 sessionId（会变），不是 persona_id。
+-- 无痕会话一行都不写记忆，所以这张表本身也要能随会话一起被清掉。
+CREATE TABLE IF NOT EXISTS session_policy (
+  session_id   TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  agent_id     TEXT NOT NULL DEFAULT '',
+  ephemeral    INTEGER NOT NULL DEFAULT 0,
+  archive_mode TEXT NOT NULL DEFAULT 'incremental',
+  updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_session_policy_scope ON session_policy(workspace_id, agent_id);
+
+-- 提炼水位：这个会话已经提炼到第几条 turn。
+-- 没有它，边聊边记就只能"重复提炼"或"等归档"，两者都是错的：
+-- 前者会把同一句话写成十几条记忆，后者等于永远不记。
+CREATE TABLE IF NOT EXISTS distill_cursor (
+  session_id      TEXT PRIMARY KEY,
+  workspace_id    TEXT NOT NULL,
+  distilled_turns INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_distill_cursor_scope ON distill_cursor(workspace_id);
+
 -- 审计：全局检索、记忆修正、隔离区操作都必须留痕
 CREATE TABLE IF NOT EXISTS audit_log (
   audit_id       TEXT PRIMARY KEY,
@@ -279,6 +302,15 @@ export function migrate(db: SqlDriver, target = SCHEMA_VERSION): { from: number;
   if (from > 0 && from < 5) {
     // v4 → v5：persona_identity 表纯新增。老库没有映射，读取侧 resolve() 会
     // 退回 agent_id 本身 —— 即"行为与升级前完全一致"，等下一次 agent/created 再建绑定。
+  }
+  if (from > 0 && from < 6) {
+    // v5 → v6：session_policy 表纯新增。老会话没有策略行 = 默认（非无痕、增量提取），
+    // 与升级前行为一致；用户显式开无痕才会写行。
+  }
+  if (from > 0 && from < 7) {
+    // v6 → v7：distill_cursor 表纯新增。老库没有水位 = 0，下一次自动提炼会把
+    // 整个会话当成"还没记过"重新过一遍 —— 对空库无害；对已经有记忆的老用户，
+    // 重复提炼会被 `content_hash` 唯一索引折成同一实体（写新版本而不是新条目）。
   }
   try {
     db.exec(`PRAGMA user_version = ${target}`)

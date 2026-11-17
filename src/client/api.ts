@@ -8,6 +8,7 @@
  * 由 `ConsoleStore` 持有——这是"全局检索必须显式授权"的一部分。
  */
 
+import type { ArchiveMode, DistillJobDto, SessionPolicyDto } from '../shared/session-policy.js'
 import type {
   AgentSummary,
   ConsoleBootstrap,
@@ -179,6 +180,79 @@ export const api = {
     request<{ rejected: boolean }>('/rules/reject', {
       method: 'POST',
       body: JSON.stringify({ requestId }),
+    }),
+
+  // ── 会话策略 / 深度提炼 / 物理销毁 ──────────────────────────────────────
+  //
+  // 这三件事共用同一条"会话"主轴：ephemeral 决定要不要写，distill 决定写多少，
+  // purge 决定把已经写下的彻底抹掉。所以接口放在一起，前端也只在一个地方用。
+
+  /**
+   * 读会话策略。`sessionId` 必填——策略挂在会话上而不是人格上，
+   * 因为 DSH 里一个会话就是一个易变 id，换了会话必须重新问一次。
+   */
+  sessionPolicy: (sessionId: string, agentId?: string) => {
+    const search = new URLSearchParams({ sessionId })
+    if (agentId !== undefined && agentId !== '') search.set('agentId', agentId)
+    return request<SessionPolicyDto>(`/session-policy?${search.toString()}`)
+  },
+
+  /** 改会话策略（无痕 / 归档模式）。只传要改的字段，未传的保持原值。 */
+  saveSessionPolicy: (body: {
+    sessionId: string
+    ephemeral?: boolean
+    archiveMode?: ArchiveMode
+    agentId?: string
+  }) =>
+    request<SessionPolicyDto>('/session-policy', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** 宿主侧已知的会话列表（用于确认 sessionId 是否还有效）。 */
+  sessions: () => request<{ items: ReadonlyArray<{ sessionId: string; title: string }> }>('/sessions'),
+
+  /**
+   * 当前工作区里所有"无痕会话"的 id。
+   *
+   * 为什么要有批量接口：侧栏每一行都要判断自己是不是无痕，
+   * 逐行调 `/session-policy` 会变成 N 个请求。这里一次拿全量集合，
+   * 前端只做 Set 查询；标识与策略实时联动靠轮询这个集合。
+   */
+  ephemeralSessions: () => request<{ ephemeral: string[] }>('/session-policies'),
+
+  /**
+   * 起一次提炼。**立即返回**任务视图（status='running'），真正的活在宿主后台跑，
+   * 进度靠 `distillJob` 轮询——不要在这里 await 到结束，那会把 UI 冻住几十秒。
+   */
+  startDistill: (body: { sessionId: string; mode?: 'incremental' | 'deep' }) =>
+    request<DistillJobDto>('/distill', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** 查任务进度：优先 jobId（精确），没有就退回该会话最近一次任务。 */
+  distillJob: (input: { jobId?: string; sessionId?: string }) => {
+    const search = new URLSearchParams()
+    if (input.jobId !== undefined && input.jobId !== '') search.set('jobId', input.jobId)
+    else if (input.sessionId !== undefined && input.sessionId !== '') search.set('sessionId', input.sessionId)
+    return request<DistillJobDto | null>(`/distill/job?${search.toString()}`)
+  },
+
+  /**
+   * 物理销毁：库表 + journal 一起清，并写 `agent.purge` 墓碑。
+   * `confirm: true` 是服务端的硬闸，前端不能省——省了后端会直接 400。
+   */
+  purge: (agentId: string) =>
+    request<{
+      agentId: string
+      entities: number
+      versions: number
+      journals: number
+      records: number
+    }>('/purge', {
+      method: 'POST',
+      body: JSON.stringify({ agentId, confirm: true }),
     }),
 
   /**

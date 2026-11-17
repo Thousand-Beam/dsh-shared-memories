@@ -121,6 +121,19 @@ export class PersonaIdentityStore {
   }
 
   /**
+   * 只读预演：这次 `touch()` 会把会话挂到谁名下？
+   *
+   * 给"归并演练"和 UI 的"要不要继承"用：**不改库、不写 journal**。
+   * 已绑定的直接给绑定值；没绑定的按同一套继承规则算，但不下笔。
+   */
+  preview(agentId: string, workspaceId: string): string {
+    if (!agentId) return agentId
+    const existing = this.lookup(agentId)
+    if (existing) return existing.personaId
+    return this.#pickPersona(workspaceId) ?? agentId
+  }
+
+  /**
    * 登记一次会话出现，并返回它应该使用的人格 id。
    *
    * 幂等：同一个会话反复出现只更新 `last_seen_at`，不会新增行、也不会改绑。

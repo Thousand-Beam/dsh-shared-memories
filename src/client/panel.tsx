@@ -23,6 +23,7 @@ import { agentLabel, formatRelative, shortCode, workspaceLabel } from './format.
 import { HistoryView } from './history.js'
 import { MemoryView } from './memory-list.js'
 import { RulesView } from './rules.js'
+import { MemoryToolbar } from './session-tools.js'
 import { CardSkeleton, ChevronIcon, EmptyState, PhaseBanner, SkeletonLine, StatusDot, Tag, Toast } from './ui.js'
 
 type NavItem = { key: ViewKey; label: string; hint: string; glyph: string }
@@ -37,11 +38,13 @@ const NAV: ReadonlyArray<NavItem> = [
 
 /* ── 装配 ─────────────────────────────────────────────────────────────── */
 
-export function createPanel(): { root: ReactNode; store: ConsoleStore } {
+export function createPanel(shared?: ConsoleStore): { root: ReactNode; store: ConsoleStore } {
   // 样式在装配期就注入：宿主可能在骨架屏阶段就把面板挂上来，
   // 晚一步注入就会先闪一下无样式裸排版。
   installConsoleStyles()
-  const store = new ConsoleStore()
+  // store 可以外部传入：菜单行/浮层挂在面板之外（`shell.overlay`），
+  // 拿不到 ConsoleContext，只能共用同一个实例才看得到同一份进度与 toast。
+  const store = shared ?? new ConsoleStore()
   const root = createElement(
     ConsoleContext.Provider,
     { value: store },
@@ -121,6 +124,38 @@ function Panel(): ReactNode {
       cancelled = true
     }
   }, [state.activeAgentId])
+
+  /**
+   * 边聊边记的实时回填：面板开着的时候，记忆会在**对话过程中**自动长出来。
+   *
+   * 之前只有切 Agent 才拉一次数据，于是用户聊完三句回来看，仍然写着
+   * "这个 Agent 还没有任何记忆" —— 不是没记住，是面板根本没再问过。
+   * 这里 5 秒对比一次条数/首条 id，变了才 patch，避免无意义的整树重渲染。
+   */
+  useEffect(() => {
+    const agentId = state.activeAgentId
+    if (agentId === '') return
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return
+      void (async () => {
+        try {
+          const [memories, snapshots] = await Promise.all([
+            api.memories({ agentId, global: store.getState().filters.global }),
+            api.snapshots(agentId),
+          ])
+          const current = store.getState()
+          const changed =
+            memories.length !== current.memories.length ||
+            memories[0]?.entityId !== current.memories[0]?.entityId ||
+            snapshots.length !== current.snapshots.length
+          if (changed) store.patch({ memories, snapshots })
+        } catch {
+          /* 后端重启中：下一轮再试，不要在面板上刷红条 */
+        }
+      })()
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [state.activeAgentId, store])
 
   const test = async (): Promise<void> => {
     setBusy('test')
@@ -262,6 +297,10 @@ function Panel(): ReactNode {
         />
 
         <div className='dsm-content'>
+          {/* 记忆工具条：只剩"深度重读"与提炼进度。
+              无痕**不在这里**——它是新建会话时的二选一（见 session-menu.tsx），
+              事后补救的开关既误导人（以为已经无痕），又会漏掉开聊前的几句话。 */}
+          <MemoryToolbar />
           {state.view === 'memory' ? <MemoryView /> : null}
           {state.view === 'snapshots' ? <HistoryView /> : null}
           {state.view === 'rules' ? <RulesView /> : null}

@@ -794,6 +794,283 @@ export const CONSOLE_CSS = `
   .dsm-content { padding: 14px 14px 26px; }
 }
 
+/* ── 会话工具条：深度重读 + 提炼进度 ──────────────────────────────────── */
+.dsm-session-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--dsm-line);
+  border-radius: var(--dsm-radius);
+  background: var(--dsm-surface);
+  transition: background 160ms ease, border-color 160ms ease;
+}
+/* 无痕开关**已经从这里删掉**：它是新建会话时的二选一（session-menu.tsx），
+   事后再补一个开关既误导人（以为已经无痕），又会放过开聊前的几句话。
+   这条工具条只剩"深度重读"和它的进度。 */
+.dsm-session-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.dsm-progress[data-tone='running'] > i { background: var(--dsm-accent); }
+.dsm-progress[data-tone='done'] > i { background: var(--dsm-ok); }
+.dsm-progress[data-tone='failed'] > i { background: var(--dsm-danger); }
+.dsm-progress[data-tone='skipped'] > i { background: var(--dsm-text-2); }
+.dsm-progress[data-tone='timeout'] > i { background: var(--dsm-warn); }
+.dsm-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--dsm-text-2);
+}
+.dsm-check input { accent-color: var(--dsm-danger); }
+.dsm-danger-title { color: var(--dsm-danger); }
+.dsm-danger-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--dsm-text-2);
+}
+
+/* ── 新建会话：正常 / 无痕 二选一 ───────────────────────────────────────── */
+.dsm-choice {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+@media (max-width: 560px) {
+  .dsm-choice { grid-template-columns: minmax(0, 1fr); }
+}
+/* 卡片本身就是按钮：原生 button，键盘 Tab / Enter 直接可用，不额外做 tabindex。 */
+.dsm-choice-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 16px 14px;
+  border: 1px solid var(--dsm-line);
+  border-radius: var(--dsm-radius);
+  background: var(--dsm-surface-2);
+  color: var(--dsm-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+.dsm-choice-card:hover {
+  border-color: var(--dsm-accent);
+  transform: translateY(-1px);
+}
+.dsm-choice-card:focus-visible {
+  outline: 2px solid var(--dsm-accent);
+  outline-offset: 2px;
+}
+/* 无痕用暖色：这是"内容不进库"的承诺，视觉上必须和正常会话区分开。 */
+.dsm-choice-card--ghost {
+  background: color-mix(in srgb, var(--dsm-warn) 7%, var(--dsm-surface));
+  border-color: color-mix(in srgb, var(--dsm-warn) 30%, transparent);
+}
+.dsm-choice-card--ghost:hover { border-color: var(--dsm-warn); }
+.dsm-choice-icon { font-size: 20px; line-height: 1; }
+.dsm-choice-title { font-size: 13.5px; font-weight: 600; }
+.dsm-choice-body { font-size: 12px; line-height: 1.65; color: var(--dsm-text-2); }
+.dsm-choice-foot {
+  margin-top: auto;
+  padding-top: 6px;
+  font-size: 11px;
+  color: var(--dsm-text-2);
+  opacity: 0.85;
+}
+
+/* ── 会话行「⋯」菜单项 ─────────────────────────────────────────────────── */
+/* 这三项渲染在宿主自己的 Menu 里，所以不自带外框，只做一个 hover 态的行。 */
+.dsm-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsm-text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.dsm-menu-row:hover:not(:disabled) { background: var(--dsm-surface-2); }
+.dsm-menu-row:disabled { opacity: 0.55; cursor: default; }
+.dsm-menu-row--danger { color: var(--dsm-danger); }
+.dsm-menu-row--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--dsm-danger) 10%, transparent);
+}
+.dsm-menu-icon { flex: 0 0 16px; text-align: center; }
+.dsm-menu-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 全局 toast（挂在 shell.overlay，面板没开也看得见） ─────────────────── */
+.dsm-toast-stack {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+}
+/* 覆盖面板内联 Toast 的居中 fixed 定位：在栈里它是普通流内元素。 */
+.dsm-toast-stack .dsm-toast {
+  position: static;
+  left: auto;
+  bottom: auto;
+  transform: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 9px 13px;
+  border-radius: var(--dsm-radius-sm);
+  box-shadow: var(--dsm-shadow-pop);
+  animation: dsm-pop 160ms ease-out;
+  pointer-events: auto;
+}
+.dsm-toast-stack .dsm-toast[data-tone='ok'] { background: var(--dsm-ok); }
+.dsm-toast-stack .dsm-toast[data-tone='warn'] { background: var(--dsm-warn); }
+.dsm-toast-stack .dsm-toast[data-tone='error'] { background: var(--dsm-danger); }
+.dsm-toast-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  background: currentColor;
+  opacity: 0.7;
+}
+
+/* ── 提炼进度浮动卡（右下角；toast 走右上，两者不会互压） ───────────────── */
+.dsm-float-card {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 85;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(320px, calc(100vw - 40px));
+  padding: 12px 14px;
+  border: 1px solid var(--dsm-line);
+  border-radius: var(--dsm-radius);
+  background: var(--dsm-overlay);
+  box-shadow: var(--dsm-shadow-pop);
+  animation: dsm-pop 180ms ease-out;
+}
+.dsm-float-title { font-size: 12.5px; font-weight: 600; }
+
+/* ── 无痕会话的持久视觉标识 ─────────────────────────────────────────────── */
+/* 聊天头部徽标：挂在 conversation.session.header.actions 里，随会话切换自动显隐。 */
+.dsm-ghost-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in oklab, var(--dsm-warn) 55%, transparent);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--dsm-warn) 14%, transparent);
+  color: var(--dsm-warn);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  user-select: none;
+}
+.dsm-ghost-badge-dot { font-size: 12.5px; line-height: 1; filter: saturate(0.85); }
+
+/* 侧栏会话行的小幽灵：只占一个图标位，不抢标题宽度。 */
+.dsm-ghost-row {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.75;
+  flex: none;
+  user-select: none;
+}
+
+/*
+ * 整窗警戒：由数据源直接给 <html> 打 data-dsm-ephemeral（不再依赖组件挂载）。
+ * fixed 覆盖层画内描边 + 顶部暖色渐隐，pointer-events:none 保证点得到下面的一切。
+ */
+html[data-dsm-ephemeral='1'] body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  pointer-events: none;
+  box-shadow:
+    inset 0 0 0 3px color-mix(in oklab, var(--dsm-warn) 62%, transparent),
+    inset 0 22px 44px -20px color-mix(in oklab, var(--dsm-warn) 70%, transparent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--dsm-warn) 12%, transparent) 0,
+    transparent 220px
+  );
+}
+
+/*
+ * 主线：顶部常驻警告带（挂 shell.overlay）。
+ * 之所以敢用 fixed + 高 z-index：它和 Toast 是同一个浮层容器，真机已验证可渲染；
+ * pointer-events:none 让它只是"看得见"，绝不挡住下面的任何点击。
+ */
+.dsm-ghost-banner {
+  position: fixed;
+  top: calc(var(--dsh-windows-titlebar-height, 0px) + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 950;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 32px);
+  padding: 7px 16px;
+  border: 1px solid color-mix(in oklab, var(--dsm-warn) 62%, #5c2f00);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--dsm-warn) 90%, #4a2600);
+  color: #fff8e8;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  user-select: none;
+  box-shadow:
+    0 10px 26px -10px rgba(96, 48, 0, 0.6),
+    0 0 0 4px color-mix(in oklab, var(--dsm-warn) 16%, transparent);
+  animation: dsm-fade 160ms ease-out;
+}
+.dsm-ghost-banner-icon { font-size: 13px; line-height: 1; filter: saturate(0.9); }
+.dsm-ghost-banner-text { overflow: hidden; text-overflow: ellipsis; }
+
+@media (max-width: 720px) {
+  .dsm-ghost-banner { font-size: 11.5px; padding: 6px 12px; }
+}
+
 /* ── 动画 ───────────────────────────────────────────────────────────────── */
 @keyframes dsm-shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
 @keyframes dsm-spin { to { transform: rotate(360deg); } }

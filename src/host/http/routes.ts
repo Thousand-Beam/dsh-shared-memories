@@ -29,6 +29,13 @@ import { normalizeSkillId, normalizeSkillVersion } from '../../shared/skills.js'
 import { SkillRegistry, countSkills, readSkillBindings } from '../memory/skill-registry.js'
 import { UserProfileStore } from '../memory/user-profile.js'
 import { PersonaIdentityStore, resolvePersonaId } from '../memory/persona-identity.js'
+import { forgetSessionTraces, type SessionPolicyStore } from '../memory/session-policy.js'
+import type { DistillJobView } from '../distill/jobs.js'
+import type { PurgeResult } from '../memory/purge.js'
+import type { ChatTurn } from '../distill/chunker.js'
+import type { ArchiveMode, SessionPolicyDto } from '../../shared/session-policy.js'
+import { toPolicyDto } from '../../shared/session-policy.js'
+import { ARCHIVE_MODES, isArchiveMode, normalizePolicyInput } from '../../shared/session-policy.js'
 import { profileAddress, type UserProfile } from '../../shared/user-profile.js'
 // 值导入：错误映射要靠 instanceof。域错误一旦漏成 500，前端就分不清
 // "你参数错了"和"插件炸了"——这两种情况在 UI 上必须长得不一样。
@@ -117,6 +124,25 @@ export interface MemoriesApiDeps {
    * ②显示"这个 Agent 由几个会话共用"——这是验证继承是否真的在工作的唯一可见证据。
    */
   identity?(): PersonaIdentityStore | undefined
+  /**
+   * 会话策略（无痕 + 归档策略）。
+   *
+   * 必须由宿主注入同一实例：URL 写入策略、宿主在写入前读策略，
+   * 两边若不是同一个 store，就会出现"UI 显示无痕、实际还在写记忆"。
+   */
+  policies?(): SessionPolicyStore | undefined
+  /** 非致命告警出口（无痕补删之类"收拾残局"的动静，写不进日志也不该拦住请求）。 */
+  onWarn?(message: string): void
+  /** 会话列表（控制台选会话用；读不到就返回空，不影响其它视图）。 */
+  sessions?(): readonly { sessionId: string; title: string }[]
+  /** 启动一次提炼：立即返回 jobId，进度靠轮询。 */
+  distill?(input: { sessionId: string; mode: 'incremental' | 'deep' }): { jobId: string }
+  /** 按 jobId 查进度；`sessionId` 用于查"该会话最近一次任务"。 */
+  distillJob?(input: { jobId?: string; sessionId?: string }): DistillJobView | undefined
+  /** 彻底销毁（库 + journal 物理抹除）。 */
+  purge?(input: { agentId: string }): Promise<PurgeResult>
+  /** 读会话全文（提炼用），拿不到返回空数组。 */
+  sessionTurns?(sessionId: string): Promise<ChatTurn[]>
 }
 
 export const API_PREFIX = '/dsh/shared-memories'
@@ -190,6 +216,74 @@ async function dispatch(
       const body = await readJson(req)
       deps.barrier.assertWritable('identity-edit')
       return sendJson(res, 200, ok(await writeIdentity(deps, body)))
+    }
+    // ── 会话策略 / 提炼 / 销毁 ─────────────────────────────────────────────
+    if (method === 'GET' && path === '/session-policy') {
+      const store = deps.policies?.()
+      if (!store) throw new ApiError('policies-unavailable', '会话策略尚未就绪', 503)
+      const sessionId = url.searchParams.get('sessionId') ?? ''
+      if (sessionId === '') throw new ApiError('missing-session', '缺少 sessionId')
+      const policy = store.get(sessionId, deps.workspaceId, url.searchParams.get('agentId') ?? '')
+      return sendJson(res, 200, ok(toPolicyDto(policy)))
+    }
+    if (method === 'POST' && path === '/session-policy') {
+      const store = deps.policies?.()
+      if (!store) throw new ApiError('policies-unavailable', '会话策略尚未就绪', 503)
+      const body = await readJson(req)
+      const sessionId = reqStr(body, 'sessionId')
+      deps.barrier.assertWritable('session-policy')
+      const input = normalizePolicyInput({
+        ephemeral: body.ephemeral === true ? true : body.ephemeral === false ? false : undefined,
+        ...(isArchiveMode(body.archiveMode) ? { archiveMode: body.archiveMode as ArchiveMode } : {}),
+      })
+      const policy = store.set(sessionId, deps.workspaceId, input, str(body.agentId) ?? '')
+      // 无痕是"创建时就定"的，而宿主先发 agent/created、后把 sessionId 交回客户端，
+      // 中间那一瞬已经登记过人格。这里补删，让"无痕"在库里真的是零痕迹。
+      if (policy.ephemeral) {
+        const db = deps.db()
+        const removed = db === undefined ? 0 : forgetSessionTraces(db, deps.workspaceId, sessionId)
+        if (removed > 0) {
+          deps.onWarn?.(`无痕会话 ${sessionId} 创建时残留的 ${removed} 行登记已清除`)
+        }
+      }
+      return sendJson(res, 200, ok(toPolicyDto(policy)))
+    }
+    if (method === 'GET' && path === '/sessions') {
+      return sendJson(res, 200, ok({ items: deps.sessions?.() ?? [] }))
+    }
+    /**
+     * 批量无痕清单：侧栏每一行都要判断"我是不是无痕"，逐行查询会打爆接口。
+     * 只返回 id，不返回策略细节——徽标只需要知道"在不在这个集合里"。
+     */
+    if (method === 'GET' && path === '/session-policies') {
+      const store = deps.policies?.()
+      if (!store) throw new ApiError('policies-unavailable', '会话策略尚未就绪', 503)
+      return sendJson(res, 200, ok({ ephemeral: store.ephemeralSessions(deps.workspaceId) }))
+    }
+    if (method === 'POST' && path === '/distill') {
+      const body = await readJson(req)
+      const sessionId = reqStr(body, 'sessionId')
+      const mode = isArchiveMode(body.mode) && body.mode !== 'off' ? body.mode : 'incremental'
+      const start = deps.distill
+      if (!start) throw new ApiError('distill-unavailable', '提炼服务尚未就绪', 503)
+      deps.barrier.assertWritable('distill')
+      return sendJson(res, 200, ok(start({ sessionId, mode })))
+    }
+    if (method === 'GET' && path === '/distill/job') {
+      const jobId = url.searchParams.get('jobId') ?? ''
+      const sessionId = url.searchParams.get('sessionId') ?? ''
+      if (jobId === '' && sessionId === '') throw new ApiError('missing-job', '缺少 jobId 或 sessionId')
+      const job = deps.distillJob?.({ ...(jobId !== '' ? { jobId } : {}), ...(sessionId !== '' ? { sessionId } : {}) })
+      return sendJson(res, 200, ok(job ?? null))
+    }
+    if (method === 'POST' && path === '/purge') {
+      const body = await readJson(req)
+      const agentId = reqStr(body, 'agentId')
+      const purge = deps.purge
+      if (!purge) throw new ApiError('purge-unavailable', '销毁服务尚未就绪', 503)
+      if (body.confirm !== true) throw new ApiError('confirm-required', '销毁不可撤销，需要 confirm=true')
+      deps.barrier.assertWritable('purge')
+      return sendJson(res, 200, ok(await purge({ agentId: resolvePersonaIdOf(deps, agentId) })))
     }
     if (method === 'GET' && path === '/rules') {
       return sendJson(res, 200, ok(readRules(deps, url)))
@@ -784,6 +878,12 @@ function parseTraits(raw: string): Record<string, number> {
  * 但历史数据也可能是某个具体会话 id。解析是幂等的——人格 id 解析回自己。
  * 少了这一步，前端换会话后传新 id，后端就查不到旧记忆（真机表现："列表 0 条"）。
  */
+function resolvePersonaIdOf(deps: MemoriesApiDeps, agentId: string): string {
+  const raw = agentId || 'default'
+  const db = deps.db()
+  return db ? resolvePersonaId(db, raw) : raw
+}
+
 function scopeOf(deps: MemoriesApiDeps, agentId: string): Scope {
   const raw = agentId || 'default'
   const db = deps.db()

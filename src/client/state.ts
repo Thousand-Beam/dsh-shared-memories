@@ -44,6 +44,34 @@ import type {
   RestorePhase,
   SnapshotNode,
 } from '../shared/console-api.js'
+import type { DistillJobDto, SessionPolicyDto } from '../shared/session-policy.js'
+
+/**
+ * 提炼进度在 UI 侧的形状：只留渲染要用的字段。
+ * 单独抽出来是因为 `DistillJobDto` 里还有 report / 时间戳等一大坨，
+ * 塞进 store 会让每次 `patch` 都复制一堆前端根本读不到的字段。
+ */
+export interface DistillProgress {
+  readonly jobId: string
+  readonly status: 'running' | 'done' | 'failed' | 'skipped'
+  readonly phase: string
+  readonly detail: string
+  readonly chunk: number
+  readonly total: number
+  readonly written: number
+}
+
+export function progressOf(job: DistillJobDto): DistillProgress {
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    phase: job.phase,
+    detail: job.detail,
+    chunk: job.chunk,
+    total: job.total,
+    written: job.written,
+  }
+}
 
 export interface MemoryFilters {
   query: string
@@ -74,6 +102,15 @@ export interface ConsoleState {
   /** 当前设备标识（与工作区配对，说明快照是从哪台机器落盘的）。 */
   deviceId: string
   filters: MemoryFilters
+  /**
+   * 当前会话的策略（无痕 / 归档模式）。`null` = 还没读回来。
+   *
+   * 它必须跟着 `activeAgentId` 走：策略挂会话，切人会换一份，
+   * 不跟着换就会出现"A 会话无痕开着，UI 却显示 B 会话正常"的错位。
+   */
+  policy: SessionPolicyDto | null
+  /** 正在跑的提炼任务；`null` = 没有任务在跑。 */
+  distill: DistillProgress | null
   toast: { kind: 'ok' | 'error'; message: string } | null
   error: string | null
 }
@@ -93,6 +130,8 @@ export const INITIAL_STATE: ConsoleState = {
   workspaceId: '',
   deviceId: '',
   filters: { query: '', kinds: [], emotions: [], trustMin: 0, global: false },
+  policy: null,
+  distill: null,
   toast: null,
   error: null,
 }
@@ -131,12 +170,30 @@ export class ConsoleStore {
   setActiveAgent(agentId: string): void {
     if (!agentId || agentId === this.#state.activeAgentId) return
     // 切 agent 必须清空旧数据：宁可闪一下骨架屏，也不要把 A 的记忆显示在 B 名下。
-    this.patch({ activeAgentId: agentId, memories: [], snapshots: [], quarantine: [], status: 'loading' })
+    // policy / distill 同理：无痕开关和提炼进度都是**会话级**的，
+    // 留着上一条会话的值，等于让用户在 B 会话上看到 A 会话的无痕标记。
+    this.patch({
+      activeAgentId: agentId,
+      memories: [],
+      snapshots: [],
+      quarantine: [],
+      policy: null,
+      distill: null,
+      status: 'loading',
+    })
     this.#agentListener?.(agentId)
   }
 
   setFilters(partial: Partial<MemoryFilters>): void {
     this.patch({ filters: { ...this.#state.filters, ...partial } })
+  }
+
+  setPolicy(policy: SessionPolicyDto | null): void {
+    this.patch({ policy })
+  }
+
+  setDistill(distill: DistillProgress | null): void {
+    this.patch({ distill })
   }
 
   toggleFilterValue(key: 'kinds' | 'emotions', value: string): void {

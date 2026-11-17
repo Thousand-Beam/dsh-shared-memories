@@ -53,3 +53,28 @@ export function withProducerSource<T extends { source?: { kind?: unknown } }>(me
   message.source = pluginSource()
   return message
 }
+
+/**
+ * 造一条**必然合法**的注入消息。
+ *
+ * 所有往 LLM / 上下文里塞消息的地方都必须走这里，理由有两条：
+ *   ① 手写 `{ role, content }` 很容易漏掉 `source`，而漏掉的后果是宿主在
+ *      格式化阶段抛 `format v4 message requires a producer-owned source kind`——
+ *      整个会话直接崩，用户看到的是"插件把聊天搞挂了"；
+ *   ② 造完立刻自检：错误在插件这一帧就带着 role 一起炸出来，比宿主的
+ *      无上下文报错好排查一个数量级。
+ */
+export function producerMessage<T extends { role: string; content: unknown }>(
+  input: T,
+): T & { source: PluginMessageSource } {
+  const message = { ...input, source: pluginSource() }
+  assertProducerSource(message)
+  return message
+}
+
+/** 批量版本：`producerMessages([...])`，一次把整条请求的消息补齐来源。 */
+export function producerMessages<T extends { role: string; content: unknown }>(
+  messages: readonly T[],
+): Array<T & { source: PluginMessageSource }> {
+  return messages.map((message) => producerMessage(message))
+}

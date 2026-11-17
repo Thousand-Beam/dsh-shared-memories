@@ -29,6 +29,7 @@ import { normalizeBindings } from './shared/skills.js'
 import { profileAddress, type UserProfile } from './shared/user-profile.js'
 import { UserProfileStore } from './host/memory/user-profile.js'
 import { PersonaIdentityStore, backfillPersonaIdentities } from './host/memory/persona-identity.js'
+import { mergeOrphanAgents } from './host/memory/merge-agent.js'
 import type { PersonaIdentity } from './shared/persona-identity.js'
 import { readSkillBindings } from './host/memory/skill-registry.js'
 import { SkillRegistry } from './host/memory/skill-registry.js'
@@ -45,8 +46,18 @@ import { PoisonGuard } from './host/memory/poison.js'
 import { Importer } from './host/memory/importer.js'
 import { PitfallStore } from './host/memory/pitfall.js'
 import { registerRoutes, type MemoriesApiDeps, type WebServerLike } from './host/http/routes.js'
+import { SessionPolicyStore, ephemeralLeaks } from './host/memory/session-policy.js'
+import { purgeAgent } from './host/memory/purge.js'
+import { DistillService, type Complete } from './host/distill/service.js'
+import { DistillJobs } from './host/distill/jobs.js'
+import { DistillCursor } from './host/distill/cursor.js'
+import type { ChatTurn } from './host/distill/chunker.js'
+import { eventsToTurns, messagesToTurns } from './host/distill/messages.js'
+// 注入消息的来源声明只认这一处：插件名、`plugin:<插件名>`、断言全在 shared 里。
+// 不允许再手写 `source: { kind: 'plugin' }`——那会在宿主格式化阶段把整个会话搞崩。
+import { PLUGIN_ID, producerMessages } from './shared/message-source.js'
 
-export const name = 'dsh-shared-memories'
+export const name = PLUGIN_ID
 
 /**
  * 硬依赖。两条都不能少，而且原因不一样：
@@ -138,6 +149,21 @@ interface Runtime {
    * 没有这一层，新会话既读不到旧人格也读不到旧记忆（真机表现："换个会话人格就丢了"）。
    */
   identity?: PersonaIdentityStore
+  /** 会话策略：无痕与归档提取策略（带 journal 不必要，策略是本地偏好）。 */
+  policies?: SessionPolicyStore
+  /** 深度提炼服务（惰性创建，因为要等 llm/session 服务就绪）。 */
+  distill?: DistillService
+  /** 提炼任务台账（进程内）。 */
+  jobs: DistillJobs
+  /**
+   * 自动提炼水位：这个会话已经提炼到第几条 turn。
+   *
+   * 存在的理由很直白：归档才提炼 ＝ 用户不归档就一条记忆都没有。
+   * 有了水位，才敢在每轮对话结束后自动跑增量提炼而不产生重复条目。
+   */
+  cursor?: DistillCursor
+  /** 自动提炼的防抖定时器（按会话）。同一会话连发多轮只跑最后一次。 */
+  autoTimers: Map<string, ReturnType<typeof setTimeout>>
   /**
    * 当前进程里活着的 agent 与会话。
    *
@@ -166,6 +192,8 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     lastSnapshotAt: 0,
     snapshotInFlight: undefined,
     liveAgents: new Map(),
+    jobs: new DistillJobs(),
+    autoTimers: new Map(),
     intervalSec: config.sync.intervalSec,
   }
 
@@ -191,6 +219,19 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     if (!runtime.snapshots) return Promise.resolve(undefined)
     if (barrier.phase !== 'ready') {
       warn(`恢复未就绪（${barrier.phase}），跳过 ${trigger} 快照`)
+      return Promise.resolve(undefined)
+    }
+    // 无痕闸门（快照侧）：无痕会话名下出现任何记忆痕迹，说明上游闸门漏了。
+    // 此时宁可少一份快照，也不把"本该不存在的东西"推到远端——推上去就删不干净了。
+    try {
+      const ghosts = runtime.policies?.ephemeralSessions(workspaceId) ?? []
+      const leaked = ghosts.length > 0 && runtime.db ? ephemeralLeaks(runtime.db, workspaceId, ghosts) : []
+      if (leaked.length > 0) {
+        warn(`无痕会话出现记忆痕迹（${leaked.join(',')}），已跳过 ${trigger} 快照；请先清理再保存`)
+        return Promise.resolve(undefined)
+      }
+    } catch (cause) {
+      warn(`无痕巡检失败，跳过 ${trigger} 快照以求稳：${cause instanceof Error ? cause.message : String(cause)}`)
       return Promise.resolve(undefined)
     }
     if (runtime.snapshotInFlight) return runtime.snapshotInFlight
@@ -314,6 +355,39 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     inheritWindowMs: config.identity.inheritWindowMs,
   })
 
+      // 会话策略与提炼服务：这里不碰网络，纯本地对象，失败也不该拖死 boot。
+      runtime.policies = new SessionPolicyStore({ db, clock: () => Date.now(), onWarn: warn })
+
+      // 孤儿作用域归并（`memory:merge-agent`）：身份回填只处理"空壳会话"，
+      // 已经写过记忆的旧会话只能靠这一步搬回人格名下 —— 否则那批记忆永远是
+      // persona 视图里的黑洞（写进去了，但谁也不认领）。
+      // 幂等：跑完孤儿集合为空；journal 重放把它们变回来，下次启动再收敛。
+      try {
+        const merged = await mergeOrphanAgents({ db, identity: runtime.identity, clock: () => Date.now(), onWarn: warn })
+        if (merged.merged > 0) {
+          host.logger?.info?.(
+            `[shared-memories] 孤儿记忆归并：${merged.merged} 个作用域，${merged.entities} 个实体（并掉 ${merged.collapsed} 个重复），${merged.rows} 行附随数据`,
+          )
+        }
+      } catch (cause) {
+        warn(`孤儿记忆归并失败（不影响对话）：${cause instanceof Error ? cause.message : String(cause)}`)
+      }
+
+      runtime.distill = new DistillService({
+        db,
+        tree: runtime.tree,
+        identity: runtime.identity,
+        policies: runtime.policies,
+        workspaceId,
+        deviceId,
+        guard: runtime.guard,
+        complete: makeComplete(host, warn),
+        onWarn: warn,
+      })
+
+      // 自动提炼水位：边聊边记的"上次记到哪儿"。
+      runtime.cursor = new DistillCursor({ db, clock: () => Date.now(), onWarn: warn })
+
       const outcome = await runtime.restore.restoreOnBoot()
       runtime.booted = true
       if (outcome.status === 'ready') {
@@ -349,6 +423,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       barrier,
       workspaceId,
       deviceId,
+      onWarn: warn,
       db: () => runtime.db,
       snapshots: () => runtime.snapshots,
       restore: () => runtime.restore,
@@ -385,10 +460,20 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       skills: () => runtime.skills,
     userProfile: () => runtime.userProfile,
     identity: () => runtime.identity,
+      policies: () => runtime.policies,
+      sessions: () => listSessionsFor(host),
+      sessionTurns: async (sessionId) => readSessionTurns(host, sessionId, warn),
+      distill: (input) => startDistill(host, runtime, input.sessionId, input.mode, warn),
+      distillJob: (input) => (input.jobId !== undefined ? runtime.jobs.get(input.jobId) : runtime.jobs.latestFor(input.sessionId ?? '')),
+      purge: async (input) => {
+        const db = runtime.db
+        if (db === undefined) throw new Error('记忆库尚未就绪')
+        return purgeAgent({ db, root, workspaceId, agentId: input.agentId, onWarn: warn })
+      },
       importMemories: async (input) => {
         if (!runtime.importer) throw new Error('记忆库尚未就绪')
         const report = await runtime.importer.import({
-          scope: { workspaceId, agentId: input.agentId || 'default', deviceId },
+          scope: { workspaceId, agentId: runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default'), deviceId },
           content: input.content,
           format: input.format,
         })
@@ -399,7 +484,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       reopenQuarantine: async (input) => {
         if (!runtime.tree) throw new Error('记忆库尚未就绪')
         const opened = await runtime.tree.openVersion({
-          scope: { workspaceId, agentId: input.agentId || 'default', deviceId },
+          scope: { workspaceId, agentId: runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default'), deviceId },
           kind: input.kind as Parameters<typeof runtime.tree.openVersion>[0]['kind'],
           subjectKey: input.subjectKey,
           text: input.text,
@@ -426,6 +511,20 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         // 先把它解析成稳定人格 id，后面的登记/提示词/快照都只认人格 id——
         // 否则新会话既读不到旧人格也读不到旧记忆（真机事故："换个会话人格就丢了"）。
         const sessionAgentId = readAgentId(args[0])
+
+        // 无痕会话：**可读不写**。人格登记、presence、agent 行一个都不落，
+        // 否则"从没聊过"和"无痕聊过"在库里长得一模一样——那就不叫无痕了。
+        // 但闸门照等、提示词照刷：无痕会话依旧要能读到已有记忆。
+        if (sessionAgentId !== '' && runtime.policies?.isEphemeral(sessionAgentId) === true) {
+          host.logger?.info?.(`[shared-memories] 会话 ${sessionAgentId} 为无痕会话，跳过人格登记`)
+          const ghostPhase = await barrier.wait()
+          if (ghostPhase === 'degraded') {
+            warn(`记忆只读降级（${barrier.reason ?? 'unknown'}），无痕会话以受限模式启动`)
+          }
+          await refreshPrompt(runtime, config)
+          return undefined
+        }
+
         const agentId = sessionAgentId
           ? await resolveIdentity(runtime, sessionAgentId, workspaceId)
           : ''
@@ -447,9 +546,55 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       }),
     )
 
+    // ③-1 归档/停会话时的提取。宿主没有 session/archive 事件（已核对
+    // dsh-workspace：archiveSession 只做 setState + parallel('workspace/session-stop')），
+    // 所以这里挂 workspace/session-stop——它是归档链路上唯一可监听的点。
+    // 无痕或策略为 off 时什么都不做，用户点"仅归档"就不会多出记忆。
+    disposers.push(
+      host.on('workspace/session-stop', async (...args: unknown[]) => {
+        const payload = args[0]
+        if (payload === null || typeof payload !== 'object') return
+        const sessionId = (payload as { sessionId?: unknown }).sessionId
+        if (typeof sessionId !== 'string' || sessionId === '') return
+        const policies = runtime.policies
+        if (policies === undefined || runtime.distill === undefined) return
+        const policy = policies.get(sessionId, workspaceId, '')
+        if (policy.ephemeral || policy.archiveMode === 'off') return
+        const mode = policy.archiveMode === 'deep' ? 'deep' : 'incremental'
+        startDistill(host, runtime, sessionId, mode, warn)
+      }),
+    )
+
+    // ③-1b 边聊边记：一轮模型输出结束时，防抖后再跑一次**增量**提炼。
+    //
+    // 为什么不用 `turn/end`：那是 session log 里的事件类型，不是 cordis 事件，
+    // `host.on('turn/end')` 永远等不到。宿主真正会 emit 的是
+    // `agent/assistant-stream`，帧里 `attemptId = "${sessionId}:${attempt}"`，
+    // 且 `type === 'end'` 时这一轮输出已经落盘 —— 这才是可靠的"这一轮说完了"。
+    //
+    // 防抖 8 秒：一轮对话可能有多步（多次模型调用），每步都会 end 一次；
+    // 只跑最后一次，既不重复提炼，也不会让用户在打字时看到进度条乱跳。
+    disposers.push(
+      host.on('agent/assistant-stream', (...args: unknown[]) => {
+        const payload = args[0]
+        if (payload === null || typeof payload !== 'object') return
+        const frame = (payload as { frame?: unknown }).frame
+        if (frame === null || typeof frame !== 'object') return
+        const record = frame as { type?: unknown; attemptId?: unknown; outcome?: { kind?: unknown } }
+        if (record.type !== 'end') return
+        // 被中断的那一轮没有完整落盘，硬提炼会记进半句话。
+        if (record.outcome?.kind === 'abandoned') return
+        if (typeof record.attemptId !== 'string') return
+        const cut = record.attemptId.lastIndexOf(':')
+        const sessionId = cut > 0 ? record.attemptId.slice(0, cut) : record.attemptId
+        if (sessionId === '') return
+        scheduleAutoDistill(host, runtime, sessionId, warn)
+      }),
+    )
+
     // ③-2 turn 结束的持久化检查点：先落 journal，再按空闲防抖决定要不要快照。
     disposers.push(
-      host.on('session/flush', async () => {
+    host.on('session/flush', async () => {
         await runtime.journal?.flush()
         if (!config.sync.enabled || !config.snapshot.triggers.idle) return
         const idleMs = Math.max(5, config.sync.idleDebounceSec) * 1000
@@ -458,8 +603,17 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       }),
     )
 
-    // ③-3 agent 释放 = 关机型快照（多 agent 时靠 snapshotInFlight 合并，不放大成 N 次）。
-    disposers.push(host.on('agent/disposed', () => void snapshotNow('shutdown')))
+    // ③-2b 兜底扫活会话：即使 `agent/assistant-stream` 被作用域过滤掉了
+    // （它走 agent 作用域的 `events.dispatch`，宿主可能会把 app 级监听裁掉），
+    // 这条 15 秒一次的巡场也能把新对话捞出来。两条路互不依赖：
+    // 事件先到就先记，事件没到最迟 15 秒后补上。
+    const autoSweep = setInterval(() => {
+      void sweepLiveSessions(host, runtime, warn)
+    }, AUTO_SWEEP_MS)
+    ;(autoSweep as unknown as { unref?: () => void }).unref?.()
+    disposers.push(() => clearInterval(autoSweep))
+
+    // ③-3 agent 释放 = 关机型快照（多 agent 时靠 snapshotInFlight 合并，不放大成 N 次）。    disposers.push(host.on('agent/disposed', () => void snapshotNow('shutdown')))
 
     // ③-4 配置热更新：只重建提示词，不做快照（避免把配置抖动写进历史）。
     disposers.push(host.on('app-boot/config-reload', () => void refreshPrompt(runtime, config)))
@@ -473,8 +627,19 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           // 这里拿到的是**会话** id：必须先解析成人格 id，否则新建会话读到的
           // 永远是空缓存（缓存按人格 id 建），表现就是"新会话没有人格"。
           const raw = readAgentId(context) || 'default'
-          const agentId = runtime.identity?.resolve(raw) ?? raw
-          return runtime.promptCache.get(agentId) ?? ''
+          const ephemeral = runtime.policies?.isEphemeral(raw) === true
+          // 无痕会话要"可读不写"：`resolve` 只读、`preview` 连 person_identity 都不看
+          // 也能推出继承的锚点人格——用 preview 才能既不落登记、又读到老记忆。
+          const personaId = ephemeral
+            ? (runtime.identity?.preview(raw, workspaceId) ?? raw)
+            : (runtime.identity?.resolve(raw) ?? raw)
+          const cached = runtime.promptCache.get(personaId)
+          if (cached !== undefined) return cached
+          // 缓存里没有（无痕会话继承来的人格还没被 refreshPrompt 覆盖到，
+          // 或人格刚建）：现算一份并回填，别让"无痕"等于"失忆"。
+          const built = buildPrompt(runtime, config, personaId)
+          runtime.promptCache.set(personaId, built)
+          return built
         },
       }),
     )
@@ -491,6 +656,9 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     return () => {
       if (intervalTimer) clearInterval(intervalTimer)
       intervalTimer = undefined
+      // 待跑的自动提炼一起撤销：插件都卸载了，不该再往库里写。
+      for (const timer of runtime.autoTimers.values()) clearTimeout(timer)
+      runtime.autoTimers.clear()
       process.removeListener('SIGINT', sigint)
       process.removeListener('SIGTERM', sigterm)
       for (const dispose of disposers.reverse()) dispose()
@@ -680,57 +848,68 @@ async function refreshPrompt(runtime: Runtime, config: SharedConfig): Promise<vo
   if (agents.length === 0) agents = ['default']
 
   for (const agentId of agents) {
-    const scope: Scope = {
-      workspaceId: runtime.workspaceId,
-      agentId,
-      deviceId: runtime.deviceId,
-    }
-    const query = new ScopedQuery(runtime.db, scope, {
-      allowGlobalSearch: config.isolation.allowGlobalSearch,
-    })
-
-    const persona = runtime.db.one<{ name: string; age: number; traits: string; baseline_hash: string }>(
-      `SELECT name, age, traits, baseline_hash FROM persona_state
-        WHERE agent_id = ? AND workspace_id = ?`,
-      [agentId, runtime.workspaceId],
-    )
-
-    const rules = safeHits(query, { kinds: ['pitfall', 'preference', 'persona'], limit: 6 })
-    const lines: string[] = []
-    lines.push('## 你的记忆与人格（dsh-shared-memories）')
-    // 用户画像：**按 workspace 取，与 agent 无关**——换会话、换 Agent 都还是同一个人。
-    // 没有画像时不写"用户是 X"，而是写清"不知道，别猜"：留空等于把猜的权力交还模型。
-    const profile = safeProfile(runtime, runtime.workspaceId)
-    const address = profileAddress(profile)
-    if (address !== '') {
-      lines.push(`- 你的用户：${address}（称呼就用这个，不要改写成别的人名）`)
-    } else {
-      lines.push(
-        '- 你的用户：名字尚未记录。不要从仓库署名、提交记录、设备名、工作区路径或别处出现过的名字里猜，需要时直接问。',
-      )
-    }
-    lines.push(
-      `- 当前智能体：${displayName(persona?.name) || '（还没起名）'}`,
-    )
-    lines.push(`- 工作区：${runtime.workspaceId}`)
-    lines.push(`- 底线：${config.persona.baselineNotice}`)
-    // 技能段：按 (workspaceId, agentId) 精确取，缺一个条件就会串台。
-    const skills = readSkillBindings(runtime.db, scope)
-    if (skills.length > 0) {
-      lines.push('')
-      lines.push('### 这个 Agent 当前挂载的技能')
-      for (const skill of skills) {
-        const version = skill.version ? ` ${skill.version}` : ''
-        lines.push(`- \`${skill.skillId}\`${version}${skill.enabled ? '' : ' · 已停用'}`)
-      }
-    }
-    if (rules.length > 0) {
-      lines.push('')
-      lines.push('### 已确认的规则与偏好（优先级高于一般记忆）')
-      for (const hit of rules) lines.push(`- [${hit.kind}] ${compact(hit.text, 180)}`)
-    }
-    runtime.promptCache.set(agentId, `${lines.join('\n')}\n`)
+    runtime.promptCache.set(agentId, buildPrompt(runtime, config, agentId))
   }
+}
+
+/**
+ * 组装某个人格的系统提示片段。**同步 + 纯读**：渲染期现算也不会写库，
+ * 所以无痕会话可以临时借锚点人格的提示，而不留下一行登记。
+ */
+function buildPrompt(runtime: Runtime, config: SharedConfig, agentId: string): string {
+  const db = runtime.db
+  // refreshPrompt 里已经挡过一次，但渲染期现算的入口也要自己挡：没库就当没有记忆。
+  if (db === undefined) return ''
+  const scope: Scope = {
+    workspaceId: runtime.workspaceId,
+    agentId,
+    deviceId: runtime.deviceId,
+  }
+  const query = new ScopedQuery(db, scope, {
+    allowGlobalSearch: config.isolation.allowGlobalSearch,
+  })
+
+  const persona = db.one<{ name: string; age: number; traits: string; baseline_hash: string }>(
+    `SELECT name, age, traits, baseline_hash FROM persona_state
+      WHERE agent_id = ? AND workspace_id = ?`,
+    [agentId, runtime.workspaceId],
+  )
+
+  const rules = safeHits(query, { kinds: ['pitfall', 'preference', 'persona'], limit: 6 })
+  const lines: string[] = []
+  lines.push('## 你的记忆与人格（dsh-shared-memories）')
+  // 用户画像：**按 workspace 取，与 agent 无关**——换会话、换 Agent 都还是同一个人。
+  // 没有画像时不写"用户是 X"，而是写清"不知道，别猜"：留空等于把猜的权力交还模型。
+  const profile = safeProfile(runtime, runtime.workspaceId)
+  const address = profileAddress(profile)
+  if (address !== '') {
+    lines.push(`- 你的用户：${address}（称呼就用这个，不要改写成别的人名）`)
+  } else {
+    lines.push(
+      '- 你的用户：名字尚未记录。不要从仓库署名、提交记录、设备名、工作区路径或别处出现过的名字里猜，需要时直接问。',
+    )
+  }
+  lines.push(
+    `- 当前智能体：${displayName(persona?.name) || '（还没起名）'}`,
+  )
+  lines.push(`- 工作区：${runtime.workspaceId}`)
+  lines.push(`- 底线：${config.persona.baselineNotice}`)
+  // 技能段：按 (workspaceId, agentId) 精确取，缺一个条件就会串台。
+  const skills = readSkillBindings(db, scope)
+  if (skills.length > 0) {
+    lines.push('')
+    lines.push('### 这个 Agent 当前挂载的技能')
+    for (const skill of skills) {
+      const version = skill.version ? ` ${skill.version}` : ''
+      lines.push(`- \`${skill.skillId}\`${version}${skill.enabled ? '' : ' · 已停用'}`)
+    }
+  }
+  if (rules.length > 0) {
+    lines.push('')
+    lines.push('### 已确认的规则与偏好（优先级高于一般记忆）')
+    for (const hit of rules) lines.push(`- [${hit.kind}] ${compact(hit.text, 180)}`)
+  }
+  return `${lines.join('\n')}\n`
 }
 
 /** 检索失败不该拖垮对话：拿不到记忆就当没有。 */
@@ -790,4 +969,324 @@ function safeJson(value: string): unknown {
   } catch {
     return {}
   }
+}
+
+// ── 宿主桥：LLM、会话全文、会话列表 ────────────────────────────────────────
+// 全部走 lookupService + try/catch：这些服务在别的小版本里可能不存在，
+// 缺了就把提炼降级成规则抽取，不能因此让插件装不上（见文件头的装配原则）。
+
+interface LlmLike {
+  stream?: (request: unknown) => AsyncIterable<unknown>
+  prepareCall?: (config: unknown, signal?: AbortSignal) => Promise<{ stream?: (request: unknown) => AsyncIterable<unknown> }>
+  resolveModel?: (provider: string, model: string, signal?: AbortSignal) => Promise<unknown>
+}
+
+interface SessionLike {
+  deriveMessages?: () => readonly unknown[]
+  snapshotEvents?: () => readonly unknown[]
+}
+
+interface SessionQueryLike {
+  readSession?: (sessionId: string) => Promise<{ events?: readonly unknown[] }>
+  listSessions?: () => Promise<readonly unknown[]>
+}
+
+/** 从流式 chunk 里抠文本：宿主各适配器字段不完全一致，能抠到就用。 */
+function chunkText(chunk: unknown): string {
+  if (typeof chunk === 'string') return chunk
+  if (chunk === null || typeof chunk !== 'object') return ''
+  const record = chunk as Record<string, unknown>
+  for (const key of ['text', 'delta', 'content']) {
+    const value = record[key]
+    if (typeof value === 'string') return value
+    if (value !== null && typeof value === 'object') {
+      const nested = value as Record<string, unknown>
+      if (typeof nested.text === 'string') return nested.text
+      if (typeof nested.content === 'string') return nested.content
+      if (Array.isArray(nested.content)) {
+        const parts = nested.content
+          .map((block) => (block !== null && typeof block === 'object' ? (block as Record<string, unknown>).text : undefined))
+          .filter((text): text is string => typeof text === 'string')
+        if (parts.length > 0) return parts.join('')
+      }
+    }
+  }
+  if (Array.isArray(record.choices)) {
+    const first = record.choices[0]
+    if (first !== null && typeof first === 'object') {
+      const delta = (first as Record<string, unknown>).delta
+      if (delta !== null && typeof delta === 'object') {
+        const content = (delta as Record<string, unknown>).content
+        if (typeof content === 'string') return content
+      }
+    }
+  }
+  return ''
+}
+
+/**
+ * 造一个 `Complete`：用宿主当前选中的模型做一次性补全。
+ *
+ * 注意它**不抛给上层**是错的——服务靠"抛了就走规则兜底"来判断 LLM 不可用，
+ * 所以这里的每一次失败都必须原样抛出去。
+ */
+function makeComplete(host: SharedHost, warn: (message: string) => void): Complete | undefined {
+  const llm = lookupService(host, 'llm') as LlmLike | undefined
+  if (llm === undefined || typeof llm.stream !== 'function') return undefined
+  const selection = lookupService(host, 'agentDefaultModel') as { currentSelection?: () => { provider?: string; model?: string } } | undefined
+  return async (system: string, user: string): Promise<string> => {
+    const picked = selection?.currentSelection?.() ?? {}
+    // ⚠️ 这里曾经直接甩给宿主两条裸消息（只有 role/content），宿主 v4 校验
+    // 一口咬死：`format v4 message requires a producer-owned source kind`，
+    // 而且是在**格式化阶段**炸的——一次提炼能把整个会话带走。
+    // 现在统一过 producerMessages()：补齐 `plugin:dsh-shared-memories` 并当场自检。
+    const request = {
+      ...(picked.provider !== undefined ? { provider: picked.provider } : {}),
+      ...(picked.model !== undefined ? { model: picked.model } : {}),
+      messages: producerMessages([
+        { role: 'system', content: [{ type: 'text', text: system }] },
+        { role: 'user', content: [{ type: 'text', text: user }] },
+      ]),
+    }
+    const stream = llm.stream?.(request)
+    if (stream === undefined) throw new Error('llm.stream 不可用')
+    let text = ''
+    for await (const chunk of stream) text += chunkText(chunk)
+    if (text.trim() === '') throw new Error('LLM 返回空文本')
+    return text
+  }
+}
+
+/** 读一个会话的完整对话：先走 sessionQuery（含时间与全文），再退回 live session。 */
+async function readSessionTurns(host: SharedHost, sessionId: string, warn: (message: string) => void): Promise<ChatTurn[]> {
+  const query = lookupService(host, 'sessionQuery') as SessionQueryLike | undefined
+  if (query !== undefined && typeof query.readSession === 'function') {
+    try {
+      const record = await query.readSession(sessionId)
+      const events = record.events ?? []
+      const turns = eventsToTurns(events)
+      if (turns.length > 0) return turns
+    } catch (cause) {
+      warn(`读会话事件失败（回退到内存会话）：${cause instanceof Error ? cause.message : String(cause)}`)
+    }
+  }
+  const sessions = lookupService(host, 'sessions') as { get?: (id: string) => SessionLike | undefined } | undefined
+  try {
+    const session = sessions?.get?.(sessionId)
+    if (session === undefined) return []
+    if (typeof session.deriveMessages === 'function') return messagesToTurns(session.deriveMessages())
+    if (typeof session.snapshotEvents === 'function') return eventsToTurns(session.snapshotEvents())
+  } catch (cause) {
+    warn(`读活会话失败：${cause instanceof Error ? cause.message : String(cause)}`)
+  }
+  return []
+}
+
+/** 会话列表：控制台让用户挑"要提炼哪个会话"。 */
+function listSessionsFor(host: SharedHost): readonly { sessionId: string; title: string }[] {
+  const query = lookupService(host, 'sessionQuery') as SessionQueryLike | undefined
+  const live = lookupService(host, 'sessions') as { list?: () => readonly SessionLike[] } | undefined
+  const rows: { sessionId: string; title: string }[] = []
+  const push = (raw: unknown): void => {
+    if (raw === null || typeof raw !== 'object') return
+    const record = raw as Record<string, unknown>
+    const id = typeof record.sessionId === 'string' ? record.sessionId : typeof record.id === 'string' ? record.id : ''
+    if (id === '') return
+    const title =
+      typeof record.title === 'string' && record.title !== ''
+        ? record.title
+        : typeof record.displayTitle === 'string' && record.displayTitle !== ''
+          ? record.displayTitle
+          : `会话 ${id.slice(0, 8)}`
+    rows.push({ sessionId: id, title })
+  }
+  try {
+    const liveRows = live?.list?.() ?? []
+    for (const row of liveRows) push(row as unknown)
+  } catch {
+    /* 忽略：拿不到活会话就只用持久化列表 */
+  }
+  void query
+  return rows
+}
+
+/**
+ * 自动提炼的防抖间隔。
+ *
+ * 8 秒的依据：一轮回答落盘后，用户往往还要接着问；隔 8 秒才动手，
+ * 既能把"这一轮"完整读到，又不会在连问三句时提炼三次（后一次取消前一次）。
+ */
+const AUTO_DISTILL_DEBOUNCE_MS = 8000
+
+/** 兜底巡场间隔：事件没送达时，最迟这么久也能把新对话记下来。 */
+const AUTO_SWEEP_MS = 15000
+
+/** 一次巡场最多看几个会话：宁可少记，也不要每 15 秒把几十个会话全读一遍。 */
+const AUTO_SWEEP_MAX = 4
+
+/** 只扫最近这么久的活会话（老会话等用户归档时再提炼）。 */
+const AUTO_SWEEP_WINDOW_MS = 2 * 60 * 60 * 1000
+
+/**
+ * 巡场：把"活着且最近说过话"的会话挨个看一眼，水位之后还有内容就排一次提炼。
+ *
+ * 这是自动落库的第二条腿。第一条是 `agent/assistant-stream` 事件；但那条走的是
+ * agent 作用域的 `events.dispatch`，宿主完全可能把 app 级监听过滤掉（实测风险），
+ * 所以必须有一个只依赖 host 服务（`sessionQuery` / `sessions`）的兜底。
+ */
+async function sweepLiveSessions(
+  host: SharedHost,
+  runtime: Runtime,
+  warn: (message: string) => void,
+): Promise<void> {
+  if (!runtime.booted || runtime.distill === undefined || runtime.cursor === undefined) return
+  const now = Date.now()
+  const candidates: string[] = []
+  for (const [agentId, entry] of runtime.liveAgents) {
+    if (now - entry.lastSeenAt > AUTO_SWEEP_WINDOW_MS) continue
+    for (const sessionId of entry.sessions) {
+      if (sessionId === '') continue
+      candidates.push(sessionId)
+      if (candidates.length >= AUTO_SWEEP_MAX) break
+    }
+    if (candidates.length >= AUTO_SWEEP_MAX) break
+  }
+  if (candidates.length === 0) return
+
+  for (const sessionId of candidates) {
+    if (runtime.jobs.latestFor(sessionId)?.status === 'running') continue
+    if (runtime.autoTimers.has(sessionId)) continue
+    try {
+      const turns = await readSessionTurns(host, sessionId, warn)
+      if (turns.length <= runtime.cursor.get(sessionId)) continue
+      scheduleAutoDistill(host, runtime, sessionId, warn)
+    } catch (cause) {
+      warn(`巡场读会话失败（${sessionId}）：${cause instanceof Error ? cause.message : String(cause)}`)
+    }
+  }
+}
+
+/** 为一个会话排一次自动提炼；同一会话已有待跑任务就重置计时（只跑最后一次）。 */
+function scheduleAutoDistill(
+  host: SharedHost,
+  runtime: Runtime,
+  sessionId: string,
+  warn: (message: string) => void,
+): void {
+  const existing = runtime.autoTimers.get(sessionId)
+  if (existing !== undefined) clearTimeout(existing)
+  const timer = setTimeout(() => {
+    runtime.autoTimers.delete(sessionId)
+    void autoDistill(host, runtime, sessionId, warn)
+  }, AUTO_DISTILL_DEBOUNCE_MS)
+  // 桌面端退出时不该被一个待跑的提炼钉住进程。
+  ;(timer as unknown as { unref?: () => void }).unref?.()
+  runtime.autoTimers.set(sessionId, timer)
+}
+
+/**
+ * 增量自动提炼：只提炼水位之后的新内容。
+ *
+ * 这是"边聊边记"的核心：不加这段，记忆只有一个写入入口 —— 归档。
+ * 用户只聊天不归档，`memory_entity` 永远是 0 行，界面上就是"什么都没记住"。
+ */
+async function autoDistill(
+  host: SharedHost,
+  runtime: Runtime,
+  sessionId: string,
+  warn: (message: string) => void,
+): Promise<void> {
+  const policies = runtime.policies
+  const distill = runtime.distill
+  const cursor = runtime.cursor
+  if (policies === undefined || distill === undefined || cursor === undefined) return
+
+  const policy = policies.get(sessionId, runtime.workspaceId, '')
+  // 无痕：一个字都不写。off：用户点过"归档但不记忆"。
+  if (policy.ephemeral || policy.archiveMode === 'off') return
+  // 手动提炼正在跑：让它跑完，别两路同时写同一批 turn。
+  if (runtime.jobs.latestFor(sessionId)?.status === 'running') return
+
+  let turns: readonly ChatTurn[]
+  try {
+    turns = await readSessionTurns(host, sessionId, warn)
+  } catch (cause) {
+    warn(`自动提炼读会话失败（${sessionId}）：${cause instanceof Error ? cause.message : String(cause)}`)
+    return
+  }
+  if (turns.length === 0) return
+  const from = cursor.get(sessionId)
+  if (turns.length <= from) return
+  const fresh = turns.slice(from)
+
+  const job = runtime.jobs.start(sessionId, 'incremental')
+  try {
+    const report = await distill.run({
+      sessionId,
+      turns: fresh,
+      mode: 'incremental',
+      onProgress: (progress) => {
+        runtime.jobs.progress(job.jobId, {
+          phase: progress.phase,
+          detail: progress.detail,
+          chunk: progress.chunk,
+          total: progress.total,
+          turns: progress.turns,
+          written: progress.written,
+        })
+      },
+    })
+    runtime.jobs.finish(job.jobId, report)
+    // 只有真跑完才推进水位：失败/跳过的下一轮会重试同一批内容。
+    cursor.set(sessionId, runtime.workspaceId, turns.length)
+  } catch (cause) {
+    runtime.jobs.fail(job.jobId, cause)
+    warn(`自动提炼失败（${sessionId}）：${cause instanceof Error ? cause.message : String(cause)}`)
+  }
+}
+
+/**
+ * 启动一次提炼（可被 HTTP 手动触发，也可被 `workspace/session-stop` 自动触发）。
+ *
+ * 立刻返回 jobId 而不是 await：深度重读可能几十秒，HTTP 挂着会超时，
+ * 前端也无法在中途显示进度。真正的进度走 `runtime.jobs`。
+ */
+function startDistill(
+  host: SharedHost,
+  runtime: Runtime,
+  sessionId: string,
+  mode: 'incremental' | 'deep',
+  warn: (message: string) => void,
+): { jobId: string } {
+  const job = runtime.jobs.start(sessionId, mode)
+  void (async () => {
+    try {
+      if (runtime.distill === undefined) throw new Error('提炼服务尚未就绪')
+      runtime.jobs.progress(job.jobId, { phase: 'reading', detail: '正在深度重读全部对话…' })
+      const turns = await readSessionTurns(host, sessionId, warn)
+      runtime.jobs.progress(job.jobId, { phase: 'reading', detail: `已读到 ${turns.length} 条消息`, turns: turns.length })
+      const report = await runtime.distill.run({
+        sessionId,
+        turns,
+        mode,
+        onProgress: (progress) => {
+          runtime.jobs.progress(job.jobId, {
+            phase: progress.phase,
+            detail: progress.detail,
+            chunk: progress.chunk,
+            total: progress.total,
+            turns: progress.turns,
+            written: progress.written,
+          })
+        },
+      })
+      runtime.jobs.finish(job.jobId, report)
+      // 手动/归档提炼已经把整段读完，水位抬到顶，避免自动提炼重复跑一遍。
+      runtime.cursor?.set(sessionId, runtime.workspaceId, turns.length)
+    } catch (cause) {
+      runtime.jobs.fail(job.jobId, cause)
+      warn(`提炼失败（${sessionId}）：${cause instanceof Error ? cause.message : String(cause)}`)
+    }
+  })()
+  return { jobId: job.jobId }
 }

@@ -90,6 +90,10 @@ async function main() {
 
   assertNoNodeBuiltins(code)
   assertRewrittenImportsRemain(code)
+  // 宿主的客户端加载器是"传统脚本 + 注入 require"，不是 ESM：
+  // 顶层只要残留一条 import/export，整个 entry 会 import failed（页面直接起不来）。
+  assertCommonJsOnly(code)
+  await assertPackageEntryPoints(pkg)
 
   const file = wrap(code, id)
   await writeFile(OUT, file, 'utf8')
@@ -138,6 +142,61 @@ function assertRewrittenImportsRemain(code) {
   const relative = [...code.matchAll(/require\(["'](\.[^"']*)["']\)/g)].map((m) => m[1])
   if (relative.length > 0) {
     throw new Error(`客户端产物里残留相对导入（应已被打包）：${[...new Set(relative)].join(', ')}`)
+  }
+}
+
+/**
+ * 产物必须是**纯 CJS**：不许有顶层 `import` / `export` 语句。
+ *
+ * 宿主用 `factory(require) { ... return module.exports }` 的传统脚本方式执行它，
+ * 见到 ESM 语法不会帮你降级——整条 entry 直接加载失败，桌面端表现为
+ * "web boot: 1 entry did not activate"。这个断言把事故挡在构建阶段。
+ */
+function assertCommonJsOnly(code) {
+  const offenders = []
+  for (const [index, raw] of code.split('\n').entries()) {
+    const line = raw.trim()
+    // 字符串/模板里的 "export " 不会出现在行首，这里只认语句位置。
+    if (/^(import\s+[^\s(]|import\s*\{|import\s*\*)/.test(line)) offenders.push(`${index + 1}: ${line.slice(0, 80)}`)
+    if (/^export\s+(default\b|const\b|function\b|class\b|let\b|var\b|\{|\*)/.test(line)) offenders.push(`${index + 1}: ${line.slice(0, 80)}`)
+  }
+  if (offenders.length > 0) {
+    throw new Error(`客户端产物必须是 CJS，但发现 ESM 语句：\n${offenders.slice(0, 8).join('\n')}`)
+  }
+  if (!code.includes('module.exports')) {
+    throw new Error('客户端产物没有写出 module.exports —— factory 会返回空壳，宿主判定 entry 未激活')
+  }
+}
+
+/**
+ * 校验 package.json 的入口都指向**真实存在**的文件：
+ *   - `main` / `exports['./client'].default`：宿主解析包的入口；
+ *   - `dsh.client.entry`：Web 端加载客户端的路径；
+ *   - `dsh.bundle.patch`：宿主安装插件时要读的 patch 文件。
+ * 任何一条指错，用户侧看到的就是"插件装了但没反应"或启动失败。
+ */
+async function assertPackageEntryPoints(pkg) {
+  const wanted = []
+  if (typeof pkg.main === 'string') wanted.push(['main', pkg.main])
+  const clientExport = pkg.exports?.['./client']?.default
+  if (typeof clientExport === 'string') wanted.push(["exports['./client'].default", clientExport])
+  if (typeof pkg.dsh?.client?.entry === 'string') wanted.push(['dsh.client.entry', pkg.dsh.client.entry])
+  if (typeof pkg.dsh?.bundle?.patch === 'string') wanted.push(['dsh.bundle.patch', pkg.dsh.bundle.patch])
+
+  const missing = []
+  for (const [label, relative] of wanted) {
+    try {
+      const info = await stat(resolve(ROOT, relative))
+      if (!info.isFile()) missing.push(`${label} → ${relative}（不是文件）`)
+    } catch {
+      missing.push(`${label} → ${relative}（不存在）`)
+    }
+  }
+  if (missing.length > 0) throw new Error(`package.json 入口配置指向了不存在的文件：\n${missing.join('\n')}`)
+
+  // 客户端入口必须和 OUT 是同一个文件，否则我们写的产物根本没人加载。
+  if (typeof pkg.dsh?.client?.entry === 'string' && resolve(ROOT, pkg.dsh.client.entry) !== OUT) {
+    throw new Error(`dsh.client.entry (${pkg.dsh.client.entry}) 必须等于构建产物 ${OUT}`)
   }
 }
 

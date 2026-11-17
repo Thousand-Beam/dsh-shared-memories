@@ -74,6 +74,7 @@ interface ReplayStats {
   skills: number
   userProfiles: number
   personaIdentities: number
+  purged: number
   deferred: number
   skipped: number
 }
@@ -102,6 +103,7 @@ export class ReplayApplier {
       skills: 0,
       userProfiles: 0,
       personaIdentities: 0,
+      purged: 0,
       deferred: 0,
       skipped: 0,
     }
@@ -279,6 +281,36 @@ export class ReplayApplier {
               ],
             )
             stats.userProfiles++
+            break
+          }
+          case 'agent.purge': {
+            // 墓碑：某台机器上"彻底销毁"了一个 Agent。
+            // 这条必须让旧快照 replay 时也执行，否则换台机器恢复一次，
+            // 被销毁的人就带着记忆复活了——那比不能删更糟。
+            const workspaceId = str(record.workspaceId)
+            const agentId = str(record.agentId)
+            if (workspaceId === undefined || agentId === undefined) {
+              stats.skipped++
+              break
+            }
+            this.#db.run(
+              'DELETE FROM memory_version WHERE entity_id IN (SELECT entity_id FROM memory_entity WHERE workspace_id = ? AND agent_id = ?)',
+              [workspaceId, agentId],
+            )
+            this.#db.run('DELETE FROM memory_entity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#db.run('DELETE FROM pitfall WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#db.run('DELETE FROM quarantine WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#db.run('DELETE FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#db.run('DELETE FROM persona_identity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#db.run('DELETE FROM agent_skill WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            // 墓碑重放要连提炼水位一起清：否则重放后"已记过"的水位还在，
+            // 复活的会话再也不会被自动提炼。
+            this.#db.run(
+              'DELETE FROM distill_cursor WHERE session_id IN (SELECT session_id FROM session_policy WHERE workspace_id = ? AND agent_id = ?)',
+              [workspaceId, agentId],
+            )
+            this.#db.run('DELETE FROM session_policy WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            stats.purged++
             break
           }
           default: {
