@@ -309,6 +309,36 @@ export class PitfallStore {
       return []
     }
   }
+
+  /**
+   * 删除一条踩坑记录（用户手动干涉：删掉记错的观察 / 不再要的规则）。
+   *
+   * 直接物理删除 + 写审计，不写 journal。理由：`record()` 只 INSERT 库表、
+   * 不写 journal（observation 不靠日志回放重建），所以这里删了就不会在冷启动
+   * 恢复时被复活；即便之前升格时写过 `pitfall.promote` 日志，回放时也只是
+   * UPDATE 一条已不存在的行（0 行、无副作用）。这是最稳的"删了不还魂"。
+   */
+  remove(pitfallId: string, scope: Scope): { deleted: boolean } {
+    const deleted = this.#db.run(
+      `DELETE FROM pitfall WHERE pitfall_id = ? AND workspace_id = ? AND agent_id = ?`,
+      [pitfallId, scope.workspaceId, scope.agentId],
+    ).changes > 0
+    if (deleted) {
+      this.#db.run(
+        `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
+         VALUES (?,?,?,?,?,?)`,
+        [
+          newId('aud'),
+          scope.workspaceId,
+          scope.agentId,
+          'pitfall.remove',
+          JSON.stringify({ pitfallId }),
+          this.#clock(),
+        ],
+      )
+    }
+    return { deleted }
+  }
 }
 
 export class PitfallError extends Error {

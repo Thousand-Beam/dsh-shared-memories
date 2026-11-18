@@ -49,6 +49,7 @@ export function MemoryView(): ReactNode {
   const store = useStore()
   const state = useConsole((snapshot) => snapshot)
   const [editing, setEditing] = useState<MemoryCard | null>(null)
+  const [editingText, setEditingText] = useState<MemoryCard | null>(null)
 
   const visible = filterMemories(state)
   const total = state.memories.length
@@ -89,6 +90,16 @@ export function MemoryView(): ReactNode {
       store.patch({ memories: rows })
     } catch (cause) {
       store.toast('error', cause instanceof Error ? cause.message : '重载记忆失败')
+    }
+  }
+
+  const forget = async (memory: MemoryCard): Promise<void> => {
+    try {
+      const result = await api.forgetMemory({ entityId: memory.entityId, agentId: memory.agentId })
+      store.toast('ok', result.forgotten ? '已删除这条记忆' : '这条记忆已经不存在了')
+      await reload()
+    } catch (cause) {
+      store.toast('error', cause instanceof Error ? cause.message : '删除失败')
     }
   }
 
@@ -226,6 +237,10 @@ export function MemoryView(): ReactNode {
               memory={memory}
               agentName={agentName(memory.agentId)}
               onEditEmotion={() => setEditing(memory)}
+              onEditText={() => setEditingText(memory)}
+              onDelete={() => {
+                void forget(memory)
+              }}
             />
           ))}
         </div>
@@ -242,6 +257,18 @@ export function MemoryView(): ReactNode {
           }}
         />
       )}
+
+      {editingText === null ? null : (
+        <EditTextDialog
+          memory={editingText}
+          onClose={() => setEditingText(null)}
+          onSaved={async () => {
+            setEditingText(null)
+            await reload()
+            store.toast('ok', '记忆正文已更新')
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -252,6 +279,8 @@ function MemoryCardView(props: {
   memory: MemoryCard
   agentName: string
   onEditEmotion: () => void
+  onEditText: () => void
+  onDelete: () => void
 }): ReactNode {
   const { memory } = props
   const trust = trustLevel(memory.trust)
@@ -305,6 +334,22 @@ function MemoryCardView(props: {
         <span className='dsm-caption' title={`版本 ${memory.versionId}`}>
           {formatDateTime(memory.validFrom)} · {shortId(memory.versionId)}
         </span>
+        <button
+          type='button'
+          className='dsm-btn dsm-btn--sm dsm-btn--ghost'
+          onClick={props.onEditText}
+          title='修改这条记忆的正文（旧版本会进时间树，不直接覆盖）'
+        >
+          编辑
+        </button>
+        <button
+          type='button'
+          className='dsm-btn dsm-btn--sm dsm-btn--danger'
+          onClick={props.onDelete}
+          title='删除这条记忆（软删，时间树里仍可回看）'
+        >
+          删除
+        </button>
       </div>
     </article>
   )
@@ -419,6 +464,80 @@ function EmotionDialog(props: {
 
         <p className='dsm-caption'>
           修正会写入一条新的记忆版本，旧版本进时间树，不会被直接覆盖。
+        </p>
+      </div>
+    </Modal>
+  )
+}
+
+/* ── 记忆正文编辑弹层 ─────────────────────────────────────────────────── */
+
+function EditTextDialog(props: {
+  memory: MemoryCard
+  onClose: () => void
+  onSaved: () => Promise<void>
+}): ReactNode {
+  const [text, setText] = useState<string>(props.memory.text)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const save = async (): Promise<void> => {
+    const next = text.trim()
+    if (next === '') {
+      setError('正文不能为空')
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      await api.editMemory({ entityId: props.memory.entityId, agentId: props.memory.agentId, text: next })
+      await props.onSaved()
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '修改失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Modal
+      title='修改记忆正文'
+      onClose={props.onClose}
+      actions={
+        <>
+          <button type='button' className='dsm-btn dsm-btn--ghost' onClick={props.onClose} disabled={busy}>
+            取消
+          </button>
+          <button
+            type='button'
+            className='dsm-btn dsm-btn--primary'
+            onClick={() => {
+              void save()
+            }}
+            disabled={busy}
+          >
+            {busy ? '保存中…' : '保存'}
+          </button>
+        </>
+      }
+    >
+      <div className='dsm-stack' style={{ gap: 12 }}>
+        <div className='dsm-field'>
+          <span className='dsm-field-label'>新正文</span>
+          <textarea
+            className='dsm-input'
+            rows={5}
+            style={{ minHeight: 96, resize: 'vertical' }}
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            placeholder='写下这条记忆的新表述…'
+          />
+        </div>
+
+        {error === null ? null : <Tag tone='danger'>{error}</Tag>}
+
+        <p className='dsm-caption'>
+          修改会写入一条新的记忆版本，旧版本进时间树，不会被直接覆盖。
         </p>
       </div>
     </Modal>

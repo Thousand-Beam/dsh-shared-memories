@@ -121,6 +121,16 @@ export function RulesView(): ReactNode {
     }
   }
 
+  const removeRule = async (item: RuleItem): Promise<void> => {
+    try {
+      const result = await api.deleteRule({ pitfallId: item.pitfallId, agentId })
+      await reloadRules()
+      store.toast('ok', result.deleted ? '已删除这条踩坑记录' : '这条记录已经不存在了')
+    } catch (cause) {
+      store.toast('error', describe(cause, '删除踩坑失败'))
+    }
+  }
+
   const confirm = async (request: PromotionPreview): Promise<void> => {
     try {
       await api.confirmPromotion({ agentId, requestId: request.requestId, by: 'user' })
@@ -353,6 +363,9 @@ export function RulesView(): ReactNode {
               onPromote={() => {
                 void promote(item)
               }}
+              onDelete={() => {
+                void removeRule(item)
+              }}
             />
           ))}
         </div>
@@ -384,7 +397,7 @@ export function RulesView(): ReactNode {
 
 /* ── 单条经验 ─────────────────────────────────────────────────────────── */
 
-function RuleCard(props: { item: RuleItem; onPromote: () => void }): ReactNode {
+function RuleCard(props: { item: RuleItem; onPromote: () => void; onDelete: () => void }): ReactNode {
   const { item } = props
   const to = nextStage(item.stage)
   return (
@@ -422,6 +435,14 @@ function RuleCard(props: { item: RuleItem; onPromote: () => void }): ReactNode {
             升格为「{stageLabel(to)}」
           </button>
         )}
+        <button
+          type='button'
+          className='dsm-btn dsm-btn--sm dsm-btn--danger'
+          onClick={props.onDelete}
+          title='删除这条踩坑记录（不可恢复）'
+        >
+          删除
+        </button>
       </div>
     </article>
   )

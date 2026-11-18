@@ -102,6 +102,12 @@ export interface MemoriesApiDeps {
     subjectKey: string
     emotion: EmotionAttribution | null
   }): Promise<void>
+  /** 忘记一条记忆：关闭活跃版本并置 status='forgotten'（写 journal，可跨设备漫游）。 */
+  forgetMemory?(input: { entityId: string; agentId: string }): Promise<{ forgotten: boolean }>
+  /** 修改一条记忆的正文：开新版本，旧版本进时间树（写 journal）。 */
+  editMemory?(input: { entityId: string; agentId: string; text: string }): Promise<{ versionId: string }>
+  /** 删除一条踩坑记录（物理删除 + 审计，不写 journal）。 */
+  deletePitfall?(input: { pitfallId: string; agentId: string }): Promise<{ deleted: boolean }>
   /** 踩坑库（四段式观察 → 规则），「规则与人格」视图的升格入口。 */
   pitfalls?(): PitfallStore | undefined
   /**
@@ -190,6 +196,29 @@ async function dispatch(
       const body = await readJson(req)
       fixEmotion(deps, body)
       return sendJson(res, 200, ok({ versionId: str(body.versionId) ?? '' }))
+    }
+    if (method === 'POST' && path === '/memory/forget') {
+      const body = await readJson(req)
+      const forget = deps.forgetMemory
+      if (!forget) throw new ApiError('forget-unavailable', '记忆删除服务尚未就绪', 503)
+      deps.barrier.assertWritable('memory-forget')
+      const result = await forget({
+        entityId: reqStr(body, 'entityId'),
+        agentId: str(body.agentId) ?? 'default',
+      })
+      return sendJson(res, 200, ok(result))
+    }
+    if (method === 'POST' && path === '/memory/edit') {
+      const body = await readJson(req)
+      const edit = deps.editMemory
+      if (!edit) throw new ApiError('edit-unavailable', '记忆编辑服务尚未就绪', 503)
+      deps.barrier.assertWritable('memory-edit')
+      const result = await edit({
+        entityId: reqStr(body, 'entityId'),
+        agentId: str(body.agentId) ?? 'default',
+        text: reqStr(body, 'text'),
+      })
+      return sendJson(res, 200, ok(result))
     }
     // ── 人格与规则（「规则与人格」视图的后端）─────────────────────────────
     if (method === 'GET' && path === '/persona') {
@@ -333,6 +362,17 @@ async function dispatch(
       if (!store) throw new ApiError('pitfalls-unavailable', '踩坑库尚未就绪', 503)
       store.reject(reqStr(body, 'requestId'))
       return sendJson(res, 200, ok({ rejected: true }))
+    }
+    if (method === 'POST' && path === '/rules/delete') {
+      const body = await readJson(req)
+      const del = deps.deletePitfall
+      if (!del) throw new ApiError('delete-unavailable', '踩坑删除服务尚未就绪', 503)
+      deps.barrier.assertWritable('rules-delete')
+      const result = await del({
+        pitfallId: reqStr(body, 'pitfallId'),
+        agentId: str(body.agentId) ?? 'default',
+      })
+      return sendJson(res, 200, ok(result))
     }
     if (method === 'POST' && path === '/snapshots/pin') {
       const body = await readJson(req)

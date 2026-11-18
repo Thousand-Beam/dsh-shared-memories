@@ -594,6 +594,60 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         })
         if (opened.deduped) warn(`洗白内容与现有记忆一致，未新增版本：${opened.entity.entity_id}`)
       },
+      // 忘记一条记忆：关活跃版本 + status='forgotten'。closeAt 会写 version.close
+      // journal，所以这条删除能跨设备漫游（不会在冷启动时被 journal 回放复活）。
+      forgetMemory: async (input) => {
+        const db = runtime.db
+        if (!db || !runtime.tree) throw new Error('记忆库尚未就绪')
+        const agentId = runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default')
+        const scope = { workspaceId, agentId, deviceId }
+        const entity = db.one<{ entity_id: string }>(
+          `SELECT entity_id FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+          [input.entityId, workspaceId, agentId],
+        )
+        if (!entity) return { forgotten: false }
+        const active = db.one<{ valid_from: number }>(
+          `SELECT valid_from FROM memory_version WHERE entity_id = ? AND valid_until IS NULL`,
+          [input.entityId],
+        )
+        if (active) {
+          const at = Math.max(Date.now(), active.valid_from + 1)
+          await runtime.tree.closeAt(input.entityId, at, scope, 'user')
+        }
+        db.run(
+          `UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+          [Date.now(), input.entityId, workspaceId, agentId],
+        )
+        return { forgotten: true }
+      },
+      // 修改一条记忆的正文：开新版本（旧版本自动进时间树），不直接覆盖原文。
+      editMemory: async (input) => {
+        const db = runtime.db
+        if (!db || !runtime.tree) throw new Error('记忆库尚未就绪')
+        const agentId = runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default')
+        const entity = db.one<{ entity_id: string; kind: string; subject_key: string; trust: number }>(
+          `SELECT entity_id, kind, subject_key, trust FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+          [input.entityId, workspaceId, agentId],
+        )
+        if (!entity) throw new Error(`记忆不存在：${input.entityId}`)
+        const opened = await runtime.tree.openVersion({
+          scope: { workspaceId, agentId, deviceId },
+          kind: entity.kind as Parameters<typeof runtime.tree.openVersion>[0]['kind'],
+          subjectKey: entity.subject_key,
+          text: input.text,
+          entityId: entity.entity_id,
+          trust: entity.trust,
+          author: 'user',
+        })
+        return { versionId: opened.version.version_id }
+      },
+      // 删除一条踩坑记录（物理删除 + 审计，不写 journal，见 PitfallStore.remove 注释）。
+      deletePitfall: async (input) => {
+        const pitfalls = runtime.pitfalls
+        if (!pitfalls) throw new Error('踩坑库尚未就绪')
+        const agentId = runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default')
+        return pitfalls.remove(input.pitfallId, { workspaceId, agentId, deviceId })
+      },
     }
 
     const webServer = lookupService(host, 'webServer') as WebServerLike | undefined

@@ -89,6 +89,20 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /** 删除一条记忆（软删：关活跃版本 + status='forgotten'）。 */
+  forgetMemory: (body: { entityId: string; agentId: string }) =>
+    request<{ forgotten: boolean }>('/memory/forget', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** 修改一条记忆的正文（开新版本，旧版本进时间树）。 */
+  editMemory: (body: { entityId: string; agentId: string; text: string }) =>
+    request<{ versionId: string }>('/memory/edit', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
   snapshots: (agentId: string) =>
     request<SnapshotNode[]>(`/snapshots?agentId=${encodeURIComponent(agentId)}`),
 
@@ -180,6 +194,13 @@ export const api = {
     request<{ rejected: boolean }>('/rules/reject', {
       method: 'POST',
       body: JSON.stringify({ requestId }),
+    }),
+
+  /** 删除一条踩坑记录（物理删除，不可恢复）。 */
+  deleteRule: (body: { pitfallId: string; agentId: string }) =>
+    request<{ deleted: boolean }>('/rules/delete', {
+      method: 'POST',
+      body: JSON.stringify(body),
     }),
 
   // ── 会话策略 / 深度提炼 / 物理销毁 ──────────────────────────────────────
