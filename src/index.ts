@@ -614,11 +614,12 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           const at = Math.max(Date.now(), active.valid_from + 1)
           await runtime.tree.closeAt(input.entityId, at, scope, 'user')
         }
-        db.run(
-          `UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+        const updated = db.run(
+          `UPDATE memory_entity SET status = 'forgotten', updated_at = ?
+           WHERE entity_id = ? AND workspace_id = ? AND agent_id = ? AND status != 'forgotten'`,
           [Date.now(), input.entityId, workspaceId, agentId],
         )
-        return { forgotten: true }
+        return { forgotten: updated.changes > 0 }
       },
       // 修改一条记忆的正文：开新版本（旧版本自动进时间树），不直接覆盖原文。
       editMemory: async (input) => {
@@ -629,7 +630,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           `SELECT entity_id, kind, subject_key, trust FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
           [input.entityId, workspaceId, agentId],
         )
-        if (!entity) throw new Error(`记忆不存在：${input.entityId}`)
+        if (!entity) return { versionId: '' }
         const opened = await runtime.tree.openVersion({
           scope: { workspaceId, agentId, deviceId },
           kind: entity.kind as Parameters<typeof runtime.tree.openVersion>[0]['kind'],

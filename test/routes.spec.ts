@@ -244,6 +244,51 @@ async function makeHarness(t: TestContext, options: { ready?: boolean } = {}): P
       reopened.push({ quarantineId: input.quarantineId, text: input.text })
     },
     pitfalls: () => pitfalls,
+    // 三个「干涉」端点：删记忆 / 改记忆 / 删踩坑。实现对齐 index.ts 里真实闭包的语义。
+    forgetMemory: async (input: { entityId: string; agentId: string }) => {
+      const agentId = input.agentId || AGENT
+      const scope: Scope = { workspaceId: WORKSPACE, agentId, deviceId: 'dev-routes' }
+      const entity = db.one<{ entity_id: string }>(
+        `SELECT entity_id FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+        [input.entityId, WORKSPACE, agentId],
+      )
+      if (!entity) return { forgotten: false }
+      const active = db.one<{ valid_from: number }>(
+        `SELECT valid_from FROM memory_version WHERE entity_id = ? AND valid_until IS NULL`,
+        [input.entityId],
+      )
+      if (active) {
+        const at = Math.max(NOW + 1000, active.valid_from + 1)
+        await tree.closeAt(input.entityId, at, scope, 'user')
+      }
+      const updated = db.run(
+        `UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ? AND workspace_id = ? AND agent_id = ? AND status != 'forgotten'`,
+        [NOW + 1000, input.entityId, WORKSPACE, agentId],
+      )
+      return { forgotten: updated.changes > 0 }
+    },
+    editMemory: async (input: { entityId: string; agentId: string; text: string }) => {
+      const agentId = input.agentId || AGENT
+      const entity = db.one<{ entity_id: string; kind: string; subject_key: string; trust: number }>(
+        `SELECT entity_id, kind, subject_key, trust FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+        [input.entityId, WORKSPACE, agentId],
+      )
+      if (!entity) return { versionId: '' }
+      const opened = await tree.openVersion({
+        scope: { workspaceId: WORKSPACE, agentId, deviceId: 'dev-routes' },
+        kind: entity.kind as Parameters<typeof tree.openVersion>[0]['kind'],
+        subjectKey: entity.subject_key,
+        text: input.text,
+        entityId: entity.entity_id,
+        trust: entity.trust,
+        author: 'user',
+      })
+      return { versionId: opened.version.version_id }
+    },
+    deletePitfall: async (input: { pitfallId: string; agentId: string }) => {
+      const agentId = input.agentId || AGENT
+      return pitfalls.remove(input.pitfallId, { workspaceId: WORKSPACE, agentId, deviceId: 'dev-routes' })
+    },
   } as unknown as MemoriesApiDeps
 
   const base = await serve(t, deps)
@@ -482,4 +527,105 @@ test('GET/POST /persona、GET /rules、未知路径 404', async (t) => {
   const missing = await call(h.base, '/definitely-not-a-route')
   assert.equal(missing.status, 404)
   assert.equal(missing.body.error?.code, 'not-found')
+})
+
+test('POST /memory/forget：软删记忆，关活跃版本并写 version.close', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  const cards = await call<MemoryCard[]>(h.base, `/memories?agentId=${AGENT}`)
+  const card = cards.body.data?.[0]
+  assert.ok(card, '要先有一条记忆才能删')
+
+  const forgot = await call<{ forgotten: boolean }>(h.base, '/memory/forget', {
+    method: 'POST',
+    body: { entityId: card.entityId, agentId: AGENT },
+  })
+  assert.equal(forgot.status, 200)
+  assert.equal(forgot.body.data?.forgotten, true)
+
+  const row = h.db.one<{ status: string }>('SELECT status FROM memory_entity WHERE entity_id = ?', [card.entityId])
+  assert.equal(row?.status, 'forgotten', '实体状态要软删，不能硬删')
+
+  const active = h.db.one('SELECT version_id FROM memory_version WHERE entity_id = ? AND valid_until IS NULL', [
+    card.entityId,
+  ])
+  assert.equal(active, undefined, '活跃版本必须被关闭')
+
+  const after = await call<MemoryCard[]>(h.base, `/memories?agentId=${AGENT}`)
+  assert.equal(after.body.data?.length, 0, 'forgotten 的记忆不该再出现在列表里')
+
+  const gone = await call<{ forgotten: boolean }>(h.base, '/memory/forget', {
+    method: 'POST',
+    body: { entityId: card.entityId, agentId: AGENT },
+  })
+  assert.equal(gone.body.data?.forgotten, false, '重复删同一条应是幂等 false，而不是报错')
+})
+
+test('POST /memory/edit：改正文开新版本，旧版本进时间树', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  const cards = await call<MemoryCard[]>(h.base, `/memories?agentId=${AGENT}`)
+  const card = cards.body.data?.[0]
+  assert.ok(card)
+
+  const edited = await call<{ versionId: string }>(h.base, '/memory/edit', {
+    method: 'POST',
+    body: { entityId: card.entityId, agentId: AGENT, text: 'Python 项目改用 unittest 跑测试' },
+  })
+  assert.equal(edited.status, 200)
+  assert.ok(edited.body.data?.versionId, '要返回新版本 id')
+
+  const versions = h.db.all<{ text: string; valid_until: number | null }>(
+    'SELECT text, valid_until FROM memory_version WHERE entity_id = ? ORDER BY valid_from',
+    [card.entityId],
+  )
+  assert.equal(versions.length, 2, '改一次正文应多一个版本')
+  assert.equal(versions[1]?.text, 'Python 项目改用 unittest 跑测试', '新版本正文要生效')
+  assert.ok(versions[0]?.valid_until !== null, '旧版本要被关闭进时间树')
+
+  const reloaded = await call<MemoryCard[]>(h.base, `/memories?agentId=${AGENT}`)
+  assert.ok(reloaded.body.data?.[0]?.text.includes('unittest'), '列表要读到新正文')
+
+  const missingEdit = await call<{ versionId: string }>(h.base, '/memory/edit', {
+    method: 'POST',
+    body: { entityId: 'ent_does_not_exist', agentId: AGENT, text: 'x' },
+  })
+  assert.equal(missingEdit.status, 404, '编辑不存在的记忆应是 404 而不是 500')
+  assert.equal(missingEdit.body.error?.code, 'memory-not-found')
+})
+
+test('POST /rules/delete：物理删除踩坑并写审计', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  h.db.run(
+    `INSERT INTO pitfall (pitfall_id, workspace_id, agent_id, observation, lesson, pattern, rule,
+                          stage, confirmed, occurrences, created_at, updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ['pf_test', WORKSPACE, AGENT, '测试踩坑', '', '', '', 'observation', 0, 1, NOW, NOW],
+  )
+
+  const del = await call<{ deleted: boolean }>(h.base, '/rules/delete', {
+    method: 'POST',
+    body: { pitfallId: 'pf_test', agentId: AGENT },
+  })
+  assert.equal(del.status, 200)
+  assert.equal(del.body.data?.deleted, true)
+
+  const row = h.db.one('SELECT pitfall_id FROM pitfall WHERE pitfall_id = ?', ['pf_test'])
+  assert.equal(row, undefined, '踩坑行必须被物理删除')
+
+  const audit = h.db.one<{ action: string }>(
+    'SELECT action FROM audit_log WHERE action = ? AND detail LIKE ?',
+    ['pitfall.remove', '%pf_test%'],
+  )
+  assert.equal(audit?.action, 'pitfall.remove', '删除要留审计')
+
+  const again = await call<{ deleted: boolean }>(h.base, '/rules/delete', {
+    method: 'POST',
+    body: { pitfallId: 'pf_test', agentId: AGENT },
+  })
+  assert.equal(again.body.data?.deleted, false, '重复删应是幂等 false')
 })

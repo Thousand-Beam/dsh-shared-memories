@@ -218,6 +218,7 @@ async function dispatch(
         agentId: str(body.agentId) ?? 'default',
         text: reqStr(body, 'text'),
       })
+      if (result.versionId === '') throw new ApiError('memory-not-found', '记忆不存在或不属于当前会话', 404)
       return sendJson(res, 200, ok(result))
     }
     // ── 人格与规则（「规则与人格」视图的后端）─────────────────────────────
