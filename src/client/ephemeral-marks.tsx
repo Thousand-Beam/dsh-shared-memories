@@ -293,7 +293,7 @@ export function EphemeralRowMark({ sessionId }: SessionSlotProps): ReactNode {
   if (!active) return null
   return (
     <span className='dsm-ghost-row' title='无痕会话：不写记忆、不进快照、不留人格' aria-label='无痕会话'>
-      👻
+      👻 无痕
     </span>
   )
 }

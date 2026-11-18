@@ -58,7 +58,7 @@ export function HistoryView(): ReactNode {
       // 接口只回单个节点的钉住状态，列表仍以服务端为准重拉一次，避免本地拼状态漂移。
       const rows = await api.snapshots(state.activeAgentId)
       store.patch({ snapshots: rows })
-      store.toast('ok', next ? '已钉住，轮转时不会清理' : '已取消钉住')
+      store.toast('ok', next ? '已钉住：自动清理时会保留这个存档' : '已取消钉住')
     } catch (cause) {
       store.toast('error', cause instanceof Error ? cause.message : '钉住失败')
     }
@@ -88,6 +88,7 @@ export function HistoryView(): ReactNode {
           <Stat value={<span className='dsm-num'>{nodes.length}</span>} label='节点' />
           <Stat value={formatBytes(totalBytes)} label='占用' />
         </div>
+        <span className='dsm-caption'>快照是可回退的存档点；超过保留数会自动清理最旧的（钉住的除外）</span>
         <div className='dsm-legend' style={{ marginTop: 10 }}>
           {TRIGGERS.map((trigger) => (
             <span className='dsm-legend-item' key={trigger}>
@@ -159,6 +160,7 @@ export function HistoryView(): ReactNode {
                     onClick={() => {
                       void togglePin(node)
                     }}
+                    title={node.pinned ? '取消钉住：它重新参与自动清理' : '钉住：自动清理时会保留这个存档'}
                   >
                     {node.pinned ? '取消钉住' : '钉住'}
                   </button>

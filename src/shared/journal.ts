@@ -156,7 +156,12 @@ export class Journal {
     const files = await this.#listFiles(deviceId)
     for (const file of files) {
       for await (const record of this.#iterate(file)) {
-        if (record.seq > sinceSeq) yield record
+        if (record.seq > sinceSeq) {
+          // 旧版墓碑（2026-11-18 之前）写成 `deviceId` 而不是 `device`，且缺 `v`。
+          // 这里按目录名兜底补 `device`，保证 readMerged 的 (at, device, seq) 排序
+          // 不会因为 undefined.device 崩溃，也让任何读路径拿到一致的设备字段。
+          yield typeof record.device === 'string' ? record : { ...record, device: deviceId }
+        }
       }
     }
   }

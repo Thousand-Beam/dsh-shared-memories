@@ -917,6 +917,18 @@ export const CONSOLE_CSS = `
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.dsm-menu-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.dsm-menu-hint {
+  font-size: 11px;
+  color: var(--dsm-muted);
+  line-height: 1.3;
+  white-space: normal;
+}
 
 /* ── 全局 toast（挂在 shell.overlay，面板没开也看得见） ─────────────────── */
 .dsm-toast-stack {

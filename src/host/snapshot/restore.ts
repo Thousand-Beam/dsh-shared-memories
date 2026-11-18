@@ -128,7 +128,7 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
-            this.#db.run(`UPDATE memory_version SET valid_until = ? WHERE version_id = ?`, [
+            this.#run(`UPDATE memory_version SET valid_until = ? WHERE version_id = ?`, [
               validUntil,
               versionId,
             ])
@@ -141,7 +141,7 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
-            this.#db.run(`UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ?`, [
+            this.#run(`UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ?`, [
               record.at,
               entityId,
             ])
@@ -159,7 +159,7 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
-            this.#db.run(
+            this.#run(
               `INSERT INTO quarantine (quarantine_id, workspace_id, agent_id, payload, reason, score, status, created_at)
                VALUES (?,?,?,?,?,?,?,?)
                ON CONFLICT(quarantine_id) DO NOTHING`,
@@ -193,7 +193,7 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
-            this.#db.run(
+            this.#run(
               `INSERT INTO agent_skill (agent_id, workspace_id, skill_id, version, enabled, config, granted_by, updated_at)
                VALUES (?,?,?,?,?,?,?,?)
                ON CONFLICT(agent_id, workspace_id, skill_id) DO UPDATE SET
@@ -224,7 +224,7 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
-            this.#db.run(
+            this.#run(
               `DELETE FROM agent_skill WHERE workspace_id = ? AND agent_id = ? AND skill_id = ?`,
               [workspaceId, agentId, skillId],
             )
@@ -242,7 +242,7 @@ export class ReplayApplier {
               break
             }
             const at = num(record.at) ?? Date.now()
-            this.#db.run(
+            this.#run(
               `INSERT INTO persona_identity (agent_id, workspace_id, persona_id, bound_at, last_seen_at)
                VALUES (?,?,?,?,?)
                ON CONFLICT(agent_id) DO UPDATE SET
@@ -262,7 +262,7 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
-            this.#db.run(
+            this.#run(
               `INSERT INTO user_profile (workspace_id, display_name, preferred_address, notes, updated_at, updated_by)
                VALUES (?,?,?,?,?,?)
                ON CONFLICT(workspace_id) DO UPDATE SET
@@ -293,23 +293,26 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
-            this.#db.run(
+            this.#run(
               'DELETE FROM memory_version WHERE entity_id IN (SELECT entity_id FROM memory_entity WHERE workspace_id = ? AND agent_id = ?)',
               [workspaceId, agentId],
             )
-            this.#db.run('DELETE FROM memory_entity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-            this.#db.run('DELETE FROM pitfall WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-            this.#db.run('DELETE FROM quarantine WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-            this.#db.run('DELETE FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-            this.#db.run('DELETE FROM persona_identity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-            this.#db.run('DELETE FROM agent_skill WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#run('DELETE FROM memory_entity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#run('DELETE FROM pitfall WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#run('DELETE FROM quarantine WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#run('DELETE FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#run('DELETE FROM persona_identity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            // 别的会话若把这个人格当 persona_id 绑定，重放时也要断开：
+            // 否则墓碑执行完，绑定还在，下一个会话又顺着它把"这个人"认回来。
+            this.#run('DELETE FROM persona_identity WHERE workspace_id = ? AND persona_id = ?', [workspaceId, agentId])
+            this.#run('DELETE FROM agent_skill WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
             // 墓碑重放要连提炼水位一起清：否则重放后"已记过"的水位还在，
             // 复活的会话再也不会被自动提炼。
-            this.#db.run(
+            this.#run(
               'DELETE FROM distill_cursor WHERE session_id IN (SELECT session_id FROM session_policy WHERE workspace_id = ? AND agent_id = ?)',
               [workspaceId, agentId],
             )
-            this.#db.run('DELETE FROM session_policy WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+            this.#run('DELETE FROM session_policy WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
             stats.purged++
             break
           }
@@ -326,10 +329,27 @@ export class ReplayApplier {
     return stats
   }
 
+  /**
+   * 唯一的写入口：把 `undefined` 折成 `null` 再交给 sqlite。
+   *
+   * node:sqlite 的绑定器认字符串/数字/null/Buffer，唯独不认 `undefined`——
+   * 一个可选字段（典型是 emotion 的五个子字段、deviceId）在 journal 里没写，
+   * `str()` 返回 undefined，整条 INSERT 就抛 "Provided value cannot be bound to
+   * SQLite parameter N"。而这里跑在 `restoreOnBoot` 的重放事务里，抛一次 = 全局
+   * degraded = 整个插件只读：用户看到的是"策略写入失败""记忆根本存不进去"，
+   * 根因却是某条历史记录少了一个字段。宁可在这一层兜住，也不让启动变只读。
+   */
+  #run(sql: string, params: readonly unknown[] = []): void {
+    this.#db.run(
+      sql,
+      params.map((value) => (value === undefined ? null : value)),
+    )
+  }
+
   #upsertEntity(record: JournalRecord): void {
     const entityId = str(record.entityId)
     if (!entityId) return
-    this.#db.run(
+    this.#run(
       `INSERT INTO memory_entity (
          entity_id, workspace_id, agent_id, kind, subject_key, canonical,
          salience, trust, status, content_hash, created_at, updated_at, device_id
@@ -367,7 +387,22 @@ export class ReplayApplier {
       | { subject?: unknown; trigger?: unknown; label?: unknown; intensity?: unknown; confidence?: unknown }
       | null
       | undefined
-    this.#db.run(
+
+    // 活跃版本唯一（`uq_version_active ... WHERE valid_until IS NULL`）。
+    // 正常写入会先写一条 `version.close`，但 journal 里可能出现"连续两次 open、
+    // 中间没有 close"（早期版本的写入侧、或某次崩在半路）。重放时若不先关旧版本，
+    // 第二条 INSERT 直接撞唯一索引 → 整个恢复 degraded → 插件变只读。
+    // 语义上这样做也是对的：同一实体在时间线上只能有一个"当前版本"。
+    const validFrom = num(record.validFrom) ?? record.at
+    if (record.validUntil === null || record.validUntil === undefined) {
+      this.#run(
+        `UPDATE memory_version SET valid_until = ?
+         WHERE entity_id = ? AND valid_until IS NULL AND version_id <> ?`,
+        [validFrom, entityId, versionId],
+      )
+    }
+
+    this.#run(
       `INSERT INTO memory_version (
          version_id, entity_id, seq, valid_from, valid_until, text,
          emo_subject, emo_trigger, emo_label, emo_intensity, emo_confidence,
@@ -679,14 +714,30 @@ export class RestoreEngine {
         throw new RestoreError('snapshot-file-missing', `快照文件缺失：${entry.path}`, entry)
       }
       const digest = createHash('sha256').update(bytes).digest('hex')
-      if (digest !== entry.sha256) {
-        throw new RestoreError(
-          'snapshot-corrupt',
-          `快照文件校验失败：${entry.path}（期望 ${entry.sha256.slice(0, 12)}… 实际 ${digest.slice(0, 12)}…）`,
-          { path: entry.path, expected: entry.sha256, actual: digest },
-        )
+      if (digest === entry.sha256) {
+        checked++
+        continue
       }
-      checked++
+
+      // journal 是 append-only 的：快照之后每写一条记忆，文件都会变长，
+      // 全文件 sha256 必然对不上。这不是篡改，是"快照之后又说了话"。
+      // 所以只校验**快照当时那段前缀**，再逐行验尾巴是不是合法的 journal 记录：
+      //   - 前缀变了 → 历史被改写，照样拦；
+      //   - 尾巴里混进一行不是 JSON / 没有 v/seq/at/op 的东西 → 有人往里塞垃圾，拦。
+      const grew = bytes.length > entry.bytes
+      if (grew && allowedToGrow(entry.path)) {
+        const prefix = createHash('sha256').update(bytes.subarray(0, entry.bytes)).digest('hex')
+        if (prefix === entry.sha256 && validJournalTail(bytes.subarray(entry.bytes))) {
+          checked++
+          continue
+        }
+      }
+
+      throw new RestoreError(
+        'snapshot-corrupt',
+        `快照文件校验失败：${entry.path}（期望 ${entry.sha256.slice(0, 12)}… 实际 ${digest.slice(0, 12)}…）`,
+        { path: entry.path, expected: entry.sha256, actual: digest },
+      )
     }
     return { snapshotId, files: checked }
   }
@@ -743,6 +794,43 @@ export class RestoreEngine {
 
 /** local-only 策略下的"可继续"信号：restoreOnBoot 会把它当作正常通过。 */
 class LocalOnlyFallback extends Error {}
+
+/** 只有 append-only 的 journal 允许"快照之后变长"，其余文件必须逐字节一致。 */
+function allowedToGrow(path: string): boolean {
+  return path.startsWith('journal/')
+}
+
+/**
+ * 校验 journal 尾巴是不是"正常新写的记录"。
+ *
+ * 快照之后我们会继续写记忆，文件自然变长；但变长必须长成 journal 的样子：
+ * 一行一条 JSON，且带 `v/seq/at/op` 信封。有人往里塞 `{"tampered":true}`
+ * 或者把别的文件内容倒进来，这一关会拦下。
+ * 唯一放过的是"最后一行没写完整"——进程崩在 write 中间会留下半行。
+ */
+function validJournalTail(tail: Buffer): boolean {
+  if (tail.length === 0) return true
+  const text = tail.toString('utf8')
+  const lines = text.split('\n')
+  for (const [index, line] of lines.entries()) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    const isLast = index === lines.length - 1
+    try {
+      const record = JSON.parse(trimmed) as Record<string, unknown> | null
+      if (record === null || typeof record !== 'object') {
+        if (isLast && !text.endsWith('\n')) continue
+        return false
+      }
+      if (typeof record.op !== 'string' || typeof record.at !== 'number') return false
+      if (typeof record.v !== 'number' || typeof record.seq !== 'number') return false
+    } catch {
+      if (isLast && !text.endsWith('\n')) continue
+      return false
+    }
+  }
+  return true
+}
 
 function describe(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`

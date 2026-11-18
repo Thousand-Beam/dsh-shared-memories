@@ -176,9 +176,16 @@ export class Consolidator {
   }
 
   #markMerged(loser: ActiveRow, keeper: ActiveRow): void {
+    const now = this.#clock()
     this.#db.transaction(() => {
       this.#db.run(`UPDATE memory_entity SET status = 'merged', updated_at = ? WHERE entity_id = ?`, [
-        this.#clock(),
+        now,
+        loser.entity_id,
+      ])
+      // 关掉 loser 的活跃版本：否则时间树上留一条 valid_until IS NULL 的悬挂版本，
+      // 实体已经 merged，版本却还"活着"，UI 与统计都会对不上。
+      this.#db.run(`UPDATE memory_version SET valid_until = ? WHERE entity_id = ? AND valid_until IS NULL`, [
+        now,
         loser.entity_id,
       ])
       // 幸存版本的 supersedes 指向被并入的版本，UI 上可以展开"它合并了谁"。

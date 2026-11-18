@@ -18,6 +18,7 @@
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
 import { join } from 'node:path'
+import { SCHEMA_VERSION } from '../storage/schema.js'
 import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeBindings } from '../../shared/skills.js'
 import type { UserProfile } from '../../shared/user-profile.js'
@@ -156,7 +157,7 @@ export class SnapshotEngine {
     this.#root = options.root
     this.#deviceId = options.deviceId
     this.#git = options.git
-    this.#schemaVersion = options.schemaVersion ?? 1
+    this.#schemaVersion = options.schemaVersion ?? SCHEMA_VERSION
     this.#keep = Math.max(1, options.keep ?? 5)
     this.#pinProtected = options.pinProtected ?? true
     this.#maxBytes = options.maxBytes ?? 268_435_456

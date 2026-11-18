@@ -223,7 +223,7 @@ export function MemoryToolbar(): ReactNode {
   return (
     <div className='dsm-session-bar'>
       <div className='dsm-row dsm-row--wrap' style={{ gap: 10 }}>
-        <Tag tone='idle' title='这一条会话的归档策略（新建会话时可改）'>
+        <Tag tone='idle' title='深度重读＝从头重读整段对话，分块提取后归并成长期记忆'>
           深度重读：整段对话分块提取后归并
         </Tag>
         <span className='dsm-spacer' />
@@ -232,7 +232,7 @@ export function MemoryToolbar(): ReactNode {
           className='dsm-btn dsm-btn--sm'
           disabled={sessionId === '' || busy || running}
           onClick={() => void runDeep()}
-          title='从头重读整段对话，分块提取后归并（会消耗较多 Token）'
+          title='从头重读整段对话，分块提取后归并（会消耗较多算力，需几分钟）'
         >
           {running ? '提取中…' : '深度重读当前对话'}
         </button>

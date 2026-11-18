@@ -291,6 +291,20 @@ export class TemporalTree {
     return entity
   }
 
+  /**
+   * 复现确认：同一实体又被写了一次（正文可能一致、也可能是新版本）。
+   * 只动计数与 `updated_at`，不动 `created_at` —— 诞生时间是事实，不该被覆盖。
+   */
+  #reinforce(entityId: string, at: number): void {
+    this.#db.run(
+      `UPDATE memory_entity
+          SET reinforce_count = reinforce_count + 1,
+              updated_at = CASE WHEN ? > updated_at THEN ? ELSE updated_at END
+        WHERE entity_id = ?`,
+      [at, at, entityId],
+    )
+  }
+
   /** 事务内的版本写入（分支 A/B/C 都收敛到这里）。 */
   #writeVersion(
     entity: EntityRow,
@@ -315,7 +329,10 @@ export class TemporalTree {
     }
 
     // 幂等：正文一致且落在活跃区间内，不产生新版本。
+    // 但"同一句话第二次被说出来"是有信息量的：用户又说了一遍 = 复现确认，
+    // 记进 reinforce_count，检索时加权（对齐 graph-memory 的 validated_count）。
     if (active.text === text && at >= active.valid_from) {
+      this.#reinforce(entity.entity_id, at)
       return { version: active, affected: [], deduped: true }
     }
 
@@ -343,6 +360,7 @@ export class TemporalTree {
       return { version, affected: [], deduped: false }
     }
     if (covering.text === text) {
+      this.#reinforce(entity.entity_id, at)
       return { version: covering, affected: [], deduped: true }
     }
     const inheritedUntil = covering.valid_until

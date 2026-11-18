@@ -250,6 +250,8 @@ export const api = {
       versions: number
       journals: number
       records: number
+      /** 顺手清掉的宿主侧会话痕迹（会话日志 + 投影缓存 + workspace 记账条目）。 */
+      sessionFiles?: number
     }>('/purge', {
       method: 'POST',
       body: JSON.stringify({ agentId, confirm: true }),

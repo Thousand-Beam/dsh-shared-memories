@@ -32,6 +32,7 @@ import { PersonaIdentityStore, resolvePersonaId } from '../memory/persona-identi
 import { forgetSessionTraces, type SessionPolicyStore } from '../memory/session-policy.js'
 import type { DistillJobView } from '../distill/jobs.js'
 import type { PurgeResult } from '../memory/purge.js'
+import { PurgeError } from '../memory/purge.js'
 import type { ChatTurn } from '../distill/chunker.js'
 import type { ArchiveMode, SessionPolicyDto } from '../../shared/session-policy.js'
 import { toPolicyDto } from '../../shared/session-policy.js'
@@ -141,6 +142,12 @@ export interface MemoriesApiDeps {
   distillJob?(input: { jobId?: string; sessionId?: string }): DistillJobView | undefined
   /** 彻底销毁（库 + journal 物理抹除）。 */
   purge?(input: { agentId: string }): Promise<PurgeResult>
+  /**
+   * 连会话本体一起抹掉（投影文件 + workspace.json 索引）。
+   *
+   * `purge` 只动记忆库，侧栏那一行是 DSH 自己的数据，不删它会一直留着。
+   */
+  removeSession?(input: { sessionId: string }): { projection: boolean; indexUpdated: boolean }
   /** 读会话全文（提炼用），拿不到返回空数组。 */
   sessionTurns?(sessionId: string): Promise<ChatTurn[]>
 }
@@ -283,7 +290,13 @@ async function dispatch(
       if (!purge) throw new ApiError('purge-unavailable', '销毁服务尚未就绪', 503)
       if (body.confirm !== true) throw new ApiError('confirm-required', '销毁不可撤销，需要 confirm=true')
       deps.barrier.assertWritable('purge')
-      return sendJson(res, 200, ok(await purge({ agentId: resolvePersonaIdOf(deps, agentId) })))
+      const personaId = resolvePersonaIdOf(deps, agentId)
+      const result = await purge({ agentId: personaId })
+      // 记忆清完，会话本体也要能一起消失——否则"彻底销毁"之后侧栏还留着那一行，
+      // 用户会以为没生效。默认删；显式传 false 才保留会话。
+      const alsoSession = body.deleteSession !== false
+      const session = alsoSession ? deps.removeSession?.({ sessionId: agentId }) : undefined
+      return sendJson(res, 200, ok({ ...result, session }))
     }
     if (method === 'GET' && path === '/rules') {
       return sendJson(res, 200, ok(readRules(deps, url)))
@@ -398,6 +411,9 @@ function statusOf(error: unknown): { status: number; code: string } {
   if (error instanceof PitfallError) {
     return { status: error.code === 'pitfall-not-found' ? 404 : 400, code: error.code }
   }
+  // 销毁只做了一半（文件被占用 / 库只读）：409 而不是 500。
+  // 前端据 code 能显示"残留会在下次开机 replay 时清掉，请重跑一次"。
+  if (error instanceof PurgeError) return { status: 409, code: error.code }
   return { status: 500, code: 'request-failed' }
 }
 
@@ -891,19 +907,6 @@ function scopeOf(deps: MemoriesApiDeps, agentId: string): Scope {
   return { workspaceId: deps.workspaceId, agentId: resolved, deviceId: deps.deviceId }
 }
 
-
-
-/**
- * 读技能绑定。**只读当前 (workspace, agent)**，没有"列出全部 Agent 的技能"这种用法：
- * 控制台如果想显示别的 Agent，必须自己带上那个 agentId 逐个问，且每次都留审计。
- */
-/**
- * 读用户画像。
- *
- * 返回 `address`（有效称呼）是刻意的：前端不该自己再实现一遍
- * "preferredAddress 优先、否则 displayName"的规则，两处实现迟早会不一致，
- * 而不一致的后果是"提示里叫老张、界面上叫张三"。
- */
 /**
  * 身份绑定总览：哪个人格下面挂了哪些会话。
  *

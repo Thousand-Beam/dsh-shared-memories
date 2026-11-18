@@ -17,6 +17,10 @@
  *
  * 这个文件是**纯函数 + 一个取数的 assembler**，不碰 cordis：这样能单测，
  * 也能被 `ctx.systemPrompt.section()` 直接当 `text` 回调用。
+ *
+ * 注意：生产环境真正组装 System Prompt 的是 index.ts 的 buildPrompt()。
+ * 本文件的 render* 纯函数目前主要被单元测试引用，作为语义参照与未来统一装配
+ * 的底稿保留 —— 两处若不一致，以 buildPrompt() 的实装为准。
  */
 
 import type { Scope } from '../../shared/scope.js'

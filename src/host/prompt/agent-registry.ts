@@ -8,7 +8,7 @@
  *     所以人格是"沿连续轴慢慢漂"，不会一轮对话就换了个人。
  *
  * 这里不做 I/O 之外的事情：真正的 System Prompt 刷新由 index.ts 订阅 onSwitch 之后
- * 调 `PromptAssembler` 完成，保持职责单一。
+ * 用 buildPrompt 组装完成，保持职责单一。
  */
 
 import type { Scope } from '../../shared/scope.js'

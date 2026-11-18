@@ -120,22 +120,55 @@ const RULES: readonly Rule[] = [
  */
 const ACK_ONLY = /^(好|好的|好嘞|明白|收到|了解|记下了|已记录|记住了|没问题|可以)[，,。！!：:\s]/
 
-function collect(turns: readonly ChatTurn[], roles: readonly string[], out: DistillCandidate[], seen: Set<string>, limit: number): void {
+/**
+ * 排版噪声：列表符号、序号、加粗、标题、引用。
+ *
+ * 这一条是被真机打出来的：助手回答里那句
+ * `3. **再重复一次同一句偏好**（比如再说一遍「我爱吃鱼」）…`
+ * 被规则命中后**原样**进了长期记忆，并且在召回段里重复了六遍。
+ * 记忆要的是"用户说过的事实"，不是我们写给用户看的操作步骤。
+ */
+const LAYOUT_NOISE = /^\s*(?:[-*•#>]|\d+[.、)）])|\*\*|`{1,3}/
+
+/** 元话语：讨论"记忆/插件/提示词本身"的句子，不是用户的事实。 */
+const META_NOISE = /(记忆总览|召回段|上下文注入|提示词|prompt|Toast|reinforce_count|测试用例|断言|日志里|插件)/i
+
+/** 去掉 markdown 修饰，只留能独立读懂的那句话。 */
+function cleanup(line: string): string {
+  return line
+    .replace(/[*_`>#]/g, '')
+    .replace(/^\s*(?:[-•]|\d+[.、)）])\s*/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function collect(
+  turns: readonly ChatTurn[],
+  roles: readonly string[],
+  out: DistillCandidate[],
+  seen: Set<string>,
+  limit: number,
+): void {
   for (const turn of turns) {
     if (!roles.includes(turn.role)) continue
     for (const rawLine of turn.text.split(/[\n。！？!?]/)) {
       const line = rawLine.trim()
       if (line.length < 8 || line.length > 160) continue
+      // 排版与元话语一律不进记忆：宁可漏一条，也别让噪声占据注入预算。
+      if (LAYOUT_NOISE.test(line)) continue
+      if (META_NOISE.test(line)) continue
       if (turn.role === 'assistant' && ACK_ONLY.test(line)) continue
       const rule = RULES.find((candidate) => candidate.test.test(line))
       if (rule === undefined) continue
-      const text = line.replace(/\s+/g, ' ')
-      const subjectKey = slug(text)
-      if (seen.has(subjectKey)) continue
-      seen.add(subjectKey)
+      const text = cleanup(line)
+      if (text.length < 8) continue
+      // 去重按"去掉标点空白后的字面"算：同一句话中间多一个逗号不该变成两条。
+      const signature = text.replace(/[\s，,。.!！?？、；;：:]/g, '')
+      if (seen.has(signature)) continue
+      seen.add(signature)
       out.push({
         kind: rule.kind,
-        subjectKey,
+        subjectKey: slug(text),
         text,
         ...(rule.emotion ? { emotion: rule.emotion } : {}),
       })
@@ -150,6 +183,7 @@ export function heuristicCandidates(turns: readonly ChatTurn[], limit = 6): Dist
   const seen = new Set<string>()
   // 用户的表达优先：他说的才是"事实源"，助手只是复述。
   collect(turns, ['user'], out, seen, limit)
+  // 助手的话只在"没凑够"时补位，且已经被 ACK_ONLY / 排版噪声 / 元话语三重过滤。
   if (out.length < limit) collect(turns, ['assistant'], out, seen, limit)
   return out
 }

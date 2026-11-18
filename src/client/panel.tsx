@@ -29,11 +29,11 @@ import { CardSkeleton, ChevronIcon, EmptyState, PhaseBanner, SkeletonLine, Statu
 type NavItem = { key: ViewKey; label: string; hint: string; glyph: string }
 
 const NAV: ReadonlyArray<NavItem> = [
-  { key: 'memory', label: '记忆总览', hint: '条目 / 筛选 / 情感', glyph: '◍' },
-  { key: 'snapshots', label: '快照时间轴', hint: '版本 / 钉住 / 回退', glyph: '🕒' },
-  { key: 'rules', label: '规则与人格', hint: '四阶升格 / 落锁', glyph: '🧬' },
-  { key: 'quarantine', label: '隔离区', hint: '可疑条目处置', glyph: '🧯' },
-  { key: 'overview', label: '全局总览', hint: 'Agent 与工作区', glyph: '◎' },
+  { key: 'memory', label: '记忆总览', hint: '查看、搜索与筛选这个 Agent 记住的事', glyph: '◍' },
+  { key: 'snapshots', label: '快照时间轴', hint: '找回旧版本、钉住不想被清理的存档', glyph: '🕒' },
+  { key: 'rules', label: '规则与人格', hint: '编辑人格，把踩坑逐级升格成规则', glyph: '🧬' },
+  { key: 'quarantine', label: '隔离区', hint: '处理被拦下的可疑记忆', glyph: '🧯' },
+  { key: 'overview', label: '全局总览', hint: '看每个 Agent 的人格与记忆规模', glyph: '◎' },
 ]
 
 /* ── 装配 ─────────────────────────────────────────────────────────────── */
@@ -261,14 +261,26 @@ function Panel(): ReactNode {
         <header className='dsm-header'>
           <AgentSwitcher agents={state.agents} activeAgentId={state.activeAgentId} onPick={(id) => store.setActiveAgent(id)} />
           <span className='dsm-spacer' />
-          <span className='dsm-caption' title={state.phaseDetail ?? undefined}>
+          <span className='dsm-caption' title={`当前记忆引擎状态。${state.phaseDetail ?? ''}`}>
             <StatusDot tone={state.phase === 'ready' ? 'ok' : state.phase === 'degraded' ? 'danger' : 'warn'} />
             <span style={{ marginLeft: 6 }}>{phaseLabel(state.phase)}</span>
           </span>
-          <button type='button' className='dsm-btn dsm-btn--sm' onClick={() => void test()} disabled={busy !== null}>
+          <button
+            type='button'
+            className='dsm-btn dsm-btn--sm'
+            onClick={() => void test()}
+            disabled={busy !== null}
+            title='探测插件后端 HTTP 接口是否连通'
+          >
             {busy === 'test' ? '测试中…' : '测试连接'}
           </button>
-          <button type='button' className='dsm-btn dsm-btn--sm dsm-btn--primary' onClick={() => void saveNow()} disabled={busy !== null}>
+          <button
+            type='button'
+            className='dsm-btn dsm-btn--sm dsm-btn--primary'
+            onClick={() => void saveNow()}
+            disabled={busy !== null}
+            title='立即把当前记忆打成一个新快照（不等自动触发）'
+          >
             {busy === 'save' ? '保存中…' : '手动保存'}
           </button>
         </header>
@@ -492,7 +504,7 @@ function QuarantineView(): ReactNode {
             <article className='dsm-card' key={item.quarantineId}>
               <div className='dsm-card-head'>
                 <Tag tone='danger'>已隔离</Tag>
-                <Tag tone='idle'>风险分 {Math.round(item.score * 100)}%</Tag>
+                <Tag tone='idle' title='风险分越高，越建议销毁而不是放行'>风险分 {Math.round(item.score * 100)}%</Tag>
                 <span className='dsm-spacer' />
                 <span className='dsm-caption'>{formatRelative(item.createdAt)}</span>
               </div>
@@ -606,7 +618,7 @@ function UserProfileCard(): ReactNode {
               />
             </div>
             <div className='dsm-field' style={{ gridColumn: '1 / -1' }}>
-              <span className='dsm-caption'>全局偏好备注（单行，会被折进提示）</span>
+              <span className='dsm-caption'>备注（会写进发给模型的提示里）</span>
               <input
                 className='dsm-input'
                 value={notes}
@@ -645,6 +657,7 @@ function OverviewView(): ReactNode {
           <span className='dsm-spacer' />
           <span className='dsm-caption'>{phaseLabel(state.phase)}</span>
         </div>
+        <span className='dsm-caption'>看每个 Agent 的人格、记忆规模与跨会话共享</span>
       </div>
 
       {state.agents.length === 0 ? (

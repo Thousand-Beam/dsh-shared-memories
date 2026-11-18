@@ -173,6 +173,7 @@ export function RulesView(): ReactNode {
           <span className='dsm-spacer' />
           <span className='dsm-caption'>更新于 {formatRelative(persona.updatedAt)}</span>
         </div>
+        <span className='dsm-caption'>这里管人格与底线，也管把踩坑逐级升格成硬规则</span>
 
         <div className='dsm-split' style={{ marginTop: 12 }}>
           {/* 左：编辑 */}
@@ -291,7 +292,13 @@ export function RulesView(): ReactNode {
               >
                 {saving ? '保存中…' : '保存人格'}
               </button>
-              <button type='button' className='dsm-btn' onClick={() => setLockOpen(true)} disabled={saving}>
+              <button
+                type='button'
+                className='dsm-btn'
+                onClick={() => setLockOpen(true)}
+                disabled={saving}
+                title='落锁后，人格若偏离底线会被判越线拦截，且不可撤销'
+              >
                 确认写入并落锁
               </button>
             </div>
@@ -364,11 +371,12 @@ export function RulesView(): ReactNode {
 
       <div className='dsm-card dsm-card--flat'>
         <div className='dsm-row dsm-row--wrap' style={{ gap: 12 }}>
-          <span className='dsm-h3'>阶段分布</span>
+          <span className='dsm-h3' title='踩坑从现象逐步沉淀成硬规则，越往右越可信'>阶段分布</span>
           {STAGES.map((stage) => (
             <Stat key={stage} value={<span className='dsm-num'>{items.filter((item) => item.stage === stage).length}</span>} label={stageLabel(stage)} />
           ))}
         </div>
+        <span className='dsm-caption'>从左到右：现象 → 经验 → 模式 → 规则，逐级升格</span>
       </div>
     </div>
   )
@@ -405,7 +413,12 @@ function RuleCard(props: { item: RuleItem; onPromote: () => void }): ReactNode {
         {to === null ? (
           <span className='dsm-caption'>已经是最高阶</span>
         ) : (
-          <button type='button' className='dsm-btn dsm-btn--sm' onClick={props.onPromote}>
+          <button
+            type='button'
+            className='dsm-btn dsm-btn--sm'
+            onClick={props.onPromote}
+            title='把这条踩坑升级到更高阶：先生成一个待确认的升格请求'
+          >
             升格为「{stageLabel(to)}」
           </button>
         )}

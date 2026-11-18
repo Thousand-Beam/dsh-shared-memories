@@ -113,6 +113,10 @@ export interface Config {
       rerank: boolean
       /** 空字符串表示复用当前会话模型。 */
       rerankModel: string
+      /** 每轮按当前消息召回并注入的条数；0 = 关闭逐轮召回。 */
+      injectTopK: number
+      /** 逐轮召回段的字符预算。 */
+      injectChars: number
     }
     /** 遗忘与修剪 [brain-memory] */
     forgetting: {
@@ -299,6 +303,10 @@ export const Config: Schema<Config> = Schema.object({
       candidatePool: Schema.natural().min(8).max(1_000).default(64).description('rerank 候选池大小。'),
       rerank: Schema.boolean().default(true).description('是否做精排。'),
       rerankModel: Schema.string().default('').description('精排模型；留空复用当前会话模型。'),
+      injectTopK: Schema.natural().min(0).max(20).default(6)
+        .description('每轮按当前消息召回并注入提示词的条数；0 = 关闭逐轮召回。'),
+      injectChars: Schema.natural().min(200).max(8_000).default(900)
+        .description('逐轮召回段的总字符预算；超预算的条目直接丢弃。'),
     }).description('混合召回'),
     forgetting: Schema.object({
       requestRetention: Schema.number().min(0.5).max(0.99).default(0.9).description('目标留存率。'),

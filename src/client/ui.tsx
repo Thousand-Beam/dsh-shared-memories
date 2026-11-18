@@ -120,7 +120,7 @@ export function TrustBar(props: { value: number; label?: string; tone: 'ok' | 'm
   const pct = Math.max(0, Math.min(100, Math.round(props.value * 100)))
   const style: CSSProperties = { width: `${pct}%` }
   return (
-    <span className='dsm-trust' data-tone={props.tone} title={`信任度 ${pct}%`}>
+    <span className='dsm-trust' data-tone={props.tone} title={`信任度 ${pct}% · 这条记忆有多可靠，越高越优先进上下文`}>
       <span className='dsm-trust-track'>
         <span className='dsm-trust-fill' style={style} />
       </span>

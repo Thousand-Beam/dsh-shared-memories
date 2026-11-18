@@ -94,16 +94,25 @@ export function MemoryView(): ReactNode {
 
   return (
     <div className='dsm-page'>
-      {/* 工具条 */}
       <div className='dsm-card dsm-card--flat'>
         <div className='dsm-row dsm-row--wrap' style={{ gap: 10 }}>
+          <span className='dsm-h2'>记忆总览</span>
+          <span className='dsm-spacer' />
+          <span className='dsm-caption'>这个 Agent 记住的事：可搜索、筛选，按信任度排序</span>
+        </div>
+      </div>
+
+      {/* 工具条：检索范围 / 筛选门槛 / 结果计数 */}
+      <div className='dsm-card dsm-card--flat'>
+        <div className='dsm-row dsm-row--wrap' style={{ gap: 10 }}>
+          <span className='dsm-field-label' style={{ width: '100%' }}>检索范围</span>
           <div className='dsm-search'>
             <span className='dsm-search-icon'>
               <SearchIcon />
             </span>
             <input
               className='dsm-input'
-              placeholder='搜索记忆正文或主题键…'
+              placeholder='搜索记忆内容或主题…'
               value={state.filters.query}
               onChange={(event) => store.setFilters({ query: event.target.value })}
             />
@@ -115,13 +124,13 @@ export function MemoryView(): ReactNode {
               void toggleGlobal()
             }}
             quiet
-            title='跨 Agent 检索会写入审计记录'
+            title='全局检索能搜到其他会话的记忆，且每次都会留审计记录'
           />
         </div>
 
         <div className='dsm-row dsm-row--wrap' style={{ gap: 14, marginTop: 12 }}>
           <div className='dsm-col' style={{ gap: 4, flex: '1 1 220px' }}>
-            <span className='dsm-field-label'>
+            <span className='dsm-field-label' title='低于这个信任度的记忆会被隐藏'>
               最低信任度 <span className='dsm-num'>{state.filters.trustMin.toFixed(2)}</span>
             </span>
             <input
@@ -256,7 +265,12 @@ function MemoryCardView(props: {
         <Tag tone={STATUS_TONE[memory.status]}>{statusLabel(memory.status)}</Tag>
         <Tag tone='outline'>{kindLabel(memory.kind)}</Tag>
         {memory.distillStatus === 'raw' ? null : (
-          <Tag tone={memory.distillStatus === 'failed' ? 'warn' : 'idle'}>{distillLabel(memory.distillStatus)}</Tag>
+          <Tag
+            tone={memory.distillStatus === 'failed' ? 'warn' : 'idle'}
+            title={memory.distillStatus === 'failed' ? '提炼失败：这条记忆没有被归并' : '已从原始对话提炼成长期记忆'}
+          >
+            {distillLabel(memory.distillStatus)}
+          </Tag>
         )}
         <span className='dsm-spacer' />
         <TrustBar value={memory.trust} tone={trust.tone} label={`信任度 ${trust.label}`} />
@@ -284,8 +298,8 @@ function MemoryCardView(props: {
           />
         )}
         <span className='dsm-muted'>来源 {props.agentName}</span>
-        <span className='dsm-mono' title={memory.subjectKey}>
-          {memory.subjectKey}
+        <span className='dsm-mono' title={`主题（去重键）：${memory.subjectKey}`}>
+          主题：{memory.subjectKey}
         </span>
         <span className='dsm-spacer' />
         <span className='dsm-caption' title={`版本 ${memory.versionId}`}>

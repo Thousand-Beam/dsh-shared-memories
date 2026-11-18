@@ -92,6 +92,11 @@ interface CreateSessionRequest {
   agentPreset?: string
 }
 
+/** `uiWorkspace` 与 `workspaces` 共有的归档面（两个服务都有这个方法）。 */
+interface WorkspaceArchiveFace {
+  archiveSession?: (sessionId: string, options?: { readonly stopActivity?: boolean }) => Promise<void>
+}
+
 interface ClientContext {
   slots: SlotsService
   /**
@@ -119,17 +124,83 @@ function workspaceOf(ctx: ClientContext): UiWorkspaceLike | undefined {
   return service as UiWorkspaceLike
 }
 
+/**
+ * 把任何形态的失败对象转成一句人话。
+ *
+ * HTTP 层抛的是 `ApiError {code, message}`（普通对象，不是 Error），
+ * `String(obj)` 只会得到 `[object Object]` —— 用户看到的
+ * "会话策略写入失败（[object Object]）"就是漏了这一层的后果。
+ */
 function messageOf(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause)
+  if (cause instanceof Error) return cause.message
+  if (cause !== null && typeof cause === 'object') {
+    const record = cause as { message?: unknown; code?: unknown }
+    if (typeof record.message === 'string' && record.message !== '') return record.message
+    if (typeof record.code === 'string' && record.code !== '') return record.code
+  }
+  const text = String(cause)
+  return text === '[object Object]' ? '未知错误' : text
 }
 
-/** 归档会话（菜单三项共用）：先停掉在跑的活动，再归档。 */
+/**
+ * 归档会话（菜单三项共用）：先停掉在跑的活动，再归档。
+ *
+ * 为什么写成"多面 + 重试"：
+ * - `uiWorkspace` 是 UI 门面，`workspaces` 是 Workspace Controller 的门面，
+ *   两者都有 `archiveSession`。哪个先就绪就用哪个，别因为一个读不到就让侧栏留空壳。
+ * - 带 `stopActivity` 的那次失败最常见（会话正在跑、provider 拒绝停），
+ *   退一步用不带选项的写法；再失败就隔 150ms 重试一次——归档是**持久化写**，
+ *   有时候第一次只是撞上会话刚被关掉的中间态。
+ * - 全部失败才抛，并且带上每次的真实原因：前端要能弹出来，
+ *   而不是像以前那样被 `.catch(() => undefined)` 吞掉，用户只看到一个点不开的空壳。
+ */
 async function archiveSessionOf(ctx: ClientContext, sessionId: string): Promise<void> {
-  const service = workspaceOf(ctx)
-  if (service === undefined || typeof service.archiveSession !== 'function') {
-    throw new Error('宿主未提供会话服务（uiWorkspace.archiveSession）')
+  const faces: WorkspaceArchiveFace[] = []
+  const ui = workspaceOf(ctx) as WorkspaceArchiveFace | undefined
+  if (ui !== undefined) faces.push(ui)
+  const controller = ctx.get?.('workspaces') as WorkspaceArchiveFace | undefined
+  if (controller !== undefined && controller !== null && controller !== ui) faces.push(controller)
+
+  const callable = faces.filter((face) => typeof face.archiveSession === 'function')
+  if (callable.length === 0) {
+    throw new Error('宿主未提供会话归档服务（uiWorkspace / workspaces）')
   }
-  await service.archiveSession(sessionId, { stopActivity: true })
+
+  const reasons: string[] = []
+  for (let round = 0; round < 2; round += 1) {
+    if (round > 0) await delay(150)
+    for (const face of callable) {
+      for (const options of [{ stopActivity: true }, undefined]) {
+        try {
+          await face.archiveSession?.(sessionId, options)
+          return
+        } catch (cause) {
+          reasons.push(messageOf(cause))
+        }
+      }
+    }
+  }
+  throw new Error(`会话归档失败：${reasons[reasons.length - 1] ?? '未知错误'}`)
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+/**
+ * 归档落库之后再推一把界面：侧栏的数据源在宿主手里，
+ * 我们能做的是让它把这条会话的投影重新算一遍（人格 / 标题 / 会话头都在这层）。
+ * 失败无所谓——归档本身已经持久化，下次刷新自然不会再有那一行。
+ */
+async function resyncAfterPurge(ctx: ClientContext, sessionId: string): Promise<void> {
+  const sessions = ctx.get?.('sessions') as
+    | { refreshProjections?: (id: string) => Promise<void> }
+    | undefined
+  if (sessions === undefined || sessions === null) return
+  if (typeof sessions.refreshProjections !== 'function') return
+  await sessions.refreshProjections(sessionId)
 }
 
 /* ── 新建会话拦截（两层） ──────────────────────────────────────────────── */
@@ -294,6 +365,7 @@ export const apply = (ctx: unknown): void => {
         slots,
         store,
         archiveSession: (sessionId) => archiveSessionOf(root, sessionId),
+        resyncSessions: (sessionId) => resyncAfterPurge(root, sessionId),
       }),
     )
   })

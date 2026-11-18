@@ -17,7 +17,7 @@ import type { SqlDriver } from '../../shared/types.js'
  * v2 → v3：`agent_skill`（技能挂载关系随 (workspace, agent) 隔离，并跟着快照漫游）。
  * 因为 v1 从未发布，这里用"建表时就带列 + 老库补一列"的双保险写法。
  */
-export const SCHEMA_VERSION = 7
+export const SCHEMA_VERSION = 8
 
 /**
  * 全量 DDL。全部 `IF NOT EXISTS`，可以在任何状态下重复执行。
@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS memory_entity (
   updated_at    INTEGER NOT NULL,
   -- 最近一次被召回的时间（0 = 从未）。夜间整理用它判断"90 天没被用到"。
   last_recalled_at INTEGER NOT NULL DEFAULT 0,
+  -- 被重复确认的次数：同一句偏好第二次被说出来就 +1。
+  -- 竞品（graph-memory 的 validated_count）都靠这个信号做复现加权：
+  -- "用户反复提过的事"比"只提过一次的事"更该进提示词。
+  reinforce_count INTEGER NOT NULL DEFAULT 1,
+  -- 置顶：pin 住的记忆永远进注入段，不参与分数竞争，也不会被预算裁掉。
+  pinned INTEGER NOT NULL DEFAULT 0,
   device_id     TEXT NOT NULL DEFAULT 'local'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_entity_identity
@@ -311,6 +317,20 @@ export function migrate(db: SqlDriver, target = SCHEMA_VERSION): { from: number;
     // v6 → v7：distill_cursor 表纯新增。老库没有水位 = 0，下一次自动提炼会把
     // 整个会话当成"还没记过"重新过一遍 —— 对空库无害；对已经有记忆的老用户，
     // 重复提炼会被 `content_hash` 唯一索引折成同一实体（写新版本而不是新条目）。
+  }
+  if (from > 0 && from < 8) {
+    // v7 → v8：给实体补"复现次数"与"置顶"。老条目一律看作"只说过一次"（1）且未置顶，
+    // 与升级前的排序完全一致 —— 不改变任何已有记忆的相对次序。
+    for (const column of [
+      'ALTER TABLE memory_entity ADD COLUMN reinforce_count INTEGER NOT NULL DEFAULT 1',
+      'ALTER TABLE memory_entity ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0',
+    ]) {
+      try {
+        db.exec(column)
+      } catch {
+        /* 已经有这列了 */
+      }
+    }
   }
   try {
     db.exec(`PRAGMA user_version = ${target}`)

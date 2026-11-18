@@ -13,16 +13,17 @@
  *         subagent 插件也在用），注册进去就是原生菜单行，不需要自己造悬浮菜单。
  *           · 归档并深度记忆：deep 提炼 →（成功再）归档
  *           · 归档但不记忆：策略直接锁成 ephemeral + off → 归档
- *           · 彻底销毁会话：双重确认 → purge（库表 + journal + 墓碑）→ 归档
+ *           · 彻底销毁会话：一键 purge（库表 + journal + 墓碑 + 宿主会话日志）→ 归档
  *
- *   ③ 全局浮层：新建会话选择框、销毁确认框、提炼进度、Toast
+ *   ③ 全局浮层：新建会话选择框、提炼进度、Toast
  *      —— 都挂 `shell.overlay`。注意它们**在面板之外**渲染，拿不到
  *         `ConsoleContext`，所以 store 是通过 slot 的 `inject` 直接塞成 props 的。
  *
  * 三条交互红线：
  *   · 无痕的判定必须发生在**写入之前**（服务端 DistillService.writable 与快照闸门），
  *     前端只负责"把选择尽早递过去"；
- *   · 销毁必须双重确认（勾选 + 手打短语），单次点击抹库的误触成本不可接受；
+ *   · 销毁是**一次点击**（用户明确要求去掉勾选+手打短语的仪式），但顺序不能乱：
+ *     锁无痕 → 归档停写 → purge（含删宿主会话日志）→ 刷新；
  *   · 提炼是轮询不是等待，切会话要能中途放弃（runDistillJob 的 signal）。
  */
 
@@ -34,7 +35,7 @@ import {
 } from 'react'
 import { api } from './api.js'
 import type { ConsoleStore } from './state.js'
-import { PURGE_PHRASE, TrashIcon, progressText, runDistillJob } from './session-tools.js'
+import { progressText, runDistillJob } from './session-tools.js'
 import { Modal } from './ui.js'
 
 /* ── 宿主 slots 的最小面 ──────────────────────────────────────────────── */
@@ -230,44 +231,49 @@ export function GlobalToaster(): ReactNode {
   )
 }
 
-/* ── 销毁请求 ─────────────────────────────────────────────────────────── */
+/* ── 归档兜底 ─────────────────────────────────────────────────────────── */
 
-interface PurgeAsk {
-  sessionId: string
-  title: string
+/**
+ * 槽位 `inject` 并不总是能被浮层拿到（有的宿主版本只把 inject 合进菜单行），
+ * 于是 `props.archiveSession` 在销毁确认框里是 undefined —— 空链一接，
+ * 销毁照样"成功"、Toast 照样弹，侧栏那一行却没人归档：
+ * 用户看到的就是一个点不开的空壳。所以这里在装配时再存一份模块级兜底。
+ */
+let archiverFallback: ((sessionId: string) => Promise<void>) | null = null
+let resyncFallback: ((sessionId: string) => Promise<void>) | null = null
+
+function archiverOf(primary?: (sessionId: string) => Promise<void>): ((sessionId: string) => Promise<void>) | null {
+  if (typeof primary === 'function') return primary
+  return archiverFallback
 }
 
-let purgeAsk: PurgeAsk | null = null
-const purgeListeners = new Set<() => void>()
-
-function emitPurge(): void {
-  for (const listener of purgeListeners) listener()
-}
-
-/** 打开"彻底销毁会话"确认框（菜单项调用）。 */
-export function requestPurge(sessionId: string, title: string): void {
-  purgeAsk = { sessionId, title }
-  emitPurge()
-}
-
-function settlePurge(): void {
-  purgeAsk = null
-  emitPurge()
-}
-
-function subscribePurge(listener: () => void): () => void {
-  purgeListeners.add(listener)
-  return () => {
-    purgeListeners.delete(listener)
+/**
+ * 尽力归档：返回 null 表示已经归档成功，返回字符串表示失败原因。
+ *
+ * 重试两次、间隔递增的理由：purge 刚把宿主的记忆/persona 行删干净，
+ * 宿主的会话侧栏可能正在重算投影，此刻归档偶尔会撞上"会话刚被关掉"的中间态。
+ */
+async function archiveSessionHard(
+  sessionId: string,
+  primary?: (sessionId: string) => Promise<void>,
+): Promise<string | null> {
+  const archiver = archiverOf(primary)
+  if (archiver === null) return '宿主没有提供会话归档能力'
+  let reason = '未知错误'
+  for (const wait of [0, 150, 400]) {
+    if (wait > 0) {
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, wait)
+      })
+    }
+    try {
+      await archiver(sessionId)
+      return null
+    } catch (cause) {
+      reason = messageOf(cause)
+    }
   }
-}
-
-function usePurgeAsk(): PurgeAsk | null {
-  return useSyncExternalStore(
-    subscribePurge,
-    () => purgeAsk,
-    () => null,
-  )
+  return reason
 }
 
 /* ── 菜单项 ───────────────────────────────────────────────────────────── */
@@ -293,8 +299,16 @@ function closeOf(props: MenuProps): () => void {
   return () => setOpen(false)
 }
 
+/** 同 client/index.ts：HTTP 层抛的是 `{code,message}` 普通对象，别让 UI 显示 [object Object]。 */
 function messageOf(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause)
+  if (cause instanceof Error) return cause.message
+  if (cause !== null && typeof cause === 'object') {
+    const record = cause as { message?: unknown; code?: unknown }
+    if (typeof record.message === 'string' && record.message !== '') return record.message
+    if (typeof record.code === 'string' && record.code !== '') return record.code
+  }
+  const text = String(cause)
+  return text === '[object Object]' ? '未知错误' : text
 }
 
 function MenuRow(props: {
@@ -318,7 +332,10 @@ function MenuRow(props: {
       <span className='dsm-menu-icon' aria-hidden='true'>
         {props.icon}
       </span>
-      <span className='dsm-menu-label'>{props.label}</span>
+      <span className='dsm-menu-text'>
+        <span className='dsm-menu-label'>{props.label}</span>
+        <span className='dsm-menu-hint'>{props.hint}</span>
+      </span>
     </button>
   )
 }
@@ -410,125 +427,82 @@ function ArchivePlainMenuItem(props: MenuProps): ReactNode {
   )
 }
 
-/** 彻底销毁会话：打开双重确认框。 */
+/**
+ * 一键销毁：点一下就跑完，不再弹确认框。
+ *
+ * 用户原话：「点击删除删除就好了，没必要这么繁琐」——勾选框 + 输入「彻底销毁」
+ * 那一套去掉了。顺序仍然讲究，不能随便调：
+ *
+ *   ① 锁成"永不记忆"（ephemeral + off）——不先锁，删完之后用户再敲一句，
+ *      记忆会被重新写回库，下一次冷启动归并又把它们复活；
+ *   ② 归档（stopActivity）——先让宿主停掉这条会话的写入，后面删日志才删得动，
+ *      而且侧栏不会再触发它的投影；
+ *   ③ purge——删库 + 改写 journal + 墓碑 + 删宿主会话日志（`~/.dsh/sessions/…`），
+ *      这一步不做，侧栏就留一个点不开的空壳；
+ *   ④ 刷 store / bootstrap / 投影重算，最后一条 Toast 收尾。
+ */
+async function purgeSessionHard(props: MenuProps): Promise<void> {
+  const sessionId = props.sessionId
+  const store = props.store
+  try {
+    await api
+      .saveSessionPolicy({ sessionId, agentId: sessionId, ephemeral: true, archiveMode: 'off' })
+      .catch(() => undefined)
+
+    // 归档失败不致命（宿主可能已经把会话关掉了），但要把原因留着告诉用户。
+    const archiveError = await archiveSessionHard(sessionId, props.archiveSession)
+
+    const result = await api.purge(sessionId)
+
+    store?.patch({ memories: [], snapshots: [], quarantine: [], policy: null, distill: null })
+    try {
+      const boot = await api.bootstrap()
+      store?.patch({ agents: boot.agents, activeAgentId: boot.activeAgentId })
+    } catch {
+      // 刷新失败不影响"已销毁"这个事实，列表保持原样即可。
+    }
+    await (resyncFallback?.(sessionId) ?? Promise.resolve()).catch(() => undefined)
+
+    const head = `已销毁 ${result.entities} 条记忆、${result.versions} 个版本、${result.journals} 份会话日志`
+    const fileCount = result.sessionFiles ?? 0
+    const logs = fileCount > 0 ? `、${fileCount} 份会话痕迹` : ''
+    if (archiveError === null) {
+      pushToast('ok', `${head}${logs}；侧栏那一行已删除`)
+    } else {
+      pushToast(
+        'error',
+        `${head}${logs}；但侧栏会话没能归档（${archiveError}）：请右键该会话手动「归档」一次`,
+      )
+    }
+  } catch (cause) {
+    pushToast('error', messageOf(cause))
+  }
+}
+
+/** 菜单行：点击即销毁（busy 期间禁用，防连点删两遍）。 */
 function PurgeMenuItem(props: MenuProps): ReactNode {
   const close = closeOf(props)
+  const [busy, setBusy] = useState(false)
+
   return (
     <MenuRow
       icon='🗑'
       label='彻底销毁会话'
-      hint='删除该会话产生的记忆、人格、journal 记录（不可撤销）'
+      hint='不可撤销：删记忆、人格、会话日志与对话记录'
       danger
+      busy={busy}
       onSelect={() => {
         close()
-        requestPurge(props.sessionId, props.displayTitle ?? props.sessionId)
+        void (async () => {
+          setBusy(true)
+          try {
+            await purgeSessionHard(props)
+          } finally {
+            setBusy(false)
+          }
+        })()
       }}
     />
-  )
-}
-
-/* ── 销毁确认框（双重确认） ───────────────────────────────────────────── */
-
-function PurgeOverlay(props: { store?: ConsoleStore; archiveSession?: (sessionId: string) => Promise<void> }): ReactNode {
-  const ask = usePurgeAsk()
-  if (ask === null) return null
-  return <PurgeForm key={ask.sessionId} ask={ask} store={props.store} archiveSession={props.archiveSession} />
-}
-
-function PurgeForm(props: {
-  ask: PurgeAsk
-  store?: ConsoleStore
-  archiveSession?: (sessionId: string) => Promise<void>
-}): ReactNode {
-  const [armed, setArmed] = useState(false)
-  const [phrase, setPhrase] = useState('')
-  const [busy, setBusy] = useState(false)
-
-  const ready = armed && phrase.trim() === PURGE_PHRASE
-
-  const run = async (): Promise<void> => {
-    if (!ready || busy) return
-    setBusy(true)
-    try {
-      // 先把这条会话锁成"永不记忆"，再删：顺序反了，删除之后用户敲的那句话
-      // 还能再写回库一次，等于销毁不彻底（还会被下一次冷启动归并复活）。
-      await api
-        .saveSessionPolicy({
-          sessionId: props.ask.sessionId,
-          agentId: props.ask.sessionId,
-          ephemeral: true,
-          archiveMode: 'off',
-        })
-        .catch(() => undefined)
-      const result = await api.purge(props.ask.sessionId)
-      await props.archiveSession?.(props.ask.sessionId).catch(() => undefined)
-      props.store?.patch({ memories: [], snapshots: [], quarantine: [], policy: null, distill: null })
-      try {
-        const boot = await api.bootstrap()
-        props.store?.patch({ agents: boot.agents, activeAgentId: boot.activeAgentId })
-      } catch {
-        // 刷新失败不影响"已销毁"这个事实，列表保持原样即可。
-      }
-      pushToast(
-        'ok',
-        `已销毁 ${result.entities} 条记忆、${result.versions} 个版本、${result.journals} 份 journal`,
-      )
-      settlePurge()
-    } catch (cause) {
-      pushToast('error', messageOf(cause))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <Modal
-      title={<span className='dsm-danger-title'>彻底销毁这条会话的记忆</span>}
-      onClose={busy ? undefined : settlePurge}
-      actions={
-        <>
-          <button type='button' className='dsm-btn dsm-btn--sm' onClick={settlePurge} disabled={busy}>
-            取消
-          </button>
-          <button
-            type='button'
-            className='dsm-btn dsm-btn--sm dsm-btn--danger'
-            disabled={!ready || busy}
-            onClick={() => void run()}
-          >
-            <TrashIcon />
-            {busy ? '销毁中…' : '不可逆地销毁'}
-          </button>
-        </>
-      }
-    >
-      <div className='dsm-field'>
-        将会删除 <span className='dsm-mono'>{props.ask.title}</span> 名下的：
-        <ul className='dsm-danger-list'>
-          <li>记忆实体与全部历史版本（memory_entity / memory_version）</li>
-          <li>踩坑、隔离条目、人格画像、技能、会话策略</li>
-          <li>journal 里属于它的记录，并写入 <span className='dsm-mono'>agent.purge</span> 墓碑</li>
-        </ul>
-      </div>
-
-      <label className='dsm-check'>
-        <input type='checkbox' checked={armed} onChange={(event) => setArmed(event.target.checked)} />
-        <span>我知道这不可撤销，且不会进入回收站</span>
-      </label>
-
-      <div className='dsm-field'>
-        <span className='dsm-caption'>
-          请输入 <b>{PURGE_PHRASE}</b> 四个字以确认
-        </span>
-        <input
-          className='dsm-input'
-          value={phrase}
-          placeholder={PURGE_PHRASE}
-          onChange={(event) => setPhrase(event.target.value)}
-          disabled={busy}
-        />
-      </div>
-    </Modal>
   )
 }
 
@@ -571,6 +545,8 @@ export interface SessionMenuOptions {
   store: ConsoleStore
   /** 归档会话（宿主 uiWorkspace 的能力，由 index.ts 注入）。 */
   archiveSession: (sessionId: string) => Promise<void>
+  /** 销毁后让宿主重算该会话的投影（侧栏重绘）。可选：拿不到就只做归档。 */
+  resyncSessions?: (sessionId: string) => Promise<void>
 }
 
 /**
@@ -582,6 +558,9 @@ export interface SessionMenuOptions {
  */
 export function mountSessionMemoryUi(options: SessionMenuOptions): () => void {
   const { slots, store, archiveSession } = options
+  // 浮层拿不到 inject 时的兜底（见 archiverOf 的注释）。
+  archiverFallback = archiveSession
+  resyncFallback = typeof options.resyncSessions === 'function' ? options.resyncSessions : null
   const menuInjected = (): Record<string, unknown> => ({ store, archiveSession })
   const disposers: Array<() => void> = []
 
@@ -644,10 +623,6 @@ export function mountSessionMemoryUi(options: SessionMenuOptions): () => void {
             NewSessionDialog as unknown as ComponentType<never>,
           ),
           register(
-            { name: 'shell.overlay', id: 'shared-memories-purge-confirm', order: 20, inject: menuInjected },
-            PurgeOverlay as unknown as ComponentType<never>,
-          ),
-          register(
             { name: 'shell.overlay', id: 'shared-memories-distill-progress', order: 30, inject: () => ({ store }) },
             DistillOverlay as unknown as ComponentType<never>,
           ),
@@ -664,6 +639,8 @@ export function mountSessionMemoryUi(options: SessionMenuOptions): () => void {
   )
 
   return () => {
+    archiverFallback = null
+    resyncFallback = null
     for (const dispose of disposers) dispose()
   }
 }
