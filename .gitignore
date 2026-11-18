@@ -7,6 +7,7 @@ lib/
 .test-build/
 *.tsbuildinfo
 preview/out/
+*.tgz
 
 # ── 运行时数据（真机上由插件在 ~/.dsh 下写，兜底防误提交）──────────────────
 memory.db
