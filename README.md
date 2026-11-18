@@ -48,6 +48,8 @@
 不是导出/导入一份 JSON。快照池里装的是**整套状态**：人格档案、记忆时间树、规则、工作区会话索引。
 新机器 `git pull` 之后跑一遍重放（replay），界面上看到的就是 A 机最后一秒的样子——包括你上周三标过的那条「Windows 换行符会骗过 sha256」。
 
+> 注：单机（模式 A）这套是稳的；**多设备漫游（模式 B）标为实验性**，跨设备时钟偏移有已知风险，见 [KNOWN-ISSUES #1](KNOWN-ISSUES.md)。
+
 ### 2️⃣ 多智能体隔离 —— 每个 Agent 独立人格
 
 `workspace_id + agent_id` 的隔离**写在 SQL 编译器里**，不是写在 if 里。
@@ -106,10 +108,14 @@ npm i dsh-shared-memories
 
 能力不打折：时间树、快照池、Pin、回退、隔离区、控制台全都在。只是「换机漫游」这一条用不上——仓库就在本机。
 
-### 模式 B · 云端 Git（多设备漫游）——手把手
+### 模式 B · 云端 Git（多设备漫游，实验性）——手把手
 
 > 同步不是"上传到官方服务器"，而是把快照仓库推到你自己的 **GitHub 私有仓库**，
 > 另一台机器冷启动时把它拉回来回灌。GitHub 只当中转盘，记忆本体仍在你自己手里。
+
+> ⚠️ **实验性**：多设备同步依赖各机时钟一致。journal 按 `(时间戳, 设备, 序号)` 排序，
+> 跨设备时钟偏移可能让「已删除的记忆」在排序中复活（见 [KNOWN-ISSUES #1](KNOWN-ISSUES.md)）。
+> 本地单机（模式 A）无此问题；用模式 B 前请确认各机已开 NTP 时钟同步。
 
 **第 1 步 · 建一个私有仓库（必须私有，记忆是隐私数据）**
 
@@ -239,7 +245,7 @@ B 机装好插件、填同样的 `remote` + 配好 SSH，启动时就会自动 `
 
 | # | 能力 | 落点 |
 |---|---|---|
-| 1 | 全状态云端漫游（Git 快照推拉，跨端换机无感） | `src/host/snapshot/engine.ts` + `restore.ts` |
+| 1 | 全状态漫游（Git 快照推拉；多设备为实验性，见 KNOWN-ISSUES #1） | `src/host/snapshot/engine.ts` + `restore.ts` |
 | 2 | 快照池滑窗 + Pin + 一键回退 | `engine.ts`（FIFO 跳过 pinned） |
 | 3 | 时间树（不覆盖，只切分） | `src/host/memory/timetree.ts` |
 | 4 | 归档蒸馏 + 夜间整理 | `distill.ts` + `consolidate.ts` |
@@ -251,7 +257,7 @@ B 机装好插件、填同样的 `remote` + 配好 SSH，启动时就会自动 `
 | 10 | 记忆污染防御 + 隔离区（洗白 / 销毁） | `memory/poison.ts` |
 | 11 | 多端冲突解决（按设备分片） | `shared/journal.ts` |
 | 12 | 记忆导入（JSON / Markdown / 自动识别） | `memory/importer.ts` |
-| 13 | 一键物理销毁（清记忆 + 人格 + 宿主会话痕迹） | `memory/purge.ts` |
+| 13 | 一键清除（记忆 + 人格 + 会话日志 + 工作区登记；**不含 Git 历史**） | `memory/purge.ts` |
 
 ---
 
@@ -446,6 +452,7 @@ npm run self-test   # 第 ⑥ 段：新建会话继承同一人格，且用解�
 - ❌ **不做越狱 / 提示词注入增强。** 隔离区与低信任度机制是**防御性**的：它的设计目标是把「忽略之前所有指令」这类内容拦在时间树之外，不是帮你把它们塞进上下文。
 - ❌ **不托管凭据。** 仓库只存 `credentialRef` 引用名；token 本体在系统钥匙串里，插件不读、不写、不落盘。
 - ❌ **不替你决定删除。** 没有 `DELETE FROM memories`，只有 `status` 迁移。
+- ⚠️ **「一键清除」止于本地工作副本，不重写 Git 历史。** 它删记忆库、会话日志、投影缓存、工作区登记，但**不动 `.git` 里已 commit 的 blob，也不动已 push 到远端的内容**——这些仍能被 `git log -p` 或平台缓存翻出来。真要从仓库根除需要 `git filter-repo` + force push + 请平台清缓存（本插件不做、也做不到保证）。
 - ⚠️ **仓库是隐私数据。** 记忆里会有你的项目路径、踩坑、偏好。用**私有**仓库；推公共仓库前先 `git log -p` 自己看一遍。
 
 ---
@@ -453,7 +460,7 @@ npm run self-test   # 第 ⑥ 段：新建会话继承同一人格，且用解�
 ## 兼容性
 
 - Node **≥ 22.5**（依赖内置 `node:sqlite`；更早的版本需要自行接 `node:sqlite` polyfill，走 `SqlDriver` 接口）。
-- DSH **≥ 0.2.1-rc.3**（`package.json` 的 `dsh.engines.dsh`）。
+- DSH **≥ 0.2.1-rc.3**（`package.json` 的 `dsh.engines.dsh`）。宿主仍在 rc 阶段，插件贴的是 `systemPrompt.section()` / `slots` / `locale` 注入等内部 API——**升级 DSH 前先查本插件的兼容声明，别裸升**（内部 API 一改，插件可能失效或串台）。
 - 平台：Windows / macOS / Linux 均可；`core.autocrlf` 由插件在快照仓库内强制为 `false`（否则 sha256 会被 CRLF 骗过）。
 - 多设备：同一时刻只允许一台机器处于可写状态；其余机器以 `degraded-readonly` 挂在只读模式（抢占写入需要显式回退或等待下次恢复）。
 
@@ -491,6 +498,7 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
 - 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），117 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
+- 诚实声明：`npm test` 的函数级用例主要覆盖 `sections.ts` 的语义参照实现与各模块单元；**真正挂在宿主上的 System Prompt 组装是 `index.ts` 的 `buildPrompt()`**，它由 `npm run self-test`（57 条端到端断言）兜底，而非这 117 条单测。两套各测各的，别拿单测数量当生产路径的覆盖率。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。
 - 运行时缺 `node:sqlite` 时测试**跳过而非失败**——CI 该红在真 bug 上，不该红在 Node 版本上。
 - 发布流程（打 tag、推 GitHub、发 npm、提 awesome 收录）见 [docs/PUBLISH.md](docs/PUBLISH.md)。
@@ -503,6 +511,7 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 - [ ] WebDAV / S3 作为 Git 之外的传输层
 - [ ] 时间轴可视化（拖动滑块看任意时刻的记忆状态）
 - [ ] 记忆冲突的人工合并 UI
+- [ ] 可选 embedding 召回（现在召回是 CJK bigram 字面匹配——零依赖、零联网；接入本地 embedding 模型能提升同义改写 / 跨语言召回，代价是 + 依赖 + 体积，且要保持离线）
 - [ ] `dsh-shared-memories doctor` 自检命令
 
 ---
