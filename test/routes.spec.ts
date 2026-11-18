@@ -434,6 +434,31 @@ test('GET/POST /quarantine：列表用 score 不用 risk，洗白必须重开版
   assert.equal(missing.body.error?.code, 'not-found')
 })
 
+test('POST /quarantine/destroy：销毁只改状态、不重开版本、幂等由状态兜底', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  const destroyed = await call(h.base, '/quarantine/destroy', {
+    method: 'POST',
+    body: { quarantineId: 'q_1', by: 'me' },
+  })
+  assert.equal(destroyed.status, 200)
+  assert.equal(h.reopened.length, 0, '销毁不该触发 reopenQuarantine 重开版本')
+
+  const row = h.db.one<{ status: string }>('SELECT status FROM quarantine WHERE quarantine_id = ?', ['q_1'])
+  assert.equal(row?.status, 'destroyed')
+
+  const audit = h.db.one<{ action: string }>(
+    'SELECT action FROM audit_log WHERE detail LIKE ? ORDER BY created_at DESC LIMIT 1',
+    ['q_1 by me%'],
+  )
+  assert.equal(audit?.action, 'quarantine.destroy')
+
+  const missing = await call(h.base, '/quarantine/destroy', { method: 'POST', body: { quarantineId: 'q_missing' } })
+  assert.equal(missing.status, 404)
+  assert.equal(missing.body.error?.code, 'not-found')
+})
+
 test('POST /snapshots/pin|rollback：越界快照 id 一律 404 snapshot-not-found', async (t) => {
   const h = await makeHarness(t)
   if (!h) return
