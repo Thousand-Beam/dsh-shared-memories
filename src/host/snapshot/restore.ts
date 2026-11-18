@@ -537,6 +537,9 @@ export class RestoreEngine {
     const verified = await this.#verifySnapshotHashes()
     this.#verifySchema()
 
+    // 全量重放：memory.db 不进 git 快照（只同步 journal + state + persona），
+    // 本机 memory.db 必须靠 journal 逐条重放重建，不能按水位跳过——
+    // 否则跨设备时本机会漏掉"快照之后、本机停机前"其它设备写的事件。
     const records = await this.#journal.readMerged()
     const applier = new ReplayApplier(this.#db)
     const stats = applier.apply(records)

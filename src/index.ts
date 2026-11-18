@@ -86,6 +86,8 @@ interface PromptSectionLike {
   readonly name: string
   readonly order: number
   readonly text: string | ((context: unknown) => string)
+  /** 关闭宿主的 `{{var}}` 插值（宿主只注册 provider/model 两个变量，正文含 `{{` 会抛错）。 */
+  readonly interpolate?: boolean
 }
 
 /** 宿主里我们真正用到的最小面（见文件头注释）。 */
@@ -294,8 +296,12 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         runtime.lastSnapshotAt = Date.now()
         return undefined
       }
-      return runtime.snapshots!
-        .snapshot(trigger)
+      // 写闸门：先让已排队的 journal 写入落盘，再在闸门内完成 capture→commit，
+      // 防止 manifest 里的 sha256 与 git add -A 实际提交的磁盘内容脱节。
+      const journal = runtime.journal
+      if (journal) await journal.flush()
+      const snapshot = () => runtime.snapshots!.snapshot(trigger)
+      return (journal ? journal.withGate(snapshot) : snapshot())
         .then(async (result) => {
           runtime.lastSnapshotAt = Date.now()
           runtime.journalPrint = await journalPrint()
@@ -777,6 +783,10 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       host.systemPrompt.section({
         name: 'shared-memories:persona-and-rules',
         order: 5,
+        // 这里拼的是用户画像/记忆原文，不是宿主模板：任何 `{{...}}`（用户随口写的一句）
+        // 都会触发宿主 `{{var}}` 插值，而宿主只注册了 provider/model 两个变量，未注册即抛。
+        // 关闭插值让正文原样落进系统提示。
+        interpolate: false,
         text: (context: unknown) => {
           // 这里拿到的是**会话** id：必须先解析成人格 id，否则新建会话读到的
           // 永远是空缓存（缓存按人格 id 建），表现就是"新会话没有人格"。
@@ -804,6 +814,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       host.systemPrompt.section({
         name: 'shared-memories:tool-guide',
         order: 6,
+        interpolate: false,
         text:
           '长期记忆：与你当前这句话相关的条目会自动出现在上下文里。需要确认用户以前说过的具体信息时，' +
           '用 memory_search 查（不要凭印象猜）；用户明确要求"记住这件事"或"忘掉这件事"时，' +
@@ -824,6 +835,8 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         host.systemPrompt.context({
           name: 'shared-memories:recall',
           order: recallOrderOf(host),
+          // 召回正文是用户记忆原文，同样关闭宿主插值（recall.ts 另有 `{{` 转义兜底）。
+          interpolate: false,
           text: (context: unknown) => recallSection(runtime, config, context, warn),
         }),
       )

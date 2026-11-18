@@ -13,8 +13,10 @@
  * 每台设备只写自己的文件，git 层面几乎不会冲突，合并退化为"文件并集"。
  *
  * 记录格式（每行一条，字段稳定，向后兼容靠 `v`）：
- *   { "v":1, "seq":42, "at":1730000000000, "device":"dev_xxx",
+ *   { "v":1, "lc":42, "seq":17, "at":1730000000000, "device":"dev_xxx",
  *     "op":"version.open", ...op 私有字段 }
+ *   `lc`（Lamport 逻辑时钟）是跨设备因果排序键：open() 时对齐所有设备的水位，
+ *   append 时本地单调递增，不依赖墙钟（旧记录缺 lc 字段，按墙钟回退排序）。
  *
  * 写入保证：
  *  - 同一进程内 append 串行化（Promise 队列），不会交错半行；
@@ -49,6 +51,11 @@ export interface JournalRecord {
   readonly seq: number
   readonly at: number
   readonly device: string
+  /**
+   * Lamport 逻辑时钟：跨设备因果排序键，不依赖墙钟。
+   * 旧记录（v0.3.2 及之前）无此字段，readMerged 回退用 0 + 墙钟排序。
+   */
+  readonly lc?: number
   readonly op: JournalOp | string
   readonly [key: string]: unknown
 }
@@ -87,10 +94,14 @@ export class Journal {
 
   /** 当前设备已分配的最大 seq。 */
   #seq = 0
-  /** 是否已从磁盘恢复过 seq。 */
+  /** Lamport 逻辑时钟：本进程已分配的最大 lc（open() 时对齐全局水位）。 */
+  #lc = 0
+  /** 是否已从磁盘恢复过 seq/lc。 */
   #loaded = false
   /** append 串行队列：保证"读 seq → 加一 → 写盘"不被并发打断。 */
   #queue: Promise<void> = Promise.resolve()
+  /** 写闸门：快照 capture→commit 期间上锁，暂停新 append（防止 manifest sha 与磁盘内容脱节）。 */
+  #gate: Promise<void> = Promise.resolve()
 
   constructor(options: JournalOptions) {
     if (!DEVICE_ID_RE.test(options.deviceId)) {
@@ -118,12 +129,26 @@ export class Journal {
    */
   async open(): Promise<void> {
     if (this.#loaded) return
+    // 恢复本设备 seq：从最新文件往前找最后一个可解析记录。
     const files = await this.#listFiles(this.#deviceId)
     for (const file of files.reverse()) {
       const last = await this.#readLastRecord(file)
       if (last) {
         this.#seq = Math.max(this.#seq, last.seq)
         break
+      }
+    }
+    // 恢复 Lamport 逻辑时钟：取所有设备最后一条记录的 lc 最大值。
+    // 这样 pull 到远端记录后，本设备新事件会接在远端之后，跨设备因果单调。
+    const devices = await this.#listDevices()
+    for (const device of devices) {
+      const dfiles = await this.#listFiles(device)
+      for (const file of dfiles.reverse()) {
+        const last = await this.#readLastRecord(file)
+        if (last) {
+          this.#lc = Math.max(this.#lc, typeof last.lc === 'number' ? last.lc : 0)
+          break
+        }
       }
     }
     this.#loaded = true
@@ -149,6 +174,25 @@ export class Journal {
   }
 
   /**
+   * 写闸门：在 `fn` 执行期间暂停所有新 append（快照 capture→commit 的原子窗口）。
+   * 调用方应先在外部 `await flush()` 让已排队写入落盘，再进入闸门；闸门释放后
+   * 被阻塞的 append 会按进入顺序继续落盘。
+   */
+  async withGate<T>(fn: () => Promise<T>): Promise<T> {
+    // 等所有已排队的写入落盘，避免闸门内还有半截 append 在飞。
+    await this.#queue
+    let release!: () => void
+    this.#gate = new Promise((resolve) => {
+      release = resolve
+    })
+    try {
+      return await fn()
+    } finally {
+      release()
+    }
+  }
+
+  /**
    * 按设备顺序读取增量记录（seq > sinceSeq）。
    * 用于单设备回放；多设备合并请用 `readMerged()`。
    */
@@ -167,22 +211,33 @@ export class Journal {
   }
 
   /**
-   * 读取所有设备的记录并按**事件时间**合并排序。
+   * 读取所有设备的记录并按**因果顺序**合并排序。
    *
-   * 排序键：`(at, device, seq)`。事件时间优先，是因为两台设备的墙钟可能不同步，
-   * 但同一条记忆的版本区间语义依赖 `valid_from`，回放必须按它稳定排序。
+   * 排序键：`(lc, at, device, seq)`。lc（Lamport 逻辑时钟）优先，因为两台设备的
+   * 墙钟可能漂移，但 lc 在每次 pull 到远端记录后都会对齐到远端水位之上，跨设备
+   * 因果有序（墓碑先于其后写入的复活记录）。旧记录无 lc 字段时回退按墙钟排序。
    * 量级提示：这是全量读入内存的接口，仅用于恢复/整理这类低频路径。
+   *
+   * `sinceSeq` 是 checkpoint 水位（每设备）：`seq <= sinceSeq[device]` 的事件已经
+   * 体现在快照的 memory.db 里，恢复时跳过它们、只重放增量，避免冷启动线性变慢。
+   * 省略或某设备缺水位时，该设备按全量读（安全回退）。
    */
-  async readMerged(options: { sinceAt?: number } = {}): Promise<JournalRecord[]> {
+  async readMerged(options: { sinceAt?: number; sinceSeq?: Readonly<Record<string, number>> } = {}): Promise<JournalRecord[]> {
     const sinceAt = options.sinceAt ?? 0
+    const sinceSeq = options.sinceSeq
     const devices = await this.#listDevices()
     const out: JournalRecord[] = []
     for (const device of devices) {
-      for await (const record of this.readDevice(device, 0)) {
+      const floor = sinceSeq?.[device] ?? 0
+      for await (const record of this.readDevice(device, floor)) {
         if (record.at >= sinceAt) out.push(record)
       }
     }
-    out.sort((a, b) => a.at - b.at || a.device.localeCompare(b.device) || a.seq - b.seq)
+    out.sort((a, b) => {
+      const la = typeof a.lc === 'number' ? a.lc : 0
+      const lb = typeof b.lc === 'number' ? b.lc : 0
+      return la - lb || a.at - b.at || a.device.localeCompare(b.device) || a.seq - b.seq
+    })
     return out
   }
 
@@ -195,11 +250,14 @@ export class Journal {
 
   async #appendOne(input: JournalInput): Promise<JournalRecord> {
     if (!this.#loaded) await this.open()
+    // 快照写闸门：capture→commit 期间新 append 挂起，保证 manifest sha 与磁盘内容一致。
+    await this.#gate
     const at = input.at ?? this.#clock()
     // 显式展开顺序：信封字段在最后，防止调用方覆盖 seq/device。
     const record: JournalRecord = {
       ...input,
       v: JOURNAL_VERSION,
+      lc: ++this.#lc,
       seq: ++this.#seq,
       at,
       device: this.#deviceId,
