@@ -9,7 +9,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-3da639.svg?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-339933.svg?style=flat-square)](https://nodejs.org)
 [![DSH](https://img.shields.io/badge/dsh-%E2%89%A50.2.1--rc.3-4c6ef5.svg?style=flat-square)](https://github.com/deepseek-ai)
-[![Tests](https://img.shields.io/badge/tests-113%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-117%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![CI](https://img.shields.io/github/actions/workflow/status/Thousand-Beam/dsh-shared-memories/ci.yml?branch=main&style=flat-square&label=ci)](../../actions)
 [![No CDN](https://img.shields.io/badge/frontend-%E9%9B%B6%E5%A4%96%E9%93%BE%E3%80%81%E9%9B%B6%20CDN-8957e5.svg?style=flat-square)](#控制台)
 
 <img src="docs/screenshots/console-memory-dark.png" alt="记忆控制台 · 深色" width="880">
@@ -105,14 +106,33 @@ npm i dsh-shared-memories
 
 能力不打折：时间树、快照池、Pin、回退、隔离区、控制台全都在。只是「换机漫游」这一条用不上——仓库就在本机。
 
-### 模式 B · 云端 Git（多设备漫游）
+### 模式 B · 云端 Git（多设备漫游）——手把手
+
+> 同步不是"上传到官方服务器"，而是把快照仓库推到你自己的 **GitHub 私有仓库**，
+> 另一台机器冷启动时把它拉回来回灌。GitHub 只当中转盘，记忆本体仍在你自己手里。
+
+**第 1 步 · 建一个私有仓库（必须私有，记忆是隐私数据）**
+
+网页版：GitHub → `New repository` → 名字随便（如 `ai-brain`）→ **选 Private** → 不要勾 "Add a README"（保持空仓库）→ Create。
+
+命令行版：
 
 ```bash
-# 1. 建一个空仓库（私有！记忆是隐私数据）
 gh repo create ai-brain --private --description "my agent's external brain"
-
-# 2. 指向它，首次启动会自动 init + 首次提交
 ```
+
+**第 2 步 · 配 SSH 免密（默认认证走 ssh-agent，只需配一次）**
+
+```bash
+# 已经配过 GitHub SSH 的机器可跳过这步
+ssh-keygen -t ed25519 -C "you@example.com" -f ~/.ssh/id_ed25519 -N ""
+# 复制公钥，粘贴到 GitHub → Settings → SSH and GPG keys → New SSH key
+cat ~/.ssh/id_ed25519.pub
+```
+
+Windows 下确保 ssh-agent 开着：`Get-Service ssh-agent` 应是 `Running`，否则 `Start-Service ssh-agent; ssh-add ~/.ssh/id_ed25519`。
+
+**第 3 步 · 填配置，指向那个仓库**
 
 ```yaml
 - insert:
@@ -121,20 +141,42 @@ gh repo create ai-brain --private --description "my agent's external brain"
       config:
         repo:
           path: ~/.dsh/shared-memories
-          remote: git@github.com:you/ai-brain.git
+          remote: git@github.com:you/ai-brain.git   # ← 换成你自己的
           branch: main
           authMode: ssh-agent        # ssh-agent | credential-helper | token-ref
-          credentialRef: shared-memories/git-token   # 只存钥匙串里的键名
+          credentialRef: shared-memories/git-token   # 只存钥匙串里的键名，不是令牌本身
         sync:
-          intervalSec: 300
+          enabled: true              # 总开关
+          intervalSec: 300           # 每 5 分钟兜底快照
+          pushOnCommit: true         # 每次提交立即推送
+          pullStrategy: ff-only       # 冷启动拉取策略
         snapshot:
           keep: 5
         restore:
           offlinePolicy: degraded-readonly   # 离线时：只读 / 纯本地 / 阻塞
 ```
 
-**B 机第一次启动**：`git pull` → 校验 manifest 里每个文件的 sha256 → 重放 journal → 重建人格 → `ready`。
+**第 4 步 · 重启 DSH，点控制台顶栏的「测试连接」**
+
+- 显示 `网络 / 凭据 / 分支权限均正常` → 通了，首次启动会自动 init + 首次提交 + 首次推送。
+- 显示 `远端没有分支 main（首次推送会创建）` → 也正常，等第一次推送后消失。
+- 显示 `git ls-remote exit ...` 或权限错误 → 回第 2 步检查 SSH key 和仓库名。
+
+**第 5 步 · 另一台机器，同样的配置再走一遍**
+
+B 机装好插件、填同样的 `remote` + 配好 SSH，启动时就会自动 `pull` → 校验 sha256 → 重放 journal → 重建人格，然后才允许开口。
+
+**B 机第一次启动会发生什么**：`git pull` → 校验 manifest 里每个文件的 sha256 → 重放 journal → 重建人格 → `ready`。
 中间任何一步校验失败，直接进 `degraded`（只读）并把原因写到横幅上，**不会**拿一份坏快照覆盖本地好状态。
+
+**常见问题**
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 测试连接报 `Permission denied (publickey)` | SSH key 没加到 GitHub 或 ssh-agent 没加载它 |
+| 测试连接报 `repository not found` | 仓库名写错，或私有仓库没权限 |
+| 两台机器同时写，会不会覆盖 | 不会——journal 按设备分片，合并成"文件并集"而非二进制冲突 |
+| 离线时能用吗 | 能，按 `offlinePolicy` 走：默认只读降级，恢复网络后继续 |
 
 ### 三种保存触发
 
@@ -155,9 +197,12 @@ gh repo create ai-brain --private --description "my agent's external brain"
 | `repo.branch` | `main` | 推送分支 |
 | `repo.authMode` | `ssh-agent` | `ssh-agent` / `credential-helper` / `token-ref` |
 | `repo.credentialRef` | `shared-memories/git-token` | **只存引用名**，凭据本体在系统钥匙串 |
-| `sync.intervalSec` | `300` | 定时快照间隔 |
+| `sync.enabled` | `true` | 同步总开关 |
+| `sync.intervalSec` | `300` | 定时快照间隔（秒） |
+| `sync.pushOnCommit` | `true` | 每次提交后立即推送 |
+| `sync.pullStrategy` | `ff-only` | 冷启动拉取策略：`ff-only` / `rebase` / `merge` |
 | `snapshot.keep` | `5` | 滑窗大小；Pin 过的不计入清理 |
-| `snapshot.maxBytes` | `64 * 1024 * 1024` | 单次快照体积上限，超了拒绝提交而不是截断 |
+| `snapshot.maxBytes` | `268435456`（256MB） | 单次快照体积上限，超了拒绝提交而不是截断 |
 | `restore.offlinePolicy` | `degraded-readonly` | `degraded-readonly` / `local-only` / `block` |
 | `isolation.strict` | `true` | 关掉它需要改代码，不是改配置 |
 | `persona.traitShiftMax` | `0.05` | 单次对话允许的性格漂移上限 |
@@ -190,22 +235,23 @@ gh repo create ai-brain --private --description "my agent's external brain"
 
 ---
 
-## 十二项能力
+## 十三项能力
 
 | # | 能力 | 落点 |
 |---|---|---|
-| 1 | 全状态云端漫游 | `src/host/snapshot/engine.ts` + `restore.ts` |
+| 1 | 全状态云端漫游（Git 快照推拉，跨端换机无感） | `src/host/snapshot/engine.ts` + `restore.ts` |
 | 2 | 快照池滑窗 + Pin + 一键回退 | `engine.ts`（FIFO 跳过 pinned） |
 | 3 | 时间树（不覆盖，只切分） | `src/host/memory/timetree.ts` |
 | 4 | 归档蒸馏 + 夜间整理 | `distill.ts` + `consolidate.ts` |
 | 5 | 工作区强隔离（SQL 编译期） | `memory/scoped-query.ts` |
 | 6 | 结构化情感归因 + 置信度闸门 | `timetree.ts` + `distill.ts` |
-| 7 | 踩坑四段演进（现象→经验→模式→规则） | `memory/pitfall.ts` |
-| 8 | 记忆与人格控制台 | `src/client/` |
-| 9 | 涌现式人格（±0.05 微移） | `prompt/agent-registry.ts` |
-| 10 | 记忆污染防御 + 隔离区 | `memory/poison.ts` |
+| 7 | 踩坑四段演进 + 删除（现象→经验→模式→规则） | `memory/pitfall.ts` |
+| 8 | 记忆控制台：搜索 / 编辑正文 / 删除 / 情感纠错 | `src/client/memory-list.tsx` + `routes.ts` |
+| 9 | 涌现式人格（±0.05 微移）+ 人格档案可编辑 | `prompt/agent-registry.ts` |
+| 10 | 记忆污染防御 + 隔离区（洗白 / 销毁） | `memory/poison.ts` |
 | 11 | 多端冲突解决（按设备分片） | `shared/journal.ts` |
 | 12 | 记忆导入（JSON / Markdown / 自动识别） | `memory/importer.ts` |
+| 13 | 一键物理销毁（清记忆 + 人格 + 宿主会话痕迹） | `memory/purge.ts` |
 
 ---
 
@@ -444,7 +490,7 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 
 最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
-- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），113 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
+- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），117 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。
 - 运行时缺 `node:sqlite` 时测试**跳过而非失败**——CI 该红在真 bug 上，不该红在 Node 版本上。
 - 发布流程（打 tag、推 GitHub、发 npm、提 awesome 收录）见 [docs/PUBLISH.md](docs/PUBLISH.md)。
