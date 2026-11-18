@@ -19,6 +19,7 @@
 import type { MemoryKind, SqlDriver } from '../../shared/types.js'
 import type { Scope } from '../../shared/scope.js'
 import type { TemporalTree } from './timetree.js'
+import type { PitfallStore } from './pitfall.js'
 import { recallMemories } from './recall.js'
 
 /** 宿主 `ctx.tools` 的最小面。 */
@@ -35,6 +36,8 @@ export interface MemoryToolDeps {
   readonly tree: () => TemporalTree | undefined
   /** 会话 → 人格 id（复用 persona_identity，不新开一套映射）。 */
   readonly personaOf: (sessionId: string) => string
+  /** 踩坑链（四段式）；kind=pitfall 时同步写入，缺失则只写记忆不写链。 */
+  readonly pitfalls?: () => PitfallStore | undefined
   readonly onWarn: (message: string) => void
 }
 
@@ -131,7 +134,7 @@ export function registerMemoryTools(
       type: 'object',
       properties: {
         text: { type: 'string', description: 'One self-contained sentence in the user\'s language.' },
-        kind: { type: 'string', enum: [...KINDS], description: 'Memory kind; default preference for "I like X", fact otherwise.' },
+        kind: { type: 'string', enum: [...KINDS], description: 'Memory kind: fact (objective fact about the user/workspace), preference (what the user likes or wants), decision (a choice already made), pitfall (a mistake or trap worth never repeating — use this when the user or you hit an error/踩坑), persona (how to address the user). Default: preference for "I like X", otherwise fact.' },
         subject_key: { type: 'string', description: 'Short stable key for dedupe (e.g. "food/likes"). Optional.' },
       },
       required: ['text'],
@@ -162,12 +165,27 @@ export function registerMemoryTools(
           distillStatus: 'distilled',
           distillModel: 'model-tool',
         })
+        // pitfall 记忆同步进四段式踩坑链（现象→经验→模式→规则），
+        // 否则"记住错误"只会躺在 memory_entity 里，规则视图的"经验条目"永远是空的。
+        let pitfall = false
+        if (kind === 'pitfall') {
+          const store = deps.pitfalls?.()
+          if (store !== undefined) {
+            try {
+              await store.record({ scope, observation: text, author: 'agent' })
+              pitfall = true
+            } catch (error) {
+              deps.onWarn(`踩坑链写入失败（记忆已保存，仅规则视图未同步）：${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+        }
         return JSON.stringify({
           ok: true,
           entity_id: opened.entity.entity_id,
           kind,
           created: !opened.deduped,
           reinforced: opened.deduped,
+          pitfall,
         })
       } catch (error) {
         deps.onWarn(`memory_remember 失败：${error instanceof Error ? error.message : String(error)}`)
