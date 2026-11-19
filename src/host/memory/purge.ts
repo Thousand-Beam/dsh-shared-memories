@@ -67,11 +67,10 @@ export interface PurgeOptions {
   readonly onWarn?: (message: string) => void
   /**
    * 宿主状态根（通常是 `~/.dsh`，也就是数据根的上一层）。
-   * 给了就把这条会话在宿主侧留下的三样东西一起清掉：
-   *   · `sessions/<cwd-slug>/<sessionId>`：会话日志（侧栏行的来源）
-   *   · `storages/session_projcache/sessions/<sessionId>.json`：投影缓存（标题/时间）
-   *   · `storages/workspace.json`：workspace 记账里的 sessionIds / archivedSessionIds
-   * 不清这些，记忆删干净了侧栏还留着一个点不开的空壳。
+   * 给了就删掉这条会话的宿主侧日志 `sessions/<cwd-slug>/<sessionId>`——会话正文的
+   * 持久化文件。删掉后宿主重启扫 header 就再也看不到这一行；运行期那一行靠前端
+   * archiveSession 归档隐藏，不在这里动 workspace 记账（那会跟宿主内存态打架，
+   * 把已归档会话渲染成「未分组」的「未命名」幽灵）。
    */
   readonly hostRoot?: string
 }
@@ -402,81 +401,29 @@ interface HostTraceOptions {
   readonly failures: string[]
 }
 
-/** 宿主侧三处痕迹一起清，返回动过的文件/条目数。 */
+/**
+ * 宿主侧痕迹：只删会话日志（`~/.dsh/sessions/<slug>/<sessionId>`）。
+ *
+ * 不再删投影缓存和 workspace 记账（曾经删过，真机踩坑回退）：
+ * - `storages/workspace.json` 由宿主 workspace registry 独占持久化，插件直接改磁盘
+ *   会跟宿主内存态打架：侧栏把已归档会话当成「找不到 workspace」的 stray 行，
+ *   掉进「未分组」，渲染成「未命名」幽灵（时间还是几天前）。
+ * - `storages/session_projcache/sessions/<id>.json` 是侧栏标题投影，删了就没标题，
+ *   同样变「未命名」。
+ *
+ * 让行真正消失是两段式：
+ *   运行期 → 前端 archiveSession 归档（宿主原生机制，行从默认分组隐藏）；
+ *   重启后 → 这里删掉的会话日志让宿主 header 索引扫不到，行彻底不再出现。
+ * 归档在前、删日志在后（purge 处理器就是这顺序），archiveSession 的 sessionKnown
+ * 校验时日志还在，不会被「会话不存在」拒绝。
+ */
 async function dropHostSessionTraces(options: HostTraceOptions): Promise<number> {
-  let touched = 0
-  touched += await dropSessionLogs({
+  return dropSessionLogs({
     sessionStoreRoot: join(options.hostRoot, 'sessions'),
     agentId: options.agentId,
     warn: options.warn,
     failures: options.failures,
   })
-  touched += await dropProjectionCache(join(options.hostRoot, 'storages', 'session_projcache', 'sessions'), options)
-  touched += await pruneWorkspaceRegistry(join(options.hostRoot, 'storages', 'workspace.json'), options)
-  return touched
-}
-
-/** 投影缓存：`<id>.json` / `session-<id>.json`，删了它侧栏就没有标题可渲染了。 */
-async function dropProjectionCache(dir: string, options: HostTraceOptions): Promise<number> {
-  const target = bareSessionId(options.agentId)
-  let names: string[]
-  try {
-    const entries = await readdir(dir)
-    names = entries.filter((name) => bareSessionId(name.replace(/\.json$/u, '')) === target)
-  } catch (cause) {
-    if (codeOf(cause) !== 'ENOENT') options.failures.push(`读投影缓存失败：${dir}：${messageOf(cause)}`)
-    return 0
-  }
-  let removed = 0
-  for (const name of names) {
-    const full = join(dir, name)
-    try {
-      await discardIn(join(dir, TRASH_DIR), full)
-      removed += 1
-    } catch (cause) {
-      options.failures.push(`删投影缓存失败：${full}：${messageOf(cause)}`)
-    }
-  }
-  return removed
-}
-
-/**
- * workspace 记账：`global.archivedSessionIds` / `global.pinnedSessionIds` 与
- * `tables.workspaces[*].sessionIds` 里该会话的 id 一并剔除。
- *
- * 这一处是"行真的消失"的关键：只归档（archivedSessionIds）时那一行仍会渲染，
- * 从 sessionIds 里拿掉才等于"这条会话不存在"。
- */
-async function pruneWorkspaceRegistry(file: string, options: HostTraceOptions): Promise<number> {
-  const target = bareSessionId(options.agentId)
-  let removed = 0
-  await scrubJson(file, (doc) => {
-    const matches = (value: unknown): boolean => typeof value === 'string' && bareSessionId(value) === target
-    const pruneList = (list: unknown): unknown => {
-      if (!Array.isArray(list)) return list
-      const kept = list.filter((value) => !matches(value))
-      removed += list.length - kept.length
-      return kept
-    }
-    const global = doc.global
-    if (global !== null && typeof global === 'object' && !Array.isArray(global)) {
-      const scope = global as Record<string, unknown>
-      scope.archivedSessionIds = pruneList(scope.archivedSessionIds)
-      scope.pinnedSessionIds = pruneList(scope.pinnedSessionIds)
-    }
-    const tables = doc.tables
-    const workspaces = (tables as { workspaces?: unknown } | null)?.workspaces
-    if (workspaces !== null && typeof workspaces === 'object' && !Array.isArray(workspaces)) {
-      for (const entry of Object.values(workspaces as Record<string, unknown>)) {
-        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
-        const row = entry as Record<string, unknown>
-        row.sessionIds = pruneList(row.sessionIds)
-      }
-    }
-    return doc
-  }, options.warn, options.failures)
-  if (removed > 0) options.warn(`已从 workspace 记账里剔除 ${removed} 条会话索引`)
-  return removed
 }
 
 /** 把 target 挪进同一卷的回收区再删；挪不动就原地删。 */
