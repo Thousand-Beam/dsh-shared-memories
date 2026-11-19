@@ -93,10 +93,12 @@ async function main() {
   // 宿主的客户端加载器是"传统脚本 + 注入 require"，不是 ESM：
   // 顶层只要残留一条 import/export，整个 entry 会 import failed（页面直接起不来）。
   assertCommonJsOnly(code)
-  await assertPackageEntryPoints(pkg)
 
   const file = wrap(code, id)
   await writeFile(OUT, file, 'utf8')
+  // 入口校验放在写产物之后：`dsh.client.entry` 指向的正是 OUT，必须先写出来再验，
+  // 否则 clean build（删 lib 后重建）会在这里自己绊倒自己。
+  await assertPackageEntryPoints(pkg)
 
   console.log(`✔ ${OUT}`)
   console.log(`  入口    ${ENTRY}`)
