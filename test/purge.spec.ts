@@ -7,7 +7,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile, writeFile, mkdir } from 'node:fs/promises'
+import { readFile, writeFile, mkdir, access } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { openTestDb, tempRoot } from './helpers/db.js'
@@ -101,4 +101,78 @@ test('journal 目录不存在时 purge 也不报错（全新机器）', async (t
   const result = await purgeAgent({ db, root, workspaceId: WORKSPACE, agentId: 'nobody' })
   assert.equal(result.entities, 0)
   assert.equal(result.records, 0)
+})
+
+test('dropHostSessionTraces 只删会话日志，不碰投影缓存与 workspace 记账', async (t) => {
+  const db = await openTestDb(t)
+  if (db === undefined) return
+  const root = await tempRoot(t, 'purge-host-')
+  const hostRoot = join(root, 'host')
+  const agentId = 'victim'
+  const slug = '--C-Users-Test-default-workspace--'
+
+  // 两种命名的会话日志（裸 uuid 与 session- 前缀）
+  await mkdir(join(hostRoot, 'sessions', slug, agentId), { recursive: true })
+  await writeFile(join(hostRoot, 'sessions', slug, agentId, 'session.v4.jsonl.zstd'), 'victim-log', 'utf8')
+  await mkdir(join(hostRoot, 'sessions', slug, `session-${agentId}`), { recursive: true })
+  await writeFile(join(hostRoot, 'sessions', slug, `session-${agentId}`, 'session.v4.jsonl.zstd'), 'victim-log-prefixed', 'utf8')
+
+  // 别人的会话日志，不该动
+  await mkdir(join(hostRoot, 'sessions', slug, 'session-other'), { recursive: true })
+  await writeFile(join(hostRoot, 'sessions', slug, 'session-other', 'session.v4.jsonl.zstd'), 'other-log', 'utf8')
+
+  // 投影缓存 + workspace 记账（宿主持有，插件不该碰）
+  const projCache = join(hostRoot, 'storages', 'session_projcache', 'sessions', `${agentId}.json`)
+  await mkdir(join(hostRoot, 'storages', 'session_projcache', 'sessions'), { recursive: true })
+  await writeFile(projCache, JSON.stringify({ title: '不该被删' }), 'utf8')
+  const registry = {
+    global: { archivedSessionIds: [agentId], pinnedSessionIds: [] },
+    tables: { workspaces: { ws1: { sessionIds: [agentId] } } },
+  }
+  const workspaceJson = join(hostRoot, 'storages', 'workspace.json')
+  await writeFile(workspaceJson, JSON.stringify(registry), 'utf8')
+
+  const result = await purgeAgent({ db, root, workspaceId: WORKSPACE, agentId, hostRoot })
+  assert.equal(result.sessionFiles, 2)
+
+  // 会话日志（两种命名）都被移除
+  await assert.rejects(readFile(join(hostRoot, 'sessions', slug, agentId, 'session.v4.jsonl.zstd'), 'utf8'))
+  await assert.rejects(readFile(join(hostRoot, 'sessions', slug, `session-${agentId}`, 'session.v4.jsonl.zstd'), 'utf8'))
+  // 别人的不动
+  assert.equal(await readFile(join(hostRoot, 'sessions', slug, 'session-other', 'session.v4.jsonl.zstd'), 'utf8'), 'other-log')
+
+  // 投影缓存与 workspace 记账原样保留
+  assert.equal(await readFile(projCache, 'utf8'), JSON.stringify({ title: '不该被删' }))
+  assert.deepEqual(JSON.parse(await readFile(workspaceJson, 'utf8')), registry)
+
+  // trash 放在 hostRoot 下（sessions/ 之外），不在 sessions/ 里
+  await access(join(hostRoot, '.purge-trash'))
+  await assert.rejects(access(join(hostRoot, 'sessions', '.purge-trash')))
+})
+
+test('purge 不误删另一个工作区里同名人格的绑定记录', async (t) => {
+  const db = await openTestDb(t)
+  if (db === undefined) return
+  const root = await tempRoot(t, 'purge-crossws-')
+  const journal = new Journal({ root, deviceId: 'dev-a' })
+  await journal.open()
+  const identity = new PersonaIdentityStore({ db, journal })
+
+  const OTHER_WS = 'ws-other'
+
+  // 本工作区绑定 + 另一工作区同名人格绑定
+  await identity.bindTo('session-a', WORKSPACE, 'lead', 'user')
+  await identity.bindTo('session-other', OTHER_WS, 'lead', 'user')
+
+  await purgeAgent({ db, root, workspaceId: WORKSPACE, agentId: 'lead' })
+
+  // DB 层：本工作区绑定清掉，另一工作区绑定原样保留
+  assert.equal(identity.resolve('session-a'), 'session-a')
+  assert.equal(identity.lookup('session-other')?.personaId, 'lead')
+
+  // journal 层：本工作区的 persona.bind 被物理剔除，另一工作区的保留
+  const file = join(root, 'journal', 'devices', 'dev-a', `${new Date().toISOString().slice(0, 10)}.jsonl`)
+  const text = await readFile(file, 'utf8')
+  assert.equal(text.includes('session-a'), false, '本工作区绑定记录应从 journal 剔除')
+  assert.ok(text.includes('session-other'), '另一工作区同名人格绑定必须保留')
 })

@@ -272,9 +272,11 @@ export async function purgeAgent(options: PurgeOptions): Promise<PurgeResult> {
     fail('清理派生状态失败', cause)
   }
 
-  // ── ④ 宿主侧残留：会话日志 / 投影缓存 / workspace 记账 ──
-  // 侧栏那一行完全不来自记忆库：它是 `~/.dsh/sessions/…` 与 `storages/workspace.json`
-  // 拼出来的。只清库不改这里，用户看到的就是"记忆没了、会话还在"。
+  // ── ④ 宿主侧残留：会话日志（~/.dsh/sessions/<slug>/<sessionId>）──
+  // 侧栏那一行不来自记忆库，而是宿主持久化的会话日志 + workspace 记账拼出来的。
+  // 这里只删会话日志：运行期靠前端 archiveSession 归档隐藏，重启后宿主 header 索引
+  // 扫不到它，行彻底消失。不碰投影缓存和 workspace.json（那是宿主持有状态，插件直接
+  // 改磁盘会跟宿主内存态打架，正是 v0.3.4 修的幽灵 bug）。
   let sessionFiles = 0
   if (options.hostRoot !== undefined && options.hostRoot !== '') {
     try {
@@ -338,6 +340,8 @@ function bareSessionId(name: string): string {
 
 interface DropSessionOptions {
   readonly sessionStoreRoot: string
+  /** 回收区目录：放在 sessions/ 之外，宿主扫 header 不会把它当会话目录。 */
+  readonly trashDir: string
   readonly agentId: string
   readonly warn: (message: string) => void
   readonly failures: string[]
@@ -351,7 +355,7 @@ interface DropSessionOptions {
  * rename 是原子的，行会立刻从下一次扫描里消失；rename 撞上占用才退化成直接删。
  */
 async function dropSessionLogs(options: DropSessionOptions): Promise<number> {
-  const { sessionStoreRoot, agentId, warn, failures } = options
+  const { sessionStoreRoot, trashDir, agentId, warn, failures } = options
   const target = bareSessionId(agentId)
   if (target === '') return 0
 
@@ -380,8 +384,11 @@ async function dropSessionLogs(options: DropSessionOptions): Promise<number> {
     for (const name of names) {
       const full = join(dir, name)
       try {
-        await discardIn(join(sessionStoreRoot, TRASH_DIR), full)
+        const { residue } = await discardIn(trashDir, full)
         removed += 1
+        if (residue) {
+          failures.push(`回收区残留副本未清：${full}（已移出会话目录，但 trash 里留了一份完整日志）`)
+        }
       } catch (cause) {
         failures.push(`删会话日志失败：${full}：${messageOf(cause)}`)
       }
@@ -420,24 +427,37 @@ interface HostTraceOptions {
 async function dropHostSessionTraces(options: HostTraceOptions): Promise<number> {
   return dropSessionLogs({
     sessionStoreRoot: join(options.hostRoot, 'sessions'),
+    // 回收区放在 sessions/ 之外：宿主扫 header 时不会把 .purge-trash 当会话目录。
+    trashDir: join(options.hostRoot, TRASH_DIR),
     agentId: options.agentId,
     warn: options.warn,
     failures: options.failures,
   })
 }
 
-/** 把 target 挪进同一卷的回收区再删；挪不动就原地删。 */
-async function discardIn(trashDir: string, target: string): Promise<void> {
+/**
+ * 把 target 挪进同一卷的回收区再删；挪不动就原地删。
+ * 返回 `residue=true` 表示"文件已移出原位，但回收区里的副本没删干净"——
+ * 这是删除不彻底，调用方必须记进 failures，否则「彻底销毁」会静默留完整副本。
+ */
+async function discardIn(trashDir: string, target: string): Promise<{ residue: boolean }> {
   try {
     await mkdir(trashDir, { recursive: true })
     const parked = join(trashDir, `${basename(target)}-${randomUUID()}`)
     await rename(target, parked)
-    await rm(parked, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined)
-    return
+    try {
+      await rm(parked, { recursive: true, force: true, maxRetries: 3 })
+      return { residue: false }
+    } catch {
+      // rename 成功 = 会话日志已从 sessions/ 移走；但回收区副本删不掉等于别处留了
+      // 一份完整日志，必须上报，不能 `.catch(() => undefined)` 静默吞。
+      return { residue: true }
+    }
   } catch {
     // rename 失败（多半被占用）：退化成原地删。
   }
   await rm(target, { recursive: true, force: true, maxRetries: 3 })
+  return { residue: false }
 }
 
 function countRows(db: SqlDriver, sql: string, params: readonly unknown[]): number {
@@ -546,12 +566,19 @@ async function purgeJournal(options: PurgeJournalOptions): Promise<{ files: numb
     }
   }
 
+  // 归属判定必须带工作区：personaId / agentId 都不是全局唯一，而是按 workspace 隔离的
+  // （persona.bind 用 personaId，entity.upsert 用 agentId）。只按 `personaId === agentId`
+  // 会把另一个 workspace 里同名人格的绑定记录也误删。entityId 本身是全局唯一（ULID），
+  // 加 workspace 守卫是防御纵深；version.open/close 不带 workspaceId（undefined），
+  // 放行它才能让 entityId 归属继续生效。
+  const sameWorkspace = (record: JournalRecordShape): boolean =>
+    record.workspaceId === undefined || record.workspaceId === workspaceId
+
   const matches = (record: JournalRecordShape): boolean => {
-    const mineByAgent =
-      record.agentId === agentId && (record.workspaceId === undefined || record.workspaceId === workspaceId)
-    const mineByEntity = typeof record.entityId === 'string' && entityIds.has(record.entityId)
+    const mineByAgent = record.agentId === agentId && sameWorkspace(record)
+    const mineByEntity = typeof record.entityId === 'string' && entityIds.has(record.entityId) && sameWorkspace(record)
     // persona.bind 记录带的是 personaId：不按它过滤，销毁后绑定还在，会话照样"继承"这个人。
-    const mineByPersona = record.personaId === agentId
+    const mineByPersona = record.personaId === agentId && sameWorkspace(record)
     return mineByAgent || mineByEntity || mineByPersona
   }
 
@@ -583,7 +610,8 @@ async function purgeJournal(options: PurgeJournalOptions): Promise<{ files: numb
         if (eid === undefined) continue
         // 归属条件：记录本身属于本 agent（entity.upsert 等带 agentId），
         // 或记录的 entityId 已经在本 agent 名下（version.* 引用它）。
-        const mine = record.agentId === agentId || entityIds.has(eid)
+        // agentId 可能跨 workspace 重复（如 persona id），必须带 sameWorkspace。
+        const mine = (record.agentId === agentId && sameWorkspace(record)) || entityIds.has(eid)
         if (mine && !entityIds.has(eid)) {
           entityIds.add(eid)
           grew = true

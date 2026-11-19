@@ -148,12 +148,6 @@ export interface MemoriesApiDeps {
   distillJob?(input: { jobId?: string; sessionId?: string }): DistillJobView | undefined
   /** 彻底销毁（库 + journal 物理抹除）。 */
   purge?(input: { agentId: string }): Promise<PurgeResult>
-  /**
-   * 连会话本体一起抹掉（投影文件 + workspace.json 索引）。
-   *
-   * `purge` 只动记忆库，侧栏那一行是 DSH 自己的数据，不删它会一直留着。
-   */
-  removeSession?(input: { sessionId: string }): { projection: boolean; indexUpdated: boolean }
   /** 读会话全文（提炼用），拿不到返回空数组。 */
   sessionTurns?(sessionId: string): Promise<ChatTurn[]>
 }
@@ -322,11 +316,10 @@ async function dispatch(
       deps.barrier.assertWritable('purge')
       const personaId = resolvePersonaIdOf(deps, agentId)
       const result = await purge({ agentId: personaId })
-      // 记忆清完，会话本体也要能一起消失——否则"彻底销毁"之后侧栏还留着那一行，
-      // 用户会以为没生效。默认删；显式传 false 才保留会话。
-      const alsoSession = body.deleteSession !== false
-      const session = alsoSession ? deps.removeSession?.({ sessionId: agentId }) : undefined
-      return sendJson(res, 200, ok({ ...result, session }))
+      // 会话本体的清理由 purge 内部完成（dropHostSessionTraces 只删会话日志）。
+      // 不在这里额外删投影缓存 / workspace.json：那两样是宿主持有状态，插件直接改磁盘
+      // 会跟宿主内存态打架，正是 v0.3.4 修的「未分组 + 未命名」幽灵 bug。
+      return sendJson(res, 200, ok(result))
     }
     if (method === 'GET' && path === '/rules') {
       return sendJson(res, 200, ok(readRules(deps, url)))

@@ -102,6 +102,8 @@ export class Journal {
   #queue: Promise<void> = Promise.resolve()
   /** 写闸门：快照 capture→commit 期间上锁，暂停新 append（防止 manifest sha 与磁盘内容脱节）。 */
   #gate: Promise<void> = Promise.resolve()
+  /** 闸门互斥锁：同一时刻只允许一个 withGate 在跑（purge 改 journal vs 快照 capture 互斥）。 */
+  #mutex: Promise<void> = Promise.resolve()
 
   constructor(options: JournalOptions) {
     if (!DEVICE_ID_RE.test(options.deviceId)) {
@@ -181,6 +183,14 @@ export class Journal {
   async withGate<T>(fn: () => Promise<T>): Promise<T> {
     // 等所有已排队的写入落盘，避免闸门内还有半截 append 在飞。
     await this.#queue
+    // 互斥：同一时刻只允许一个 withGate 在跑。purge 会原子重写 journal 文件，
+    // 快照 capture 也在读这些文件算 sha256，两者并发会算出与磁盘脱节的 manifest。
+    const prev = this.#mutex
+    let releaseMutex!: () => void
+    this.#mutex = new Promise((resolve) => {
+      releaseMutex = resolve
+    })
+    await prev
     let release!: () => void
     this.#gate = new Promise((resolve) => {
       release = resolve
@@ -189,6 +199,7 @@ export class Journal {
       return await fn()
     } finally {
       release()
+      releaseMutex()
     }
   }
 

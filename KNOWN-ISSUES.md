@@ -23,7 +23,7 @@
 
 ## 4. readAgentId / readSessionId 未做 SCOPE_TOKEN 校验（评估：已有双重防线，不加）
 - 位置：`src/index.ts`（readAgentId / readSessionId）。
-- 说明：这两个函数只负责从事件负载里「挖」id，不做格式校验。但 id 进入的所有敏感路径已有防护：SQL 全部参数化、文件路径在 `src/host/memory/session-artifacts.ts` 有 basename 穿越守卫、作用域构造在 `src/shared/scope.ts` 有 SCOPE_TOKEN 校验。
+- 说明：这两个函数只负责从事件负载里「挖」id，不做格式校验。但 id 进入的所有敏感路径已有防护：SQL 全部参数化、文件删除路径在 `src/host/memory/purge.ts` 的 `dropSessionLogs` 用 `bareSessionId()` 归一化后**完全相等**匹配（绝不做前缀/模糊匹配，杜绝路径穿越）、作用域构造在 `src/shared/scope.ts` 有 SCOPE_TOKEN 校验。
 - 不修原因：再加一层是「防御纵深」的第三道，边际收益低，且可能误伤未来合法的 id 形态。
 
 ## 5. schema 参数 host 校验缺失（评估：需宿主配合，暂缓）
@@ -34,3 +34,14 @@
 - 位置：`src/shared/journal.ts`（`withGate()`）、`src/index.ts`（snapshotNow）。
 - 修复：给 Journal 加 `withGate(fn)`，快照流程先 `journal.flush()` 再在闸门内执行 capture+commit，闸门期间 `#appendOne` 挂起。杜绝 manifest 记录的 sha256 与 `git add -A` 提交内容脱节（P0-3）。
 - 验证：`test/journal.spec.ts` 新增「写闸门：withGate 执行期间 append 挂起，释放后按顺序落盘」测试。
+
+## 7. 「彻底销毁」不重写 Git 历史（已知边界，插件不做）
+- 位置：`src/host/memory/purge.ts`（purgeAgent 全程无 git 调用）。
+- 说明：purge 删的是工作副本里的 memory.db 记录、journal、会话日志，但**不动 `.git` 里已 commit 的 blob，也不动已 push 到远端的对象**。已进入 git 快照的记忆/人格/会话，仍能被 `git log -p`、clone、或平台缓存翻出来「复活」。
+- 影响：对「AI 记忆/人格」这类敏感个人数据，这是删除不彻底；真要从仓库根除需要 `git filter-repo` + force push + 请平台清缓存，本插件不做、也做不到保证。
+- 处理：README 能力 13 已明确标注「不含 Git 历史」，安全边界段有完整警告。用户若要彻底根除，需在插件外自行执行历史重写。
+
+## 8. 删除语义对宿主文件/API 深度耦合（结构性风险，已收敛但未根除）
+- 说明：让一条会话「消失」当前分散在多个宿主机制上——前端 archiveSession 归档（内存态）、删会话日志（重启后 header 索引扫不到）、journal 墓碑（replay 时清记忆）。插件没有宿主级 `deleteSession` API 可调用，只能「停止直接改共享状态 + 依赖宿主原生机制」，这正是幽灵 bug 的根因（插件曾绕过所有者直接改 storages/）。
+- 已收敛：v0.3.4 起 purge 不再删投影缓存与 workspace 记账（`dropProjectionCache`/`pruneWorkspaceRegistry` 已删，连带删除了整个 `session-artifacts.ts` 与 routes 里的 `removeSession` 路径）；`test/architecture.spec.ts` 焊死「插件代码不得写 storages/」。
+- 剩余风险：宿主仍在 rc 阶段、header 索引等内部实现未来可能变动，届时「靠删日志让索引扫不到」可能再次失效。根治需宿主提供 `deleteSession` 级 API，插件只调用不伸手。

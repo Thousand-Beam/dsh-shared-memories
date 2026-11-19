@@ -32,7 +32,6 @@ import { UserProfileStore } from './host/memory/user-profile.js'
 import { PersonaIdentityStore, backfillPersonaIdentities } from './host/memory/persona-identity.js'
 import { mergeOrphanAgents } from './host/memory/merge-agent.js'
 import { pruneNoiseMemories } from './host/memory/prune-noise.js'
-import { removeSessionArtifacts } from './host/memory/session-artifacts.js'
 import type { PersonaIdentity } from './shared/persona-identity.js'
 import { looksLikeSessionId } from './shared/persona-identity.js'
 import { readSkillBindings } from './host/memory/skill-registry.js'
@@ -550,16 +549,22 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         const db = runtime.db
         if (db === undefined) throw new Error('记忆库尚未就绪')
         try {
-          // hostRoot：顺手清掉宿主侧会话痕迹（sessions/、投影缓存、workspace 记账），
+          // hostRoot：顺手清掉宿主侧会话日志（sessions/<slug>/<sessionId>），
           // 否则侧栏会留下一个点不开的空壳（记忆没了、那一行还在）。
-          return await purgeAgent({
-            db,
-            root,
-            workspaceId,
-            agentId: input.agentId,
-            hostRoot: dirname(root),
-            onWarn: warn,
-          })
+          const run = () =>
+            purgeAgent({
+              db,
+              root,
+              workspaceId,
+              agentId: input.agentId,
+              hostRoot: dirname(root),
+              onWarn: warn,
+            })
+          // 写闸门：purge 会原子重写 journal 文件，快照 capture 也在读这些文件算 sha256，
+          // 两者并发会算出与磁盘脱节的 manifest sha。所以 purge 也走 withGate 与快照互斥。
+          const journal = runtime.journal
+          if (journal) await journal.flush()
+          return await (journal ? journal.withGate(run) : run())
         } catch (cause) {
           // 关键：这里绝不能让裸异常冒到宿主。
           // 文件被占用（EBUSY）、库只读这类事故会被 purgeAgent 收进 PurgeError；
@@ -569,12 +574,6 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           throw new PurgeError('purge-failed', cause instanceof Error ? cause.message : String(cause))
         }
       },
-      removeSession: (input) =>
-        removeSessionArtifacts({
-          sessionId: input.sessionId,
-          dshHome: resolve(root, '..'),
-          onWarn: warn,
-        }),
       importMemories: async (input) => {
         if (!runtime.importer) throw new Error('记忆库尚未就绪')
         const report = await runtime.importer.import({
