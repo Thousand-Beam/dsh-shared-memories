@@ -177,3 +177,42 @@ test('写闸门：withGate 执行期间 append 挂起，释放后按顺序落盘
   const merged = await journal.readMerged()
   assert.ok(merged.some((r) => r.entityId === 'blocked'), '闸门释放后，被阻塞的记录应已落盘')
 })
+
+test('withGate：嵌套调用直接抛错，防止死锁', async (t) => {
+  const root = await tempRoot(t)
+  const journal = new Journal({ root, deviceId: 'devA', durable: false, clock: () => DAY })
+  await journal.open()
+
+  await assert.rejects(
+    journal.withGate(async () => {
+      // 闸门内再开闸门 = 自己等自己，死锁。必须在入口就抛错。
+      await journal.withGate(async () => {})
+    }),
+    /不允许嵌套调用/,
+  )
+})
+
+test('realignClock：pull 到远端后重新对齐 Lamport 水位', async (t) => {
+  const root = await tempRoot(t)
+  const devA = new Journal({ root, deviceId: 'devA', durable: false, clock: () => DAY })
+  await devA.open()
+  await devA.append({ op: 'version.open', versionId: 'a1', at: DAY + 100 }) // lc=1
+  await devA.append({ op: 'version.open', versionId: 'a2', at: DAY + 200 }) // lc=2
+
+  // devB 冷启动，open() 对齐到当时可见的最大 lc（=2，来自 devA）。
+  const devB = new Journal({ root, deviceId: 'devB', durable: false, clock: () => DAY })
+  await devB.open()
+
+  // 模拟 git pull：devC 在 devB 之后写了更高 lc 的记录（lc=3..5）。
+  const devC = new Journal({ root, deviceId: 'devC', durable: false, clock: () => DAY })
+  await devC.open() // devC open 时对齐到 devA 的 lc=2
+  await devC.append({ op: 'version.open', versionId: 'c3', at: DAY + 300 }) // lc=3
+  await devC.append({ op: 'version.open', versionId: 'c4', at: DAY + 301 }) // lc=4
+  await devC.append({ op: 'version.open', versionId: 'c5', at: DAY + 302 }) // lc=5
+
+  // realignClock 前：devB 水位仍是 2，新 append 会得到 lc=3，排在 devC 的 lc=5 之前。
+  // realignClock 后：水位抬到 5，新 append 得到 lc=6。
+  await devB.realignClock()
+  const rec = await devB.append({ op: 'version.open', versionId: 'b6', at: DAY + 400 })
+  assert.equal(rec.lc, 6, `realignClock 后新事件 lc 应为 6，实际 ${rec.lc}`)
+})

@@ -457,6 +457,9 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       const outcome = await runtime.restore.restoreOnBoot()
       runtime.booted = true
       if (outcome.status === 'ready') {
+        // pull 到远端 journal 后重新对齐 Lamport 时钟：open() 时对齐的是本地水位，
+        // 远端记录可能带更高 lc，不对齐会让本设备新事件被 readMerged 排到远端之前。
+        await journal.realignClock()
         // 噪声自愈：早期启发式把"助手写给用户看的操作步骤"当事实存进库，
         // 已经在库里的脏数据不会自己消失，而且 journal 是 append-only 的。
         // 这里每轮启动扫一遍活实体，命中就写 `memory.forget` 墓碑再标死；
@@ -557,6 +560,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
               root,
               workspaceId,
               agentId: input.agentId,
+              sessionId: input.sessionId,
               hostRoot: dirname(root),
               onWarn: warn,
             })
@@ -692,14 +696,16 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
             `[shared-memories] 会话 ${sessionAgentId} 继承人格 ${agentId}`,
           )
         }
-        // 先登记"这个 Agent 活着"再等闸门：persona_state 里此时可能还没有它
-        //（还没写过任何记忆），但快照必须带上，否则换台机器就少一个人。
+        // 内存登记（trackPresence 只写 liveAgents Map，不落库）可以立刻做；
+        // 落库登记（ensureAgentRow 写 persona_state）必须等闸门 ready——
+        // 冷启动时 persona_state 还没从 journal 恢复完，先写会被 replay 覆盖。
         trackPresence(runtime, agentId, readSessionId(args[0]))
-        if (agentId) ensureAgentRow(runtime, agentId, workspaceId)
         const phase = await barrier.wait()
         if (phase === 'degraded') {
           warn(`记忆只读降级（${barrier.reason ?? 'unknown'}），agent ${agentId || '?'} 以受限模式启动`)
         }
+        // 只在 ready 时补 persona_state 行：degraded（只读降级）不该写库。
+        if (agentId && phase === 'ready') ensureAgentRow(runtime, agentId, workspaceId)
         await refreshPrompt(runtime, config)
         return undefined
       }),
@@ -772,7 +778,8 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     ;(autoSweep as unknown as { unref?: () => void }).unref?.()
     disposers.push(() => clearInterval(autoSweep))
 
-    // ③-3 agent 释放 = 关机型快照（多 agent 时靠 snapshotInFlight 合并，不放大成 N 次）。    disposers.push(host.on('agent/disposed', () => void snapshotNow('shutdown')))
+    // ③-3 agent 释放 = 关机型快照（多 agent 时靠 snapshotInFlight 合并，不放大成 N 次）。
+    disposers.push(host.on('agent/disposed', () => void snapshotNow('shutdown')))
 
     // ③-4 配置热更新：只重建提示词，不做快照（避免把配置抖动写进历史）。
     disposers.push(host.on('app-boot/config-reload', () => void refreshPrompt(runtime, config)))

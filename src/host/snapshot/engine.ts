@@ -255,6 +255,14 @@ export class SnapshotEngine {
       const result = await this.#git.run(['push', '--tags', 'origin', this.#branch])
       if (result.code === 0) return { pushed: true }
       lastError = result.stderr.trim() || `exit ${result.code}`
+      // 远端有本地没有的提交（另一台设备先推过）：push 会被 rejected，重试多少次都一样。
+      // 只有一次机会 pull --rebase，把本地提交垫到远端之上再推；rebase 本身冲突则放弃，
+      // 交给冷启动的 restore 流程走 pull-conflict 分支让用户人工处理。
+      if (isPushDiverged(String(lastError)) && attempt === 0) {
+        const pulled = await this.#git.run(['pull', '--rebase', 'origin', this.#branch])
+        if (pulled.code === 0) continue
+        this.#onWarn(`push 分叉且 pull --rebase 失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`)
+      }
       if (attempt < this.#retries) {
         const delay = backoffDelay(attempt)
         this.#onWarn(`push 失败（第 ${attempt + 1} 次）：${String(lastError)}；${delay}ms 后重试`)
@@ -415,15 +423,52 @@ export class SnapshotEngine {
       if (init.code !== 0) {
         throw new SnapshotError('git-init-failed', `git init 失败：${init.stderr.trim()}`)
       }
+      // 首次初始化也要先把 .gitignore 落盘再 add，否则 memory.db 会被 add -A 收进首个 commit。
+      await this.#ensureGitignore()
       await this.#git.run(['add', '-A'])
       await this.#git.run(['commit', '--allow-empty', '-m', 'chore: init shared-memories repo'], {
         config: { 'user.name': this.#authorName, 'user.email': this.#authorEmail },
       })
+    } else {
+      // 已存在的仓库也可能缺 .gitignore（v0.3.5 之前从未写过它）。
+      await this.#ensureGitignore()
     }
     // 新旧仓库都钉死行尾策略：清单里记的是工作区字节的 sha256。
     // 一旦 git 把 LF 转成 CRLF（Windows 默认 core.autocrlf=true），恢复时的校验
     // 就会把"一次完全正常的拉取"判成 snapshot-corrupt——假篡改比真篡改更难查。
     await this.#pinLineEndings()
+  }
+
+  /**
+   * 确保数据根有 .gitignore，且 memory.db 不在索引里。
+   *
+   * memory.db / -wal / -shm 是从 journal 逐条重放出来的派生数据，真相源是
+   * journal/*.jsonl。`git add -A` 若不排除它们，会把几 MB 的库文件连同 -wal 一起
+   * 提交推送（v0.3.5 及之前就这样），与 schema.ts「库文件永远不进 git」的承诺矛盾。
+   * 已跟踪的旧文件用 `git rm --cached --ignore-unmatch` 从索引摘掉（磁盘文件保留），
+   * 该命令幂等：文件不在索引时 ignore-unmatch 让它返回成功。
+   */
+  async #ensureGitignore(): Promise<void> {
+    const gi = join(this.#root, '.gitignore')
+    const content = [
+      '# 派生数据：真相源是 journal/*.jsonl，库文件是重放产物，永不进 git。',
+      'memory.db',
+      'memory.db-wal',
+      'memory.db-shm',
+      'memory.db-journal',
+      '',
+    ].join('\n')
+    await writeFile(gi, content, 'utf8')
+    await this.#git.run([
+      'rm',
+      '--cached',
+      '--ignore-unmatch',
+      '--',
+      'memory.db',
+      'memory.db-wal',
+      'memory.db-shm',
+      'memory.db-journal',
+    ])
   }
 
   /** 关掉文本行尾转换，让"存进去的字节"和"校验的字节"是同一份。 */
@@ -698,4 +743,12 @@ function kindOf(path: string): SnapshotFileEntry['kind'] {
 /** agentId 可能包含路径分隔符（理论上不该有），落文件名前先消毒。 */
 function sanitizeName(value: string): string {
   return value.replace(/[^0-9A-Za-z._-]/g, '_').slice(0, 120) || 'anonymous'
+}
+
+/**
+ * push 被拒是否因为"远端有本地没有的提交"（非网络抖动、非鉴权失败）。
+ * 这类分叉重试多少次都一样，只能 pull --rebase；其它错误（网络、权限）走退避重试。
+ */
+function isPushDiverged(stderr: string): boolean {
+  return /non-fast-forward|fetch first|rejected|tip of your current branch/i.test(stderr)
 }

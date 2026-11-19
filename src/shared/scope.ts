@@ -42,6 +42,15 @@ export interface GlobalToken {
 const SCOPE_TOKEN = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$/
 
 /**
+ * 校验单个作用域令牌（workspaceId / agentId / sessionId）是否可安全用于路径拼接。
+ * 任何要 `join(root, '<id>.json')` 的入口都必须先过这里——否则 `../` 之类的
+ * 路径穿越字符会把 `persona/<agentId>.json` 变成删到 persona/ 之外的文件。
+ */
+export function isSafeScopeToken(token: string): boolean {
+  return SCOPE_TOKEN.test(token)
+}
+
+/**
  * 校验并收窄 Scope。任何入口（查询、写入、导入）都必须先过这里。
  * @param origin 调用点标识，仅用于错误信息，便于定位是哪条路径漏了 scope。
  */

@@ -72,6 +72,15 @@ test('purgeAgent 物理抹除 journal 记录，并写 agent.purge 墓碑', async
   const text = await readFile(tombstone, 'utf8')
   assert.ok(text.includes('agent.purge'))
   assert.ok(text.includes('session-x'))
+
+  // P0-2：墓碑必须带 Lamport lc 且压过全 journal 最大 lc，否则跨设备 replay 时
+  // 其他设备带更大 lc 的 upsert 会排在墓碑（lc=0）后面，把已销毁 Agent 复活。
+  const tombstoneLine = text.trim().split('\n').pop()!
+  const tombstoneRecord = JSON.parse(tombstoneLine) as { lc?: number; op: string }
+  assert.equal(tombstoneRecord.op, 'agent.purge')
+  assert.equal(typeof tombstoneRecord.lc, 'number', '墓碑必须带 lc 字段')
+  // 本例 dev-a 已有一条 version.open（lc=1），墓碑 lc 必须 > 1。
+  assert.ok(tombstoneRecord.lc! >= 2, `墓碑 lc 应压过现有记录（>=2），实际 ${tombstoneRecord.lc}`)
 })
 
 test('purgeAgent 不碰别人的记录', async (t) => {

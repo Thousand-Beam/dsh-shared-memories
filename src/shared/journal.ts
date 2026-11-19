@@ -104,6 +104,8 @@ export class Journal {
   #gate: Promise<void> = Promise.resolve()
   /** 闸门互斥锁：同一时刻只允许一个 withGate 在跑（purge 改 journal vs 快照 capture 互斥）。 */
   #mutex: Promise<void> = Promise.resolve()
+  /** 防重入标志：withGate 里再调 withGate 会死锁（#mutex 已被自己占用），直接抛错。 */
+  #inGate = false
 
   constructor(options: JournalOptions) {
     if (!DEVICE_ID_RE.test(options.deviceId)) {
@@ -140,7 +142,23 @@ export class Journal {
         break
       }
     }
-    // 恢复 Lamport 逻辑时钟：取所有设备最后一条记录的 lc 最大值。
+    await this.#realignClock()
+    this.#loaded = true
+  }
+
+  /**
+   * 重新对齐 Lamport 逻辑时钟到所有设备最后一条记录的最大 lc。
+   *
+   * 冷启动 `restoreOnBoot()` pull 到远端记录后必须调一次：`open()` 时对齐的是
+   * 本地磁盘水位，pull 回来的远端记录可能带更高的 lc，不对齐的话本设备接下来
+   * 写的新事件 lc 会低于远端，readMerged 排序时就被排到远端之前（乱序/复活）。
+   */
+  async realignClock(): Promise<void> {
+    await this.#realignClock()
+  }
+
+  async #realignClock(): Promise<void> {
+    // 取所有设备最后一条记录的 lc 最大值。
     // 这样 pull 到远端记录后，本设备新事件会接在远端之后，跨设备因果单调。
     const devices = await this.#listDevices()
     for (const device of devices) {
@@ -153,7 +171,6 @@ export class Journal {
         }
       }
     }
-    this.#loaded = true
   }
 
   /**
@@ -181,6 +198,16 @@ export class Journal {
    * 被阻塞的 append 会按进入顺序继续落盘。
    */
   async withGate<T>(fn: () => Promise<T>): Promise<T> {
+    // 运行时断言：TS 类型能挡住绝大多数误用，但插件的 fn 可能来自宿主注入的动态值，
+    // 在边界上再挡一道，避免 undefined() 之类的诡异崩溃。
+    if (typeof fn !== 'function') {
+      throw new TypeError('journal.withGate(fn): fn 必须是函数')
+    }
+    // 防重入：withGate 里再调 withGate 会拿不到 #mutex（被自己占着）而永远挂起。
+    if (this.#inGate) {
+      throw new Error('journal.withGate() 不允许嵌套调用：外层闸门尚未释放')
+    }
+    this.#inGate = true
     // 等所有已排队的写入落盘，避免闸门内还有半截 append 在飞。
     await this.#queue
     // 互斥：同一时刻只允许一个 withGate 在跑。purge 会原子重写 journal 文件，
@@ -200,6 +227,7 @@ export class Journal {
     } finally {
       release()
       releaseMutex()
+      this.#inGate = false
     }
   }
 

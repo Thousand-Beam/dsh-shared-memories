@@ -9,11 +9,18 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const SRC = join(process.cwd(), 'src')
+// 用 import.meta.url 定位仓库根，不依赖 process.cwd()。测试被 tsc 编到
+// .test-build/test/architecture.spec.js，向上两级就是仓库根。换目录跑
+// `node --test` 时 process.cwd() 可能不是仓库根，readdir 会读错目录甚至失败。
+const HERE = dirname(fileURLToPath(import.meta.url))
+const SRC = join(HERE, '..', '..', 'src')
 
 test('架构守卫：插件代码不得写宿主的 storages/ 目录', async () => {
+  // readdir 失败必须抛错，不能静默吞掉让 offenders 为空——守卫自己挂了还显示
+  // 绿灯是"守卫讽刺性地失效"的最坏情况。
   const names = await readdir(SRC, { recursive: true })
 
   const offenders: string[] = []

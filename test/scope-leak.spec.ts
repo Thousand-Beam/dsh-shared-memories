@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { Journal } from '../src/shared/journal.js'
 import { TemporalTree } from '../src/host/memory/timetree.js'
 import { ScopedQuery } from '../src/host/memory/scoped-query.js'
-import { ScopeViolation, type Scope } from '../src/shared/scope.js'
+import { ScopeViolation, isSafeScopeToken, type Scope } from '../src/shared/scope.js'
 import { hasCode, openTestDb, tamperRows, tempRoot } from './helpers/db.js'
 
 const NOW = 1_700_000_000_000
@@ -155,4 +155,22 @@ test('历史读取：跨工作区读 entity 历史必须抛错，不能返回空
   const history = own.history(h.entityId)
   assert.equal(history.length, 1)
   assert.equal(history[0]?.text, 'Python 项目的测试用 pytest 跑')
+})
+
+test('isSafeScopeToken：拒绝路径穿越与非法字符', () => {
+  // 合法：会话/人格 id（uuid，或带 session- 前缀）。
+  assert.equal(isSafeScopeToken('session-2b81896b-f1fb-4fdf-a5e5-ade2c7593654'), true)
+  assert.equal(isSafeScopeToken('312561a2-1234-5678-9abc-def012345678'), true)
+  assert.equal(isSafeScopeToken('default'), true)
+  assert.equal(isSafeScopeToken('agent_fish'), true)
+
+  // 非法：路径穿越、目录分隔符、空白、控制字符、超长、空串。
+  assert.equal(isSafeScopeToken('../etc/passwd'), false, '../ 必须拒绝')
+  assert.equal(isSafeScopeToken('..'), false, '.. 必须拒绝')
+  assert.equal(isSafeScopeToken('a/b'), false, '/ 必须拒绝')
+  assert.equal(isSafeScopeToken('a\\b'), false, '\\ 必须拒绝')
+  assert.equal(isSafeScopeToken('a b'), false, '空格必须拒绝')
+  assert.equal(isSafeScopeToken('a\tb'), false, '制表符必须拒绝')
+  assert.equal(isSafeScopeToken(''), false, '空串必须拒绝')
+  assert.equal(isSafeScopeToken('x'.repeat(129)), false, '超长（>128）必须拒绝')
 })

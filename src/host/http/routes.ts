@@ -16,6 +16,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { SqlDriver } from '../../shared/types.js'
+import { isSafeScopeToken } from '../../shared/scope.js'
 import type { GlobalToken, Scope } from '../../shared/scope.js'
 import type { Config as SharedConfig } from '../../config.js'
 import type { RestoreBarrier } from '../snapshot/barrier.js'
@@ -147,7 +148,7 @@ export interface MemoriesApiDeps {
   /** 按 jobId 查进度；`sessionId` 用于查"该会话最近一次任务"。 */
   distillJob?(input: { jobId?: string; sessionId?: string }): DistillJobView | undefined
   /** 彻底销毁（库 + journal 物理抹除）。 */
-  purge?(input: { agentId: string }): Promise<PurgeResult>
+  purge?(input: { agentId: string; sessionId?: string }): Promise<PurgeResult>
   /** 读会话全文（提炼用），拿不到返回空数组。 */
   sessionTurns?(sessionId: string): Promise<ChatTurn[]>
 }
@@ -314,8 +315,16 @@ async function dispatch(
       if (!purge) throw new ApiError('purge-unavailable', '销毁服务尚未就绪', 503)
       if (body.confirm !== true) throw new ApiError('confirm-required', '销毁不可撤销，需要 confirm=true')
       deps.barrier.assertWritable('purge')
+      // 会话 id / 人格 id 都会拼进 persona/<id>.json 等文件路径，先过 scope 令牌校验，
+      // 拒绝 `../` 之类的路径穿越字符，不让 HTTP 参数变成删到数据目录之外的文件。
+      if (!isSafeScopeToken(agentId)) {
+        throw new ApiError('invalid-agent-id', '会话 id 含非法字符，拒绝执行', 400)
+      }
       const personaId = resolvePersonaIdOf(deps, agentId)
-      const result = await purge({ agentId: personaId })
+      if (!isSafeScopeToken(personaId)) {
+        throw new ApiError('invalid-persona-id', '人格 id 含非法字符，拒绝执行', 400)
+      }
+      const result = await purge({ agentId: personaId, sessionId: agentId })
       // 会话本体的清理由 purge 内部完成（dropHostSessionTraces 只删会话日志）。
       // 不在这里额外删投影缓存 / workspace.json：那两样是宿主持有状态，插件直接改磁盘
       // 会跟宿主内存态打架，正是 v0.3.4 修的「未分组 + 未命名」幽灵 bug。

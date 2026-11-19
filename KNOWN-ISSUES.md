@@ -5,8 +5,8 @@
 
 ## 1. 跨设备时钟偏移导致 purge 复活（已修复：Lamport 逻辑时钟）
 - 位置：`src/shared/journal.ts`（`JournalRecord.lc` 字段 + `readMerged()` 排序键）、`src/host/snapshot/restore.ts`（agent.purge 墓碑重放）。
-- 修复：每条 journal 记录带单调递增的 `lc`（Lamport 逻辑时钟）；`Journal.open()` 恢复本设备 seq 后遍历所有设备最后一条记录对齐最大 lc 水位；`readMerged()` 排序键改为 `(lc, at, device, seq)`，旧记录（lc 缺失）回退用 0 + 墙钟。跨设备时墓碑的 lc 必然小于其后写的事件，墓碑先重放，杜绝复活。
-- 验证：`test/journal.spec.ts` 新增「Lamport 墓碑：跨设备墙钟漂移时墓碑仍先于复活记录」测试。
+- 修复：每条 journal 记录带单调递增的 `lc`（Lamport 逻辑时钟）；`Journal.open()` 恢复本设备 seq 后遍历所有设备最后一条记录对齐最大 lc 水位；`readMerged()` 排序键改为 `(lc, at, device, seq)`，旧记录（lc 缺失）回退用 0 + 墙钟。purge 墓碑本身也带 `lc`（`appendTombstone` 在改写 journal 前先扫全 journal 最大 lc，墓碑取 max+1）；`Journal.realignClock()` 让 pull 到远端后重新对齐水位。墓碑 lc 压过所有已落盘记录，replay 时墓碑最后执行、把之前重放出的 agent 记录删掉，杜绝复活。
+- 验证：`test/journal.spec.ts`「Lamport 墓碑：跨设备墙钟漂移时墓碑仍先于复活记录」+「realignClock：pull 到远端后重新对齐 Lamport 水位」；`test/purge.spec.ts` 墓碑测试断言墓碑 lc 压过现有记录。
 
 ## 2. 冷启动 journal 全量重放随规模线性变慢（评估：暂缓，需状态快照层）
 - 位置：`src/host/snapshot/restore.ts`（verifyAndReplay 全量 `readMerged()` + `ReplayApplier.apply` 重放到本机 memory.db）。
@@ -21,10 +21,11 @@
 - 影响：产生一个 valid_from == valid_until 的零长版本，查询语义仍正确（新版本从该时刻起生效），只是历史里多一条空区间。
 - 不修原因：实测把 `at >= valid_from` 改成 `at > valid_from` 无法根治（会落入分支 C，仍 truncate 到零长），需更大重构，风险大于收益。
 
-## 4. readAgentId / readSessionId 未做 SCOPE_TOKEN 校验（评估：已有双重防线，不加）
+## 4. readAgentId / readSessionId 未做 SCOPE_TOKEN 校验（已修复：purge 入口 + persona 文件删除加校验）
 - 位置：`src/index.ts`（readAgentId / readSessionId）。
-- 说明：这两个函数只负责从事件负载里「挖」id，不做格式校验。但 id 进入的所有敏感路径已有防护：SQL 全部参数化、文件删除路径在 `src/host/memory/purge.ts` 的 `dropSessionLogs` 用 `bareSessionId()` 归一化后**完全相等**匹配（绝不做前缀/模糊匹配，杜绝路径穿越）、作用域构造在 `src/shared/scope.ts` 有 SCOPE_TOKEN 校验。
-- 不修原因：再加一层是「防御纵深」的第三道，边际收益低，且可能误伤未来合法的 id 形态。
+- 说明：这两个函数只负责从事件负载里「挖」id，不做格式校验。但 id 进入的敏感路径已加防护：SQL 全部参数化、文件删除路径在 `src/host/memory/purge.ts` 的 `dropSessionLogs` 用 `bareSessionId()` 归一化后**完全相等**匹配（绝不做前缀/模糊匹配，杜绝路径穿越）、作用域构造在 `src/shared/scope.ts` 有 SCOPE_TOKEN 校验。
+- 修复（v0.3.6）：`src/shared/scope.ts` 新增 `isSafeScopeToken()`；`src/host/http/routes.ts` 的 `/purge` 入口对 agentId/personaId 都过 `isSafeScopeToken`（非法即 400 拒绝执行）；`src/host/memory/purge.ts` 的 `scrubDerivedState` 在删 `persona/<agentId>.json` 前也过 `isSafeScopeToken`。`test/scope-leak.spec.ts` 新增「isSafeScopeToken：拒绝路径穿越与非法字符」测试。
+- 剩余：readAgentId/readSessionId 本身仍不做校验（它们只是「挖 id」，不进入路径拼接），真正的路径拼接点在 purge/scrub 已全覆盖。
 
 ## 5. schema 参数 host 校验缺失（评估：需宿主配合，暂缓）
 - 说明：部分工具入参的 `host` 字段未做宿主级来源校验。
@@ -32,8 +33,8 @@
 
 ## 6. snapshot capture 与 commit 之间的写闸门（已修复）
 - 位置：`src/shared/journal.ts`（`withGate()`）、`src/index.ts`（snapshotNow）。
-- 修复：给 Journal 加 `withGate(fn)`，快照流程先 `journal.flush()` 再在闸门内执行 capture+commit，闸门期间 `#appendOne` 挂起。杜绝 manifest 记录的 sha256 与 `git add -A` 提交内容脱节（P0-3）。
-- 验证：`test/journal.spec.ts` 新增「写闸门：withGate 执行期间 append 挂起，释放后按顺序落盘」测试。
+- 修复：给 Journal 加 `withGate(fn)`，快照流程先 `journal.flush()` 再在闸门内执行 capture+commit，闸门期间 `#appendOne` 挂起。杜绝 manifest 记录的 sha256 与 `git add -A` 提交内容脱节（P0-3）。v0.3.6 补：`withGate` 加 `#mutex` 互斥锁 + 嵌套调用直接抛错（防死锁）；purge 处理器也走 `journal.flush()` + `journal.withGate()`，让「purge 改 journal」与「快照 capture」互斥。
+- 验证：`test/journal.spec.ts`「写闸门：withGate 执行期间 append 挂起，释放后按顺序落盘」+「withGate：嵌套调用直接抛错，防止死锁」。
 
 ## 7. 「彻底销毁」不重写 Git 历史（已知边界，插件不做）
 - 位置：`src/host/memory/purge.ts`（purgeAgent 全程无 git 调用）。
@@ -45,3 +46,21 @@
 - 说明：让一条会话「消失」当前分散在多个宿主机制上——前端 archiveSession 归档（内存态）、删会话日志（重启后 header 索引扫不到）、journal 墓碑（replay 时清记忆）。插件没有宿主级 `deleteSession` API 可调用，只能「停止直接改共享状态 + 依赖宿主原生机制」，这正是幽灵 bug 的根因（插件曾绕过所有者直接改 storages/）。
 - 已收敛：v0.3.4 起 purge 不再删投影缓存与 workspace 记账（`dropProjectionCache`/`pruneWorkspaceRegistry` 已删，连带删除了整个 `session-artifacts.ts` 与 routes 里的 `removeSession` 路径）；`test/architecture.spec.ts` 焊死「插件代码不得写 storages/」。
 - 剩余风险：宿主仍在 rc 阶段、header 索引等内部实现未来可能变动，届时「靠删日志让索引扫不到」可能再次失效。根治需宿主提供 `deleteSession` 级 API，插件只调用不伸手。
+
+## 9. agent/disposed 关机快照 fire-and-forget（评估：暂缓，本地 commit 已同步）
+- 位置：`src/index.ts`（agent/disposed 处理器 `void snapshotNow('shutdown')`）。
+- 说明：关机快照是 `void` 触发，事件处理器立即返回，不 await 快照完成。但 `snapshotNow` 内部先 `journal.flush()`（把队列清空落盘）再 `withGate` 内 capture+commit，本地 git commit 是同步的；`fire-and-forget` 丢的只有最后一步 `push`（网络），下次开机/定时同步会补 push。
+- 影响：关机瞬间若进程被强杀，可能少一次「关机快照」的 push，但记忆数据本身已 append 落盘、本地 commit 已完成，不丢记忆。
+- 不修原因：宿主在 agent/disposed 后不保证给插件 await 的机会；强行阻塞事件处理器可能拖住宿主退出。已由「append 同步落盘 + 本地 commit」兜底。
+
+## 10. 快照 sha256 校验可能误伤正常写入（评估：暂缓，需查证触发路径）
+- 位置：`src/host/snapshot/restore.ts`（verifySnapshotHashes）。
+- 说明：快照 manifest 记录的 sha256 是 capture 时刻的文件内容；若 journal 在快照后正常 append 变长（append-only 允许，`allowedToGrow` 只对 `journal/` 前缀放行），sha256 会不一致。当前实现只对非 journal 文件做严格比对，journal 走「允许增长」路径。
+- 影响：理论上 memory.db 等非 journal 文件若在快照后被正常写入，会被误判「快照损坏」而降级；但 memory.db 不进快照清单（`#collectFiles` 跳过 `.db`），persona/state 等文件在快照后不写，实际触发面极窄。
+- 不修原因：需要完整复现「快照后、校验前有合法非 journal 写入」的路径才能对症下药，当前未观测到，暂记。
+
+## 11. HTTP 面无 CSRF / Origin 防御（评估：暂缓，宿主 webServer 层职责）
+- 位置：`src/host/http/routes.ts`（token-write policy）。
+- 说明：插件 HTTP 路由靠 `barrier.assertWritable`（token 校验）授权，但没有校验请求的 Origin/Referer。恶意网页若拿到 token 或能触发浏览器自动带凭据的请求，可能跨站调用 purge 等写接口。
+- 影响：本插件路由挂在宿主 webServer 下，浏览器同源策略 + 宿主 CORS/鉴权是第一道防线；插件再加 Origin 校验可能误伤宿主不同端口/Electron 场景。
+- 不修原因：这是宿主 webServer 层的通用职责（同源/CORS），插件层重复实现易误伤，且需要宿主提供可信来源标识后才能正确判断。

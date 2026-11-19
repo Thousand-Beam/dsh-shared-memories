@@ -31,6 +31,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 
+import { isSafeScopeToken } from '../../shared/scope.js'
 import type { SqlDriver } from '../../shared/types.js'
 
 export interface PurgeResult {
@@ -63,6 +64,12 @@ export interface PurgeOptions {
   readonly root: string
   readonly workspaceId: string
   readonly agentId: string
+  /**
+   * 原始会话 id（前端传的 sessionId）。删库/写墓碑按 `agentId`（人格 id），
+   * 但删宿主会话日志按这个 id 匹配目录名——继承型会话里目录名是 sessionId，
+   * 不是人格 id，按人格 id 匹配会落空（`sessionFiles = 0`，行重启后仍在）。
+   */
+  readonly sessionId?: string
   readonly clock?: () => number
   readonly onWarn?: (message: string) => void
   /**
@@ -96,6 +103,7 @@ export class PurgeError extends Error {
 
 interface JournalRecordShape {
   readonly seq?: number
+  readonly lc?: number
   readonly op?: string
   readonly workspaceId?: string
   readonly agentId?: string
@@ -283,6 +291,7 @@ export async function purgeAgent(options: PurgeOptions): Promise<PurgeResult> {
       sessionFiles = await dropHostSessionTraces({
         hostRoot: options.hostRoot,
         agentId,
+        sessionId: options.sessionId,
         warn,
         failures,
       })
@@ -343,6 +352,8 @@ interface DropSessionOptions {
   /** 回收区目录：放在 sessions/ 之外，宿主扫 header 不会把它当会话目录。 */
   readonly trashDir: string
   readonly agentId: string
+  /** 原始会话 id（前端传的 sessionId）。继承型会话的目录名是这个，不是人格 id。 */
+  readonly sessionId?: string
   readonly warn: (message: string) => void
   readonly failures: string[]
 }
@@ -353,10 +364,14 @@ interface DropSessionOptions {
  * 只按"归一化后完全相等"匹配，绝不做前缀/模糊匹配 —— 这条路径上乱删一个目录
  * 就是用户的一整段对话没了。删除走"先 rename 到 .purge-trash 再 rm"：
  * rename 是原子的，行会立刻从下一次扫描里消失；rename 撞上占用才退化成直接删。
+ *
+ * `sessionId` 是前端传的会话目录名，`agentId` 是解出来的人格 id——继承型会话里
+ * 两者不同（目录叫 `session-8cc2…`，人格叫 `lead`），按人格 id 匹配不到任何目录，
+ * 会让「重启后行消失」落空。所以这里优先用 sessionId，缺省才回退 agentId。
  */
 async function dropSessionLogs(options: DropSessionOptions): Promise<number> {
-  const { sessionStoreRoot, trashDir, agentId, warn, failures } = options
-  const target = bareSessionId(agentId)
+  const { sessionStoreRoot, trashDir, agentId, sessionId, warn, failures } = options
+  const target = bareSessionId(sessionId ?? agentId)
   if (target === '') return 0
 
   let slugs: string[]
@@ -404,6 +419,8 @@ const TRASH_DIR = '.purge-trash'
 interface HostTraceOptions {
   readonly hostRoot: string
   readonly agentId: string
+  /** 原始会话 id（前端传的 sessionId），会话目录名按它匹配，不按人格 id。 */
+  readonly sessionId?: string
   readonly warn: (message: string) => void
   readonly failures: string[]
 }
@@ -425,14 +442,43 @@ interface HostTraceOptions {
  * 校验时日志还在，不会被「会话不存在」拒绝。
  */
 async function dropHostSessionTraces(options: HostTraceOptions): Promise<number> {
+  const trashDir = join(options.hostRoot, TRASH_DIR)
+  // 上次运行的 residue 可能留在回收区里（rename 成功、rm 失败），重跑 purge 时
+  // 目标已移出 sessions/、dropSessionLogs 扫描不到，这些完整副本会永久残留。
+  // 所以每次入口先清扫回收区，把上次没删干净的东西删掉。
+  await sweepTrash(trashDir, options.warn)
   return dropSessionLogs({
     sessionStoreRoot: join(options.hostRoot, 'sessions'),
     // 回收区放在 sessions/ 之外：宿主扫 header 时不会把 .purge-trash 当会话目录。
-    trashDir: join(options.hostRoot, TRASH_DIR),
+    trashDir,
     agentId: options.agentId,
+    sessionId: options.sessionId,
     warn: options.warn,
     failures: options.failures,
   })
+}
+
+/**
+ * 清空回收区目录。上次 `discardIn` 的 residue（rename 成功、rm 失败）会留下
+ * 完整会话日志副本，重跑 purge 时它已不在 sessions/ 下、扫描不到，必须在这里
+ * 主动清掉，否则「彻底销毁」会永久留一份可恢复的副本。
+ */
+async function sweepTrash(trashDir: string, warn: (message: string) => void): Promise<void> {
+  let entries
+  try {
+    entries = await readdir(trashDir, { withFileTypes: true })
+  } catch (cause) {
+    // 回收区不存在是正常情况（从未产生 residue）。
+    if (codeOf(cause) !== 'ENOENT') warn(`清扫回收区失败：${messageOf(cause)}`)
+    return
+  }
+  for (const entry of entries) {
+    try {
+      await rm(join(trashDir, entry.name), { recursive: true, force: true, maxRetries: 3 })
+    } catch (cause) {
+      warn(`清扫回收区残留失败：${entry.name}：${messageOf(cause)}`)
+    }
+  }
 }
 
 /**
@@ -568,17 +614,21 @@ async function purgeJournal(options: PurgeJournalOptions): Promise<{ files: numb
 
   // 归属判定必须带工作区：personaId / agentId 都不是全局唯一，而是按 workspace 隔离的
   // （persona.bind 用 personaId，entity.upsert 用 agentId）。只按 `personaId === agentId`
-  // 会把另一个 workspace 里同名人格的绑定记录也误删。entityId 本身是全局唯一（ULID），
-  // 加 workspace 守卫是防御纵深；version.open/close 不带 workspaceId（undefined），
-  // 放行它才能让 entityId 归属继续生效。
-  const sameWorkspace = (record: JournalRecordShape): boolean =>
-    record.workspaceId === undefined || record.workspaceId === workspaceId
-
+  // 会把另一个 workspace 里同名人格的绑定记录也误删。
+  //
+  // 三条分支对 workspaceId 的处理不同：
+  // - entity 分支：entityId 是 ULID 全局唯一，且 entityIds 集合在删库前由
+  //   `SELECT ... WHERE workspace_id AND agent_id` 播种，天然带 workspace 归属，
+  //   不需要再查 workspaceId（version.open/close 只带 entityId、不带 workspaceId）。
+  // - agent / persona 分支：必须显式 `workspaceId === workspaceId` 匹配。对
+  //   `workspaceId === undefined` 默认放行是危险的——一条只带 agentId 没带
+  //   workspaceId 的记录无法证明属于本工作区，物理销毁时会无差别剔除。
   const matches = (record: JournalRecordShape): boolean => {
-    const mineByAgent = record.agentId === agentId && sameWorkspace(record)
-    const mineByEntity = typeof record.entityId === 'string' && entityIds.has(record.entityId) && sameWorkspace(record)
+    const explicitWs = record.workspaceId === workspaceId
+    const mineByAgent = record.agentId === agentId && explicitWs
+    const mineByEntity = typeof record.entityId === 'string' && entityIds.has(record.entityId)
     // persona.bind 记录带的是 personaId：不按它过滤，销毁后绑定还在，会话照样"继承"这个人。
-    const mineByPersona = record.personaId === agentId && sameWorkspace(record)
+    const mineByPersona = record.personaId === agentId && explicitWs
     return mineByAgent || mineByEntity || mineByPersona
   }
 
@@ -608,10 +658,10 @@ async function purgeJournal(options: PurgeJournalOptions): Promise<{ files: numb
         }
         const eid = typeof record.entityId === 'string' ? record.entityId : undefined
         if (eid === undefined) continue
-        // 归属条件：记录本身属于本 agent（entity.upsert 等带 agentId），
+        // 归属条件：记录本身属于本 agent（entity.upsert 等带 agentId 且 workspaceId 显式匹配），
         // 或记录的 entityId 已经在本 agent 名下（version.* 引用它）。
-        // agentId 可能跨 workspace 重复（如 persona id），必须带 sameWorkspace。
-        const mine = (record.agentId === agentId && sameWorkspace(record)) || entityIds.has(eid)
+        // agentId 可能跨 workspace 重复（如 persona id），必须显式 workspaceId 匹配。
+        const mine = (record.agentId === agentId && record.workspaceId === workspaceId) || entityIds.has(eid)
         if (mine && !entityIds.has(eid)) {
           entityIds.add(eid)
           grew = true
@@ -619,6 +669,11 @@ async function purgeJournal(options: PurgeJournalOptions): Promise<{ files: numb
       }
     }
   }
+
+  // 在改写文件前扫描全 journal 最大 lc：改写会删掉本 agent 的记录，改写后再扫
+  // 会漏掉它们的 lc，导致墓碑 lc 偏低（单设备时退化成 1，跨设备 replay 时其他
+  // 设备的 upsert 仍可能排在墓碑后把 agent 复活）。
+  const maxLc = await scanJournalMaxLc(devicesDir)
 
   let rewritten = 0
   let records = 0
@@ -660,8 +715,46 @@ async function purgeJournal(options: PurgeJournalOptions): Promise<{ files: numb
     records += removed
   }
 
-  const tombstone = await appendTombstone({ root, workspaceId, agentId, at: options.at })
+  const tombstone = await appendTombstone({ root, workspaceId, agentId, at: options.at, baseLc: maxLc })
   return { files: rewritten + (tombstone ? 1 : 0), records, tombstone }
+}
+
+/** 扫描所有设备的 journal，取最大 Lamport 逻辑时钟（无记录返回 0）。 */
+async function scanJournalMaxLc(devicesDir: string): Promise<number> {
+  let maxLc = 0
+  let devices: string[]
+  try {
+    devices = await readdir(devicesDir)
+  } catch {
+    return 0
+  }
+  for (const device of devices) {
+    const dir = join(devicesDir, device)
+    let names: string[]
+    try {
+      names = (await readdir(dir)).filter((name) => name.endsWith('.jsonl'))
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      let raw: string
+      try {
+        raw = await readFile(join(dir, name), 'utf8')
+      } catch {
+        continue
+      }
+      for (const line of raw.split('\n')) {
+        if (line.trim() === '') continue
+        try {
+          const record = JSON.parse(line) as JournalRecordShape
+          if (typeof record.lc === 'number' && record.lc > maxLc) maxLc = record.lc
+        } catch {
+          continue
+        }
+      }
+    }
+  }
+  return maxLc
 }
 
 /** 追加墓碑。失败返回 false（不抛），由调用方决定是否重试。 */
@@ -670,14 +763,23 @@ async function appendTombstone(options: {
   workspaceId: string
   agentId: string
   at: number
+  /** 已知的 journal 最大 lc（由调用方在改写文件前扫描），墓碑取它 +1。 */
+  baseLc?: number
 }): Promise<boolean> {
   const { root, workspaceId, agentId, at } = options
   const devicesDir = join(root, 'journal', 'devices')
   const today = new Date(at).toISOString().slice(0, 10)
   const dir = join(devicesDir, 'purge')
   const file = join(dir, `${today}.jsonl`)
+  // Lamport 逻辑时钟：墓碑必须排在所有现有记录之后，否则跨设备 replay 时
+  // 其他设备的 upsert（lc 更大）会排在墓碑（lc=0）后面，把已销毁的 Agent 复活。
+  // 这里取全 journal 最大 lc + 1，让墓碑在因果序里压过所有已落盘的记录。
+  // baseLc 由 purgeJournal 在改写前扫描传入——改写会删掉本 agent 的记录，
+  // 若改写后再扫会漏掉它们的 lc，单设备时墓碑退化成 lc=1。
+  const lc = (options.baseLc ?? (await scanJournalMaxLc(devicesDir))) + 1
   const tombstone = JSON.stringify({
     v: 1,
+    lc,
     seq: 0,
     op: 'agent.purge',
     workspaceId,
@@ -719,12 +821,19 @@ async function scrubDerivedState(options: {
 }): Promise<void> {
   const { root, workspaceId, agentId, warn, failures } = options
 
-  const personaFile = join(root, 'persona', `${agentId}.json`)
-  try {
-    await rm(personaFile, { force: true })
-  } catch (cause) {
-    failures.push(`删人格文件失败：${messageOf(cause)}`)
-    warn(`删人格文件失败 ${personaFile}：${messageOf(cause)}`)
+  // persona 文件路径由 agentId 拼成，必须先过 scope 令牌校验——`../` 之类的
+  // 穿越字符会把 `persona/<agentId>.json` 变成删到 persona/ 之外的文件。
+  if (!isSafeScopeToken(agentId)) {
+    failures.push(`agentId 含非法字符，跳过人格文件删除：${agentId}`)
+    warn(`agentId 含非法字符，跳过人格文件删除：${agentId}`)
+  } else {
+    const personaFile = join(root, 'persona', `${agentId}.json`)
+    try {
+      await rm(personaFile, { force: true })
+    } catch (cause) {
+      failures.push(`删人格文件失败：${messageOf(cause)}`)
+      warn(`删人格文件失败 ${personaFile}：${messageOf(cause)}`)
+    }
   }
 
   const identityFile = join(root, 'state', 'persona-identity.json')
