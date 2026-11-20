@@ -190,17 +190,31 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * 归档落库之后再推一把界面：侧栏的数据源在宿主手里，
- * 我们能做的是让它把这条会话的投影重新算一遍（人格 / 标题 / 会话头都在这层）。
- * 失败无所谓——归档本身已经持久化，下次刷新自然不会再有那一行。
+ * 归档落库之后再推一把界面。
+ *
+ * 关键：不要用 refreshProjections——标题投影是从会话日志算出来的，日志刚被
+ * purge 删掉，refreshProjections 只会把标题重算成「未命名」，反而制造残骸。
+ *
+ * 正确的动作是 refresh() 全量刷新列表：它走到宿主 session.list → listSessions，
+ * 实时重扫磁盘 header；日志没了，这一行就从列表里消失（活跃会话靠归档隐藏）。
+ * 失败无所谓——归档本身已持久化，下次刷新自然不会有那一行。
  */
 async function resyncAfterPurge(ctx: ClientContext, sessionId: string): Promise<void> {
   const sessions = ctx.get?.('sessions') as
-    | { refreshProjections?: (id: string) => Promise<void> }
+    | { refresh?: () => Promise<void>; refreshProjections?: (id: string) => Promise<void> }
     | undefined
   if (sessions === undefined || sessions === null) return
-  if (typeof sessions.refreshProjections !== 'function') return
-  await sessions.refreshProjections(sessionId)
+  if (typeof sessions.refresh === 'function') {
+    try {
+      await sessions.refresh()
+      return
+    } catch {
+      // 全量刷新失败再退到投影刷新（虽然大概率「未命名」，但至少触发一次重算）。
+    }
+  }
+  if (typeof sessions.refreshProjections === 'function') {
+    await sessions.refreshProjections(sessionId)
+  }
 }
 
 /* ── 新建会话拦截（两层） ──────────────────────────────────────────────── */
