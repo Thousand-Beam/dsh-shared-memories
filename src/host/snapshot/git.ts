@@ -127,8 +127,16 @@ export function backoffDelay(attempt: number, baseMs = 500, capMs = 30_000): num
 /** 可注入的 sleep，测试里替换成零延迟。 */
 export type SleepFn = (ms: number) => Promise<void>
 
+/**
+ * 注意：**不要 unref**。
+ *
+ * 退避重试是"正在进行的活"，不是可丢弃的后台通知。unref 之后，等待期间事件循环
+ * 可以被判定为空：进程会提前退出（CLI 里丢掉真正错误），`node:test` 更会直接报
+ * 「Promise resolution is still pending but the event loop has already resolved」
+ * 并取消测试——真机 CI 上 push 第一次失败就必然踩中这一条，表现成"测试被取消"
+ * 而不是"push 失败"，把真正的原因彻底埋掉。
+ */
 export const defaultSleep: SleepFn = (ms) =>
   new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    if (typeof timer === 'object' && 'unref' in timer) timer.unref()
+    setTimeout(resolve, ms)
   })

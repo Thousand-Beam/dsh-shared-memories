@@ -29,7 +29,7 @@ import { TemporalTree } from '../src/host/memory/timetree.js'
 import { RestoreBarrier } from '../src/host/snapshot/barrier.js'
 import { SnapshotEngine, SnapshotError } from '../src/host/snapshot/engine.js'
 import { ExecGitRunner } from '../src/host/snapshot/git.js'
-import type { SnapshotManifest } from '../src/host/snapshot/manifest.js'
+import { snapshotIdOf, type SnapshotManifest } from '../src/host/snapshot/manifest.js'
 import { RestoreEngine } from '../src/host/snapshot/restore.js'
 import { purgeAgent } from '../src/host/memory/purge.js'
 import { openTestDb, tempRoot } from './helpers/db.js'
@@ -113,6 +113,10 @@ async function bootDeviceA(t: TestContext, bare: string): Promise<DeviceA | unde
     remote: bare,
     branch: 'main',
     clock: () => NOW,
+    // 测试里不要真等退避：git.ts 的注释就要求"测试里替换成零延迟"。
+    // 真等待会让 push 首次失败时把测试时间拖到秒级，CI 上更会因事件循环短暂
+    // 变空被 node:test 判为挂起而取消。
+    sleep: async () => {},
     // 多智能体：两个 Agent 的人格与会话指针都要进快照。
     collectState: () => ({
       agents: [
@@ -264,6 +268,7 @@ test('repo.path 指向陌生 git 仓库 → 拒绝快照（repo-hijack）', asyn
     remote: dsmRemote,
     branch: 'main',
     clock: () => NOW,
+    sleep: async () => {},
     collectState: () => ({ agents: [] }),
   })
 
@@ -321,6 +326,7 @@ test('repo.path 嵌套在别的 Git 仓库的子目录 → 拒绝快照（toplev
     remote: dsmRemote,
     branch: 'main',
     clock: () => NOW,
+    sleep: async () => {},
     collectState: () => ({ agents: [] }),
   })
 
@@ -403,6 +409,9 @@ test('A 销毁 lead → push → B 冷启动：被销毁记忆与人格都不复
   await journal.flush()
 
   // collectState 读 db 的 persona_state（真实语义：purge 删掉行后，快照就不再带这个人格）。
+  // 引擎的告警必须收集起来：push 失败在 snapshot() 里会被降级成 pushed:false，
+  // 不冒泡就只剩"远端没数据"，断言信息看不出真正原因。
+  const warnings: string[] = []
   const engine = new SnapshotEngine({
     root,
     deviceId: DEVICE_A,
@@ -410,6 +419,8 @@ test('A 销毁 lead → push → B 冷启动：被销毁记忆与人格都不复
     remote: bare,
     branch: 'main',
     clock: () => NOW,
+    sleep: async () => {},
+    onWarn: (message) => warnings.push(message),
     collectState: () => ({
       agents: db
         .all<{ agent_id: string; name: string }>('SELECT agent_id, name FROM persona_state WHERE workspace_id = ?', [WORKSPACE])
@@ -418,14 +429,18 @@ test('A 销毁 lead → push → B 冷启动：被销毁记忆与人格都不复
   })
 
   // 第一次快照：lead + coder 完整漫游到远端。
-  await engine.snapshot('shutdown')
+  const firstSnapshot = await engine.snapshot('shutdown')
+  assert.equal(firstSnapshot.pushed, true, `销毁场景的首次快照必须推上远端；${warnings.join(' | ')}`)
 
   // A 销毁 lead（写墓碑 + 删库 + 删 persona 文件）。
   const purge = await purgeAgent({ db, root, workspaceId: WORKSPACE, agentId: 'lead', sessionId: 'lead', clock: () => NOW })
   assert.equal(purge.tombstone, true, '墓碑必须落盘，否则销毁不生效')
 
   // 第二次快照：collectState 读 db，lead 已删 → 快照不再带 persona/lead.json。
-  await engine.snapshot('shutdown')
+  // 固定时钟下两次快照同秒，id 必须被去重（否则 tag 被 -f 改写、push 被远端拒）。
+  const secondSnapshot = await engine.snapshot('shutdown')
+  assert.equal(secondSnapshot.pushed, true, `销毁后的第二次快照必须推上远端；${warnings.join(' | ')}`)
+  assert.notEqual(secondSnapshot.manifest.snapshotId, firstSnapshot.manifest.snapshotId, '同一秒内的两次快照必须拿到不同 snapshotId')
 
   // B 全新冷启动。
   const rootB = await tempRoot(t, 'device-b-purge-')
@@ -457,4 +472,47 @@ test('A 销毁 lead → push → B 冷启动：被销毁记忆与人格都不复
   // coder 不受影响。
   const coderPersona = dbB.all<{ agent_id: string }>('SELECT agent_id FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [WORKSPACE, 'coder'])
   assert.equal(coderPersona.length, 1, 'coder 人格不受 lead 销毁影响')
+})
+
+test('远端已有同名 snap tag（两台设备同一秒各拍一次）→ 分支照常推送，不算 push 失败', async (t) => {
+  const bare = await makeBareRemote(t)
+  const at = NOW
+  const clashTag = `snap/${snapshotIdOf(at)}`
+
+  // 模拟"另一台设备在同一秒先拍过一次"：远端已存在同名 tag，指向别的提交。
+  // git 不允许改写远端同名 tag，把 tag 和分支塞进同一条 push 会让整条命令失败。
+  const peer = await tempRoot(t, 'peer-device-')
+  await git(peer, ['init', '-b', 'main'])
+  await git(peer, ['config', 'user.email', 'peer@example.test'])
+  await git(peer, ['config', 'user.name', 'Peer'])
+  await writeFile(join(peer, 'peer.txt'), 'peer\n')
+  await git(peer, ['add', '-A'])
+  await git(peer, ['commit', '-m', 'peer snapshot'])
+  await git(peer, ['tag', '-a', clashTag, '-m', 'peer tag'])
+  await git(peer, ['remote', 'add', 'origin', bare])
+  // 推到另一条分支：本测试只关心"同名 tag 已存在"，不要让 main 分叉混淆结论。
+  await git(peer, ['push', 'origin', 'main:peer-main'])
+  await git(peer, ['push', 'origin', `refs/tags/${clashTag}`])
+
+  const root = await tempRoot(t, 'tag-clash-')
+  const warnings: string[] = []
+  const engine = new SnapshotEngine({
+    root,
+    deviceId: DEVICE_B,
+    git: new ExecGitRunner({ cwd: root }),
+    remote: bare,
+    branch: 'main',
+    clock: () => at,
+    sleep: async () => {},
+    onWarn: (message) => warnings.push(message),
+    collectState: () => ({ agents: [] }),
+  })
+
+  const result = await engine.snapshot('shutdown')
+  assert.equal(result.pushed, true, `tag 冲突不应让整次 push 失败；${warnings.join(' | ')}`)
+  assert.match(warnings.join('\n'), /tag 推送被拒/, 'tag 被拒必须留下告警，不能静默')
+
+  // 数据（分支）必须真的落到远端，否则"推成功"是假的。
+  const remoteLog = await git(bare, ['log', '--format=%s', 'main'])
+  assert.match(remoteLog, /snapshot\(shutdown\)/, '远端分支必须拿到本机提交')
 })

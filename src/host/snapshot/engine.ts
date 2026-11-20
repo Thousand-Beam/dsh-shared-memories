@@ -183,7 +183,7 @@ export class SnapshotEngine {
    */
   async capture(trigger: SnapshotTrigger): Promise<SnapshotManifest> {
     const at = this.#clock()
-    const snapshotId = snapshotIdOf(at)
+    const snapshotId = await this.#uniqueSnapshotId(at)
     const state = await this.#materializeState()
     const files = await this.#collectFiles(state)
 
@@ -257,22 +257,41 @@ export class SnapshotEngine {
     await this.#ensureRemote()
     let lastError: unknown
     for (let attempt = 0; attempt <= this.#retries; attempt++) {
-      const result = await this.#git.run(['push', '--tags', 'origin', this.#branch])
-      if (result.code === 0) return { pushed: true }
-      lastError = result.stderr.trim() || `exit ${result.code}`
-      // 远端有本地没有的提交（另一台设备先推过）：push 会被 rejected，重试多少次都一样。
-      // 只有一次机会 pull --rebase，把本地提交垫到远端之上再推；rebase 本身冲突则放弃，
-      // 交给冷启动的 restore 流程走 pull-conflict 分支让用户人工处理。
-      if (isPushDiverged(String(lastError)) && attempt === 0) {
-        const pulled = await this.#git.run(['pull', '--rebase', 'origin', this.#branch])
-        if (pulled.code === 0) continue
-        this.#onWarn(`push 分叉且 pull --rebase 失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`)
+      // 分支与 tag 分开推：
+      //   - 分支是数据本身，必须成功，失败按分叉/网络分别处理。
+      //   - tag 只是书签，且 git 不允许改写远端同名 tag。两台设备在同一秒各拍一次时
+      //     会产生同名 `snap/<id>`，把 tag 和分支塞进同一条 push 会让整条命令返回
+      //     非零（`! [rejected] ... (already exists)`），真机上表现为"push 失败 →
+      //     退避重试 → 秒级延迟"，CI 上更会叠加 unref 的 sleep 被判定测试挂起。
+      //     分支已经推上去就说明数据到了，tag 冲突告警即可，不算整体失败。
+      const branchPush = await this.#git.run(['push', 'origin', this.#branch])
+      if (branchPush.code !== 0) {
+        lastError = branchPush.stderr.trim() || `exit ${branchPush.code}`
+        // 远端有本地没有的提交（另一台设备先推过）：push 会被 rejected，重试多少次都一样。
+        // 只有一次机会 pull --rebase，把本地提交垫到远端之上再推；rebase 本身冲突则放弃，
+        // 交给冷启动的 restore 流程走 pull-conflict 分支让用户人工处理。
+        if (isPushDiverged(String(lastError)) && attempt === 0) {
+          // --autostash：push 之前 rotate() 已经删掉了旧快照目录（工作区因此变脏），
+          // 不加 autostash 时 rebase 会直接拒绝「You have unstaged changes」，
+          // 分叉就再也自愈不了，只能整次 push 失败降级。
+          const pulled = await this.#git.run(['pull', '--rebase', '--autostash', 'origin', this.#branch])
+          if (pulled.code === 0) continue
+          this.#onWarn(`push 分叉且 pull --rebase 失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`)
+        }
+        if (attempt < this.#retries) {
+          const delay = backoffDelay(attempt)
+          this.#onWarn(`push 失败（第 ${attempt + 1} 次）：${String(lastError)}；${delay}ms 后重试`)
+          await this.#sleep(delay)
+        }
+        continue
       }
-      if (attempt < this.#retries) {
-        const delay = backoffDelay(attempt)
-        this.#onWarn(`push 失败（第 ${attempt + 1} 次）：${String(lastError)}；${delay}ms 后重试`)
-        await this.#sleep(delay)
+
+      const tagPush = await this.#git.run(['push', '--tags', 'origin'])
+      if (tagPush.code !== 0) {
+        // 分支已在远端，漫游数据完整；tag 被拒只会少一个书签，不影响 restore。
+        this.#onWarn(`分支已推送，但 tag 推送被拒（不影响漫游）：${tagPush.stderr.trim() || `exit ${tagPush.code}`}`)
       }
+      return { pushed: true }
     }
     throw new SnapshotError('git-push-failed', `push 最终失败：${String(lastError)}`, lastError)
   }
@@ -799,6 +818,27 @@ export class SnapshotEngine {
       out[device] = max
     }
     return out
+  }
+
+  /**
+   * 生成不与已有快照重名的 id。
+   *
+   * `snapshotIdOf` 只精确到秒。同一秒内采集两次（固定时钟的测试、idle 与 shutdown
+   * 撞在同一秒、两台设备同一秒各拍一次）会得到同一个 id → 同一个 `snap/<id>` tag
+   * 被 `git tag -f` 改写 → `git push --tags` 因「远端已有该 tag 且指向别的提交」被
+   * 拒：分支其实推上去了，但 push 返回非零，触发退避重试；真机 CI 上再叠加
+   * unref 的 sleep，整条测试被判"挂起"直接取消。
+   * 重名时按 `-2`、`-3` 递增，字典序仍与时间序一致。
+   */
+  async #uniqueSnapshotId(at: number): Promise<string> {
+    const base = snapshotIdOf(at)
+    const taken = new Set(await this.#listSnapshotIds())
+    if (!taken.has(base)) return base
+    for (let n = 2; n < 1000; n++) {
+      const candidate = `${base}-${n}`
+      if (!taken.has(candidate)) return candidate
+    }
+    throw new SnapshotError('snapshot-id-exhausted', `同一秒内快照过多，无法为 ${base} 分配唯一 id`)
   }
 
   async #listSnapshotIds(): Promise<string[]> {
