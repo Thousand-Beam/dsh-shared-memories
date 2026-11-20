@@ -75,6 +75,7 @@ interface ReplayStats {
   skills: number
   userProfiles: number
   personaIdentities: number
+  personas: number
   purged: number
   deferred: number
   skipped: number
@@ -105,15 +106,46 @@ export class ReplayApplier {
       skills: 0,
       userProfiles: 0,
       personaIdentities: 0,
+      personas: 0,
       purged: 0,
       deferred: 0,
       skipped: 0,
     }
+    // v0.4 墓碑语义合并（销毁优先）：先扫一遍找所有 agent.purge，记每个
+    // (workspaceId, agentId) 的最大墓碑 lc。多设备并发写时，某台机器在销毁前已经
+    // 发出的 entity.upsert / persona.update 等，lc 可能大于墓碑，若按 (lc, at, device)
+    // 顺序重放，会把「已销毁」的 agent 又 INSERT 回来（评价一/三实测的并发复活）。
+    // 这里改成：针对某个 agent 的写事件，只要它的 lc 严格大于该 agent 墓碑的 lc，
+    // 就视为「销毁之后的残留」跳过——销毁优先，根治复活。
+    const tombstones = new Map<string, number>()
+    for (const record of records) {
+      if (record.op === 'agent.purge') {
+        const ws = str(record.workspaceId)
+        const aid = str(record.agentId)
+        if (ws !== undefined && aid !== undefined) {
+          const lc = num(record.lc) ?? 0
+          const key = `${ws}\u0000${aid}`
+          const cur = tombstones.get(key)
+          if (cur === undefined || lc > cur) tombstones.set(key, lc)
+        }
+      }
+    }
+    const tombstoned = (ws: string | undefined, aid: string | undefined, lc: number): boolean => {
+      if (ws === undefined || aid === undefined) return false
+      const tlc = tombstones.get(`${ws}\u0000${aid}`)
+      return tlc !== undefined && lc > tlc
+    }
+
     this.#db.transaction(() => {
       for (const record of records) {
         stats.records++
         switch (record.op) {
           case 'entity.upsert': {
+            // 墓碑优先：销毁之后残留的并发写跳过，否则已销毁 agent 复活（评价一/三）。
+            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             this.#upsertEntity(record)
             stats.entities++
             break
@@ -179,6 +211,10 @@ export class ReplayApplier {
             break
           }
           case 'quarantine.add': {
+            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             // 隔离条目必须跟着漫游：换台机器后，"这条被拦过"同样要可见。
             // 之前这里落到 default 只统计数量，结果 B 机隔离区凭空清空 ——
             // 拦截记录消失，比拦截本身失败更难排查。
@@ -214,6 +250,10 @@ export class ReplayApplier {
             break
           }
           case 'skill.bind': {
+            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             // 技能绑定必须跟着漫游：A 挂了 code-exec，B 开机就得有。
             // 只落 SQLite 不重放 = "换机后模型突然不会它本来会的事"，且无报错。
             const agentId = str(record.agentId)
@@ -247,6 +287,10 @@ export class ReplayApplier {
             break
           }
           case 'skill.unbind': {
+            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             const agentId = str(record.agentId)
             const workspaceId = str(record.workspaceId)
             const skillId = str(record.skillId)
@@ -262,6 +306,10 @@ export class ReplayApplier {
             break
           }
           case 'persona.bind': {
+            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             // 会话 → 人格 绑定：这一条掉了，新会话在恢复后的机器上又变成"新人格"，
             // 表现就是"人格与记忆都在，但新建会话读不到"。
             const identityAgent = str(record.agentId)
@@ -282,6 +330,41 @@ export class ReplayApplier {
               [identityAgent, workspaceId, personaId, at, at],
             )
             stats.personaIdentities++
+            break
+          }
+          case 'persona.update': {
+            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
+            // 人格内容（名字/年龄/特质/基线哈希）也必须 journal 化：否则两台设备
+            // 并发改人格时，state/persona-identity 快照文件 Last-Write-Wins，后快照的
+            // 覆盖先快照的，丢失更新。这里按 journal 因果顺序（lc 优先）重放，后写的
+            // 覆盖先写的，跨设备合并后两边的编辑都能按序收敛。
+            const agentId = str(record.agentId)
+            const workspaceId = str(record.workspaceId)
+            if (!agentId || !workspaceId) {
+              stats.skipped++
+              break
+            }
+            const at = num(record.at) ?? Date.now()
+            this.#run(
+              `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(agent_id, workspace_id) DO UPDATE SET
+                 name = excluded.name, age = excluded.age, traits = excluded.traits,
+                 baseline_hash = excluded.baseline_hash, updated_at = excluded.updated_at`,
+              [
+                agentId,
+                workspaceId,
+                str(record.name) ?? agentId,
+                num(record.age) ?? 10,
+                str(record.traits) ?? '{}',
+                str(record.baselineHash) ?? '',
+                at,
+              ],
+            )
+            stats.personas++
             break
           }
           case 'user_profile.set': {
@@ -470,6 +553,92 @@ export class ReplayApplier {
   }
 }
 
+/**
+ * 并发写冲突检测（v0.4 改造 4）。
+ *
+ * journal 是设备分片 append-only 的 CRDT，不同设备写不同文件天然无「写冲突」；真正的
+ * 「冲突」是同一语义目标（同一实体/人格/技能/工作区画像）被两个以上设备在重叠时间窗
+ * 内并发改成不同值——重放按 lc 收敛成 LWW，后写的静默覆盖先写的。
+ *
+ * 这里不阻止并发（无感换机以串行交接为主，加 leader election 代价过高），只把「并发
+ * 覆盖」检测出来提示用户，避免静默丢编辑。每设备只取最新一条（同设备连续写是正常追
+ * 加，不算并发）。
+ */
+export interface ConcurrentWrite {
+  target: string
+  kind: string
+  devices: string[]
+  windowMs: number
+}
+
+export function detectConcurrentWrites(
+  records: readonly JournalRecord[],
+  windowMs = 60_000,
+): ConcurrentWrite[] {
+  const targetKey = (record: JournalRecord): string | null => {
+    switch (record.op) {
+      case 'entity.upsert':
+      case 'version.open':
+      case 'version.close':
+      case 'version.emotion':
+      case 'memory.forget': {
+        const id = str(record.entityId)
+        return id ? `entity:${id}` : null
+      }
+      case 'persona.update':
+      case 'persona.bind': {
+        const id = str(record.agentId)
+        return id ? `agent:${id}` : null
+      }
+      case 'skill.bind':
+      case 'skill.unbind': {
+        const aid = str(record.agentId)
+        const sid = str(record.skillId)
+        return aid && sid ? `skill:${aid}:${sid}` : null
+      }
+      case 'user_profile.set': {
+        const ws = str(record.workspaceId)
+        return ws ? `workspace:${ws}` : null
+      }
+      default:
+        return null
+    }
+  }
+
+  const byTarget = new Map<string, Map<string, { at: number; device: string }>>()
+  for (const record of records) {
+    const key = targetKey(record)
+    if (!key) continue
+    const device = typeof record.device === 'string' ? record.device : 'unknown'
+    let perDevice = byTarget.get(key)
+    if (!perDevice) {
+      perDevice = new Map()
+      byTarget.set(key, perDevice)
+    }
+    const prev = perDevice.get(device)
+    if (!prev || record.at > prev.at) perDevice.set(device, { at: record.at, device })
+  }
+
+  const conflicts: ConcurrentWrite[] = []
+  for (const [target, perDevice] of byTarget) {
+    if (perDevice.size < 2) continue
+    const entries = [...perDevice.values()].sort((a, b) => a.at - b.at)
+    const first = entries[0]
+    const last = entries[entries.length - 1]
+    if (!first || !last) continue
+    const span = last.at - first.at
+    if (span <= windowMs) {
+      conflicts.push({
+        target,
+        kind: target.slice(0, target.indexOf(':')),
+        devices: entries.map((e) => e.device),
+        windowMs: span,
+      })
+    }
+  }
+  return conflicts
+}
+
 export class RestoreEngine {
   readonly #root: string
   readonly #db: SqlDriver
@@ -487,6 +656,8 @@ export class RestoreEngine {
   readonly #allowMissingSnapshot: boolean
 
   #lastOutcome: RestoreOutcome | undefined
+  /** 上次运行期同步的墙钟时间（并发冲突检测只看这之后的新记录，历史不重复告警）。 */
+  #lastSyncAt = 0
 
   constructor(options: RestoreEngineOptions) {
     this.#root = options.root
@@ -622,6 +793,55 @@ export class RestoreEngine {
 
     await this.#journal.open()
     return { snapshotId: verified.snapshotId, files: verified.files, records: stats.records }
+  }
+
+  /**
+   * 运行期后台同步：fetch + pull 远端新数据，然后幂等全量重放进本机 SQLite。
+   *
+   * 与冷启动 restoreOnBoot 的区别：这里**不**动 barrier（已经 ready），拉取失败也不
+   * 降级只读——只是这次没同步上，下个 interval 再试。重放用全量而不是 sinceSeq 增量，
+   * 因为墓碑语义（销毁优先）要求每次重放都能看到历史墓碑，否则「销毁前的并发写」会
+   * 在增量重放里把已销毁 agent 复活（评价一/三实测的并发墓碑复活）。
+   */
+  async syncFromRemote(): Promise<{ pulled: boolean; records: number; conflicts: number }> {
+    if (!this.#remote.trim()) return { pulled: false, records: 0, conflicts: 0 }
+    try {
+      await this.#pull()
+    } catch (error) {
+      // 运行期拉取失败不降级：本地照常工作，等下个 interval 再试。
+      if (error instanceof LocalOnlyFallback) return { pulled: false, records: 0, conflicts: 0 }
+      this.#onWarn(`运行期同步拉取失败（下个周期重试）：${describe(error)}`)
+      return { pulled: false, records: 0, conflicts: 0 }
+    }
+
+    // pull 成功后重放。readMerged 的 sinceSeq 是 checkpoint 水位语义，运行期没有
+    // checkpoint，且墓碑过滤需要全量历史可见，所以这里用全量重放（幂等，O(n) 但低频）。
+    const records = await this.#journal.readMerged()
+
+    // 并发冲突检测（改造 4）：只看本次 sync 之后的新记录，历史并发不重复告警。
+    const fresh = this.#lastSyncAt > 0 ? records.filter((r) => r.at >= this.#lastSyncAt) : records
+    const conflicts = detectConcurrentWrites(fresh)
+    for (const c of conflicts) {
+      this.#onWarn(
+        `检测到多设备并发写冲突：${c.target} 被 ${c.devices.join('、')} 在 ${c.windowMs}ms 内同时修改，已按时间收敛（后写覆盖先写，请人工核对）`,
+      )
+    }
+    this.#lastSyncAt = Date.now()
+
+    const applier = new ReplayApplier(this.#db)
+    const stats = applier.apply(records)
+
+    // 人格/技能/画像/身份也回灌一遍：别的设备可能在这段时间改过它们。
+    await rehydratePersonaFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    await rehydrateSkillsFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    await rehydrateUserProfilesFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    await rehydratePersonaIdentitiesFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    // 关键：pull 回远端记录后必须 realignClock 对齐 lc 水位（open() 在已加载时直接
+    // return，不会重对齐）。否则本设备接下来写的新事件 lc 低于远端，readMerged 排序时
+    // 被排到远端之前 → 跨设备乱序/复活。
+    await this.#journal.realignClock()
+
+    return { pulled: true, records: stats.records, conflicts: conflicts.length }
   }
 
   /** 用户点"重试"：从 degraded 拨回 pulling 再跑一遍。 */

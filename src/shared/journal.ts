@@ -45,6 +45,7 @@ export type JournalOp =
   | 'skill.unbind'
   | 'user_profile.set'
   | 'persona.bind'
+  | 'persona.update'
 
 /** 磁盘上的完整记录（含信封字段）。 */
 export interface JournalRecord {

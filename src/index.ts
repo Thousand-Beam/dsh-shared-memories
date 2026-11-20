@@ -335,10 +335,48 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     return runtime.snapshotInFlight
   }
 
+  let syncInFlight: Promise<void> | undefined
+
+  /**
+   * 运行期同步：先拉远端（fetch + pull + 增量重放），再推本地（快照）。
+   *
+   * v0.4 之前 interval 只做本地快照、从不拉远端，导致「运行期不主动 pull，同步发生
+   * 在重启」（评价三实测）。现在每个周期先拉后推，多设备在同一时间轴上前进。
+   * 拉取和快照都走 journal.withGate 串行 + 互斥：git pull 会改工作区文件，快照 capture
+   * 在读这些文件算 sha256，两者并发会算出与磁盘脱节的 manifest。
+   */
+  const syncThenSnapshot = (): Promise<void> => {
+    if (syncInFlight) return syncInFlight
+    const run = (async () => {
+      const restore = runtime.restore
+      const journal = runtime.journal
+      if (restore && journal && barrier.phase === 'ready') {
+        try {
+          const doSync = () => restore.syncFromRemote()
+          const result = await journal.withGate(doSync)
+          if (result.pulled && result.records > 0) {
+            host.logger?.info?.(
+              `[shared-memories] 运行期同步：拉取并重放 ${result.records} 条记录` +
+                (result.conflicts > 0 ? `，检测到 ${result.conflicts} 处并发写冲突` : ''),
+            )
+          }
+        } catch (cause) {
+          // 运行期同步失败不降级：本地照常工作，下个周期再试。
+          warn(`运行期同步异常（下次重试）：${cause instanceof Error ? cause.message : String(cause)}`)
+        }
+      }
+      await snapshotNow('interval')
+    })()
+    syncInFlight = run.finally(() => {
+      syncInFlight = undefined
+    })
+    return syncInFlight
+  }
+
   const startIntervalTimer = (): void => {
     if (intervalTimer) return
     intervalTimer = setInterval(() => {
-      void snapshotNow('interval')
+      void syncThenSnapshot()
     }, Math.max(30, runtime.intervalSec) * 1000)
     if (typeof intervalTimer === 'object' && 'unref' in intervalTimer) intervalTimer.unref()
   }
@@ -727,6 +765,49 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           scope,
           author: 'user',
         })
+      },
+      // 设置人格内容：先写 journal（真相），再写 persona_state（物化视图）。
+      // v0.4 之前 writePersona 直接写库不写 journal，人格靠 persona/*.json 快照回灌，
+      // 两台设备并发改人格会 Last-Write-Wins（评价三实测）。现在走 persona.update 事件，
+      // 跨设备按 lc 因果排序收敛，两边的编辑按序合并而不是互相覆盖。
+      setPersona: async (input) => {
+        const db = runtime.db
+        const journal = runtime.journal
+        if (!db || !journal) throw new Error('记忆库尚未就绪')
+        const agentId = runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default')
+        const now = Date.now()
+        // 先落 journal（跨设备真相），再写物化视图；即使物化写失败，下次重放也能重建。
+        await journal.append({
+          op: 'persona.update',
+          workspaceId,
+          agentId,
+          name: input.name,
+          age: input.age,
+          traits: JSON.stringify(input.traits),
+          baselineHash: input.baselineHash,
+        })
+        db.run(
+          `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(agent_id, workspace_id) DO UPDATE SET
+             name = excluded.name, age = excluded.age, traits = excluded.traits,
+             baseline_hash = excluded.baseline_hash, updated_at = excluded.updated_at`,
+          [agentId, workspaceId, input.name, input.age, JSON.stringify(input.traits), input.baselineHash, now],
+        )
+        db.run(
+          `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
+           VALUES (?,?,?,?,?,?)`,
+          [`aud_${now.toString(36)}`, workspaceId, agentId, 'persona.edit', JSON.stringify(input), now],
+        )
+        return {
+          agentId,
+          workspaceId,
+          name: input.name,
+          age: input.age,
+          traits: input.traits,
+          baselineHash: input.baselineHash,
+          updatedAt: now,
+        }
       },
     }
 

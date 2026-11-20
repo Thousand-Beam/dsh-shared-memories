@@ -137,6 +137,20 @@ export interface MemoriesApiDeps {
     intensity?: number | null
     agentId?: string
   }): Promise<{ versionId: string; changed: boolean }>
+  /**
+   * 设置人格内容（名字/年龄/特质/基线哈希），写 persona.update journal 可跨设备漫游。
+   *
+   * v0.4 之前 writePersona 直接写 persona_state 不写 journal，人格内容靠 persona/*.json
+   * 快照回灌，两台设备并发改人格会 Last-Write-Wins（评价三实测）。改成 journal 事件后，
+   * 人格也按 lc 因果排序重放，两边的编辑按序收敛。
+   */
+  setPersona?(input: {
+    agentId: string
+    name: string
+    age: number
+    traits: Record<string, number>
+    baselineHash: string
+  }): Promise<PersonaDoc>
   /** 踩坑库（四段式观察 → 规则），「规则与人格」视图的升格入口。 */
   pitfalls?(): PitfallStore | undefined
   /**
@@ -289,7 +303,7 @@ async function dispatch(
     if (method === 'POST' && path === '/persona') {
       const body = await readJson(req)
       deps.barrier.assertWritable('persona-edit')
-      return sendJson(res, 200, ok(writePersona(deps, body)))
+      return sendJson(res, 200, ok(await writePersona(deps, body)))
     }
     if (method === 'GET' && path === '/skills') {
       return sendJson(res, 200, ok(readSkills(deps, url)))
@@ -1254,7 +1268,7 @@ function readPersona(deps: MemoriesApiDeps, url: URL): PersonaDoc {
  * 那个夹取是给"对话中自然漂移"用的；人手输入 0.8 就是 0.8。
  * 但仍然夹在 0..1，避免 UI 送进来 -3 这种脏数据。
  */
-function writePersona(deps: MemoriesApiDeps, body: Record<string, unknown>): PersonaDoc {
+async function writePersona(deps: MemoriesApiDeps, body: Record<string, unknown>): Promise<PersonaDoc> {
   const db = deps.db()
   if (!db) throw new ApiError('not-ready', '记忆库尚未就绪', 503)
   const rawAgentId = str(body.agentId) ?? 'default'
@@ -1268,6 +1282,14 @@ function writePersona(deps: MemoriesApiDeps, body: Record<string, unknown>): Per
     traits[key.slice(0, 32)] = Math.min(1, Math.max(0, value))
   }
   const baselineHash = str(body.baselineHash) ?? ''
+
+  // v0.4：人格内容走 journal（persona.update），跨设备按 lc 因果排序收敛，消除旧实现
+  // 直接写 persona_state 的 Last-Write-Wins（评价三实测并发改人格丢更新）。老宿主没有
+  // setPersona 注入时退回下面的同步写，行为与 v0.3.8 完全一致。
+  if (deps.setPersona) {
+    return deps.setPersona({ agentId, name, age, traits, baselineHash })
+  }
+
   const now = Date.now()
   db.run(
     `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
