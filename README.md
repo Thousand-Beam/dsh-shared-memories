@@ -4,12 +4,12 @@
 
 ### 基于 Git 的原生外置云脑 · 全状态漫游引擎
 
-**关机即快照，开机即还原。** 换台机器，你的 AI 还是同一个 AI——记忆、人格、工作区，一个字节都不差。
+**关机即快照，开机即还原。** 换台机器，你的 AI 还是同一个 AI——记忆、人格、技能、会话索引、用户画像，一个字节都不差。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-3da639.svg?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-339933.svg?style=flat-square)](https://nodejs.org)
 [![DSH](https://img.shields.io/badge/dsh-%E2%89%A50.2.1--rc.3-4c6ef5.svg?style=flat-square)](https://github.com/deepseek-ai)
-[![Tests](https://img.shields.io/badge/tests-117%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-138%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
 [![CI](https://img.shields.io/github/actions/workflow/status/Thousand-Beam/dsh-shared-memories/ci.yml?branch=main&style=flat-square&label=ci)](../../actions)
 [![No CDN](https://img.shields.io/badge/frontend-%E9%9B%B6%E5%A4%96%E9%93%BE%E3%80%81%E9%9B%B6%20CDN-8957e5.svg?style=flat-square)](#控制台)
 
@@ -466,7 +466,7 @@ npm run self-test   # 第 ⑥ 段：新建会话继承同一人格，且用解�
 - Node **≥ 22.5**（依赖内置 `node:sqlite`；更早的版本需要自行接 `node:sqlite` polyfill，走 `SqlDriver` 接口）。
 - DSH **≥ 0.2.1-rc.3**（`package.json` 的 `dsh.engines.dsh`）。宿主仍在 rc 阶段，插件贴的是 `systemPrompt.section()` / `slots` / `locale` 注入等内部 API——**升级 DSH 前先查本插件的兼容声明，别裸升**（内部 API 一改，插件可能失效或串台）。
 - 平台：Windows / macOS / Linux 均可；`core.autocrlf` 由插件在快照仓库内强制为 `false`（否则 sha256 会被 CRLF 骗过）。
-- 多设备：同一时刻只允许一台机器处于可写状态；其余机器以 `degraded-readonly` 挂在只读模式（抢占写入需要显式回退或等待下次恢复）。
+- 多设备：journal 按设备文件分片，并发写入在 git 层是「文件并集」、天然无冲突；但人格/技能/画像等 `state/*.json` 是单一共享文件，两台机器在同一个快照间隔内都改同一项设置时，后 push 的一方会覆盖（Last-Write-Wins）。建议同一时刻只让一台机器可写，其余以 `degraded-readonly` 只读，或避免同时改设置（记忆本体永不丢失，只有设置类状态有此风险）。
 
 ---
 

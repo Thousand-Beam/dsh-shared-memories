@@ -31,6 +31,7 @@ import { SnapshotEngine, SnapshotError } from '../src/host/snapshot/engine.js'
 import { ExecGitRunner } from '../src/host/snapshot/git.js'
 import type { SnapshotManifest } from '../src/host/snapshot/manifest.js'
 import { RestoreEngine } from '../src/host/snapshot/restore.js'
+import { purgeAgent } from '../src/host/memory/purge.js'
 import { openTestDb, tempRoot } from './helpers/db.js'
 
 /** 固定时钟：快照 id、valid_from、recency 都基于它，测试才能逐字节比对。 */
@@ -371,4 +372,89 @@ test('空远端（裸仓库无任何提交）→ 冷启动按首次播种处理�
   // 降级只读 → 模式 B 首次启动永久死锁。修复后识别为空远端，按首次播种继续走 ready。
   const outcome = await restore.restoreOnBoot()
   assert.equal(outcome.status, 'ready', `空远端首启应 ready（首次播种），实际 ${outcome.status} / ${outcome.code ?? ''}`)
+})
+
+test('A 销毁 lead → push → B 冷启动：被销毁记忆与人格都不复活（跨设备销毁）', async (t) => {
+  const bare = await makeBareRemote(t)
+
+  const root = await tempRoot(t, 'device-a-purge-')
+  await git(root, ['init', '-b', 'main'])
+  await git(root, ['config', 'user.email', 'a@example.test'])
+  await git(root, ['config', 'user.name', 'Device A'])
+
+  const db = await openTestDb(t)
+  if (!db) return
+  const journal = new Journal({ root, deviceId: DEVICE_A })
+  await journal.open()
+  const tree = new TemporalTree(db, journal, { clock: () => NOW })
+
+  // 写 lead 的"绝密记忆" + 登记两个 Agent 的人格行（模拟 agent/created 的 ensureAgentRow）。
+  const lead: Scope = { workspaceId: WORKSPACE, agentId: 'lead', deviceId: DEVICE_A }
+  await tree.openVersion({
+    scope: lead,
+    kind: 'fact',
+    subjectKey: 'lead.secret',
+    text: '绝密记忆：保险箱密码是 7355608',
+    author: 'user',
+    validFrom: NOW - 1000,
+  })
+  db.run('INSERT INTO persona_state (agent_id, workspace_id, name, updated_at) VALUES (?,?,?,?)', ['lead', WORKSPACE, '大肥鱼', NOW])
+  db.run('INSERT INTO persona_state (agent_id, workspace_id, name, updated_at) VALUES (?,?,?,?)', ['coder', WORKSPACE, '小狐狸', NOW])
+  await journal.flush()
+
+  // collectState 读 db 的 persona_state（真实语义：purge 删掉行后，快照就不再带这个人格）。
+  const engine = new SnapshotEngine({
+    root,
+    deviceId: DEVICE_A,
+    git: new ExecGitRunner({ cwd: root }),
+    remote: bare,
+    branch: 'main',
+    clock: () => NOW,
+    collectState: () => ({
+      agents: db
+        .all<{ agent_id: string; name: string }>('SELECT agent_id, name FROM persona_state WHERE workspace_id = ?', [WORKSPACE])
+        .map((row) => ({ agentId: row.agent_id, workspaceIds: [WORKSPACE], persona: { name: row.name }, sessions: [] })),
+    }),
+  })
+
+  // 第一次快照：lead + coder 完整漫游到远端。
+  await engine.snapshot('shutdown')
+
+  // A 销毁 lead（写墓碑 + 删库 + 删 persona 文件）。
+  const purge = await purgeAgent({ db, root, workspaceId: WORKSPACE, agentId: 'lead', sessionId: 'lead', clock: () => NOW })
+  assert.equal(purge.tombstone, true, '墓碑必须落盘，否则销毁不生效')
+
+  // 第二次快照：collectState 读 db，lead 已删 → 快照不再带 persona/lead.json。
+  await engine.snapshot('shutdown')
+
+  // B 全新冷启动。
+  const rootB = await tempRoot(t, 'device-b-purge-')
+  const dbB = await openTestDb(t)
+  if (!dbB) return
+  const restoreB = new RestoreEngine({
+    root: rootB,
+    db: dbB,
+    journal: new Journal({ root: rootB, deviceId: DEVICE_B }),
+    barrier: new RestoreBarrier(),
+    git: new ExecGitRunner({ cwd: rootB }),
+    remote: bare,
+    branch: 'main',
+  })
+  const outcome = await restoreB.restoreOnBoot()
+  assert.equal(outcome.status, 'ready', `销毁后 B 冷启动应 ready，实际 ${outcome.status} / ${outcome.code ?? ''}`)
+
+  // 被销毁的 lead 记忆不复活。
+  const leadMemories = dbB.all<{ text: string }>(
+    'SELECT text FROM memory_version WHERE entity_id IN (SELECT entity_id FROM memory_entity WHERE workspace_id = ? AND agent_id = ?)',
+    [WORKSPACE, 'lead'],
+  )
+  assert.equal(leadMemories.length, 0, '被销毁的 lead 记忆不得复活')
+
+  // 被销毁的 lead 人格不复活。
+  const leadPersona = dbB.all<{ agent_id: string }>('SELECT agent_id FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [WORKSPACE, 'lead'])
+  assert.equal(leadPersona.length, 0, '被销毁的 lead 人格不得复活')
+
+  // coder 不受影响。
+  const coderPersona = dbB.all<{ agent_id: string }>('SELECT agent_id FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [WORKSPACE, 'coder'])
+  assert.equal(coderPersona.length, 1, 'coder 人格不受 lead 销毁影响')
 })
