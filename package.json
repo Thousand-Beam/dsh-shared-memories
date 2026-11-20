@@ -1,6 +1,6 @@
 {
   "name": "dsh-shared-memories",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Git-native external brain and full-state roaming engine for DeepSeek Harness — snapshot on shutdown, restore on boot.",
   "keywords": [
     "dsh-plugin",
