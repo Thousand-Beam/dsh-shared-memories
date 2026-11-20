@@ -319,7 +319,15 @@ export class SnapshotEngine {
       if (deleted.code !== 0 && !/not found/i.test(deleted.stderr)) {
         this.#onWarn(`删除 tag ${tag} 失败：${deleted.stderr.trim()}`)
       }
-      await rm(join(this.#root, 'snapshots', id), { recursive: true, force: true })
+      // 目录删除失败不致命：Windows 上目录可能被别的进程短暂占用（EPERM），
+      // 抛错会让整条快照失败、上层疯狂重试。降级为 warn，留到下次 rotate 再清。
+      try {
+        await rm(join(this.#root, 'snapshots', id), { recursive: true, force: true })
+      } catch (error) {
+        this.#onWarn(
+          `删除快照目录 ${id} 失败（下次 rotate 重试）：${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
     }
 
     if (removed.length > 0) {
@@ -344,7 +352,22 @@ export class SnapshotEngine {
 
     // 注意顺序：先 rotate 再 push，这样推送的就是"已经清理干净"的状态。
     const { removed } = await this.rotate()
-    const push = this.#pushOnCommit ? await this.push() : { pushed: false, reason: 'disabled' }
+    // push 失败不致命：本地快照（capture + commit）已经落地有效，推送只是同步到远端。
+    // 若把 push 失败抛成整个快照失败，上层 idle 防抖会因 lastSnapshotAt 未刷新而疯狂重试，
+    // 每次重试又 push 失败，git 操作拖死 agent（真机事故：思考 5 分钟无响应）。
+    let push: { pushed: boolean; reason?: string }
+    if (this.#pushOnCommit) {
+      try {
+        push = await this.push()
+      } catch (error) {
+        this.#onWarn(
+          `推送失败（本地快照仍有效）：${error instanceof Error ? error.message : String(error)}`,
+        )
+        push = { pushed: false, reason: 'push-failed' }
+      }
+    } else {
+      push = { pushed: false, reason: 'disabled' }
+    }
     return {
       manifest: finalManifest,
       commit,

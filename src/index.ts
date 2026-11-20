@@ -317,6 +317,10 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         })
         .catch((error: unknown) => {
           warn(`快照失败（${trigger}）：${error instanceof Error ? error.message : String(error)}`)
+          // 失败也刷新防抖水位：否则 idle 快照失败一次后 lastSnapshotAt 停在旧值，
+          // session/flush 每次都判定"已过防抖期"→ 疯狂重试快照，git 操作拖死 agent
+          //（真机事故：思考 5 分钟无响应，关掉插件才恢复）。
+          runtime.lastSnapshotAt = Date.now()
           // 手动保存必须把失败冒到 /save：否则前端收到 200 {"snapshotId":""} 假成功，
           // 用户以为漫游已落地，实际一次都没推上去。
           if (trigger === 'manual') throw error
