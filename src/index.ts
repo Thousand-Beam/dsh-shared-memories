@@ -732,10 +732,13 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
 
     // webServer 是可选服务：宿主就绪后再注册接口（局部注入，不因缺服务拖垮插件加载）。
     // 老宿主没有 inject 方法时退回同步 lookupService。
+    // connection（鉴权）必须和 webServer 一起局部注入：apply 主体时 connection 可能尚未
+    // active，lookupService 拿不到 → dispatch 写操作鉴权被静默跳过（评价四 P0-1）。
     if (typeof host.inject === 'function') {
-      host.inject(['webServer'], (webCtx) => {
+      host.inject(['webServer', 'connection'], (webCtx) => {
         const ws = lookupService(webCtx as SharedHost, 'webServer') as WebServerLike | undefined
-        if (ws) disposers.push(registerRoutes(ws, apiDeps))
+        const conn = lookupService(webCtx as SharedHost, 'connection') as ConnectionLike | undefined
+        if (ws) disposers.push(registerRoutes(ws, { ...apiDeps, connection: conn }))
       })
     } else {
       const webServer = lookupService(host, 'webServer') as WebServerLike | undefined

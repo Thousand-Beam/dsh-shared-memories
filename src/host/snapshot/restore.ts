@@ -11,7 +11,7 @@
  */
 
 import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { SqlDriver } from '../../shared/types.js'
 import type { Journal, JournalRecord } from '../../shared/journal.js'
 import { readSchemaVersion, migrate, SCHEMA_VERSION } from '../storage/schema.js'
@@ -650,7 +650,15 @@ export class RestoreEngine {
         timeoutMs: this.#timeoutMs,
       })
       if (fetch.code !== 0) {
-        lastError = fetch.stderr.trim() || `fetch exit ${fetch.code}`
+        const fetchStderr = fetch.stderr.trim()
+        // 空远端 = 首次播种：fetch 空裸仓库的 main 分支会报 "couldn't find remote ref main"，
+        // 这发生在 fetch 阶段（不是 pull 阶段）。漏识别会按 pull-failed 降级只读，
+        // README 模式 B 首次启动就永久死锁（评价四 P0-2 实测复现）。
+        if (/couldn't find remote ref|unknown revision|not our ref|empty repository|does not have any commits/i.test(fetchStderr)) {
+          this.#onWarn(`远端仓库为空（${fetchStderr}），按首次播种处理：以本地数据为准，稍后 snapshot 推送`)
+          return
+        }
+        lastError = fetchStderr || `fetch exit ${fetch.code}`
         if (attempt < this.#retries) {
           const delay = backoffDelay(attempt)
           this.#onWarn(`git fetch 失败（第 ${attempt + 1} 次）：${lastError}；${delay}ms 后重试`)
@@ -714,6 +722,9 @@ export class RestoreEngine {
       const init = await this.#git.run(['init', '-b', this.#branch])
       assertGitOk(init, ['init'], 'git-init-failed')
     }
+    // repo.path 可能是别的仓库的子目录（父目录的 .git 让 probe 成功），先拒嵌套，
+    // 否则 git add -A / fetch 会污染外层项目仓库（评价四 P0-3）。
+    await this.#assertNotNested()
     const remotes = await this.#git.run(['remote'])
     const hasOrigin = remotes.stdout
       .split('\n')
@@ -727,6 +738,25 @@ export class RestoreEngine {
       // 项目远程），一致才允许 set-url 覆盖，防止把记忆拉进/推出别人的仓库。
       await this.#assertRepoOwnership()
       await this.#git.run(['remote', 'set-url', 'origin', this.#remote])
+    }
+  }
+
+  /**
+   * 防御「repo.path 是别的 Git 仓库的子目录」（评价四 P0-3）：`rev-parse --git-dir`
+   * 会返回父目录的 .git 让 probe 成功，随后的 fetch/add 会污染外层项目仓库。
+   * 尺子：work-tree 顶层必须等于数据根，Windows 大小写不敏感。
+   */
+  async #assertNotNested(): Promise<void> {
+    const toplevel = await this.#git.run(['rev-parse', '--show-toplevel'])
+    if (toplevel.code !== 0) return // 无 work tree，交给后续步骤处理。
+    const top = resolve(toplevel.stdout.trim()).toLowerCase()
+    const root = resolve(this.#root).toLowerCase()
+    if (top !== root) {
+      throw new RestoreError(
+        'repo-hijack',
+        `repo.path 嵌套在另一个 Git 仓库内（仓库根「${toplevel.stdout.trim()}」≠ 数据根「${this.#root}」），拒绝拉取`,
+        { toplevel: top, root },
+      )
     }
   }
 

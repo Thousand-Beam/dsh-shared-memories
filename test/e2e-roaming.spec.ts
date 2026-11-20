@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 import { promisify } from 'node:util'
@@ -296,4 +296,79 @@ test('restore 时 repo.path 指向陌生 git 仓库 → 降级只读（repo-hija
   const outcome = await restore.restoreOnBoot()
   assert.equal(outcome.status, 'degraded')
   assert.equal(outcome.code, 'repo-hijack', '拒绝把记忆拉进别人的仓库，宁可只读降级')
+})
+
+test('repo.path 嵌套在别的 Git 仓库的子目录 → 拒绝快照（toplevel 检测）', async (t) => {
+  const dsmRemote = await makeBareRemote(t)
+
+  // 外层是"别人的项目仓库"（origin 指向项目远程），里面有敏感文件。
+  const outer = await tempRoot(t, 'outer-project-')
+  await git(outer, ['init', '-b', 'main'])
+  const projectRemote = await makeBareRemote(t)
+  await git(outer, ['remote', 'add', 'origin', projectRemote])
+  await writeFile(join(outer, '.env'), 'SECRET_TOKEN=abc123\n')
+
+  // repo.path 是外层仓库的子目录，本身不是独立 git 仓库。
+  // `git rev-parse --git-dir` 会返回父目录的 .git，probe 成功，走 else 分支。
+  const nested = join(outer, 'shared-memories')
+  await mkdir(nested, { recursive: true })
+
+  const engine = new SnapshotEngine({
+    root: nested,
+    deviceId: 'devA',
+    git: new ExecGitRunner({ cwd: nested }),
+    remote: dsmRemote,
+    branch: 'main',
+    clock: () => NOW,
+    collectState: () => ({ agents: [] }),
+  })
+
+  await assert.rejects(
+    () => engine.snapshot('shutdown'),
+    (error: unknown) => error instanceof SnapshotError && error.code === 'repo-hijack',
+    '快照必须拒绝在别人仓库的子目录里 git add -A（会把 .env 一并提交推送）',
+  )
+})
+
+test('rollback 后删除派生库 memory.db，强制下次冷启动全量重放', async (t) => {
+  const bare = await makeBareRemote(t)
+  const a = await bootDeviceA(t, bare)
+  if (!a) return
+
+  // 在数据根放一个 memory.db 派生文件（openTestDb 用的是 :memory: 库，不落盘）。
+  // rollback 的 `git checkout tag -- .` 不会回退它（gitignore），必须显式删掉。
+  await writeFile(join(a.root, 'memory.db'), 'fake-derived-db-content')
+
+  const snap = await a.engine.snapshot('shutdown')
+  await a.engine.rollback(snap.manifest.snapshotId)
+
+  const leftover = await readFile(join(a.root, 'memory.db'))
+    .then(() => true)
+    .catch(() => false)
+  assert.equal(leftover, false, 'rollback 后 memory.db 必须被删除，否则旧库与旧 journal 不一致会锁死只读')
+})
+
+test('空远端（裸仓库无任何提交）→ 冷启动按首次播种处理，不降级', async (t) => {
+  const bare = await makeBareRemote(t) // 空裸仓库，无 commit、无 ref。
+
+  const root = await tempRoot(t, 'empty-remote-')
+  await git(root, ['init', '-b', 'main'])
+
+  const db = await openTestDb(t)
+  if (!db) return
+
+  const restore = new RestoreEngine({
+    root,
+    db,
+    journal: new Journal({ root, deviceId: 'devB' }),
+    barrier: new RestoreBarrier(),
+    git: new ExecGitRunner({ cwd: root }),
+    remote: bare,
+    branch: 'main',
+  })
+
+  // 评价四 P0-2：空远端 fetch 报 "couldn't find remote ref main"，此前按 pull-failed
+  // 降级只读 → 模式 B 首次启动永久死锁。修复后识别为空远端，按首次播种继续走 ready。
+  const outcome = await restore.restoreOnBoot()
+  assert.equal(outcome.status, 'ready', `空远端首启应 ready（首次播种），实际 ${outcome.status} / ${outcome.code ?? ''}`)
 })

@@ -17,7 +17,7 @@
 
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { SCHEMA_VERSION } from '../storage/schema.js'
 import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeBindings } from '../../shared/skills.js'
@@ -428,9 +428,20 @@ export class SnapshotEngine {
       { config: { 'user.name': this.#authorName, 'user.email': this.#authorEmail } },
     )
     assertGitOk(commit, ['commit', '-m', 'rollback'], 'git-commit-failed')
+    // memory.db 是 gitignore 的派生数据，`git checkout tag -- .` 不会回退它。若保留旧库，
+    // 下次冷启动用回退后的旧 journal 增量重放时，tag 之后新增的记忆不会被清掉（回退假成功），
+    // 且库与 journal 不一致可能触发 snapshot-corrupt 锁死只读（评价四 P0-4）。删掉强制全量重放。
+    await this.#dropDerivedDb()
     const head = await this.#git.run(['rev-parse', 'HEAD'])
     assertGitOk(head, ['rev-parse', 'HEAD'], 'git-rev-parse-failed')
     return { commit: head.stdout.trim() }
+  }
+
+  /** 删除派生库文件（memory.db 及 WAL），让下次冷启动从 journal 全量重放。 */
+  async #dropDerivedDb(): Promise<void> {
+    for (const name of ['memory.db', 'memory.db-wal', 'memory.db-shm']) {
+      await rm(join(this.#root, name), { force: true })
+    }
   }
 
   // ── 内部 ────────────────────────────────────────────────────────────────
@@ -460,6 +471,7 @@ export class SnapshotEngine {
     } else {
       // 已存在的仓库也可能是陌生仓库（repo.path 指向了别人的项目目录），
       // 先验证归属，再补 .gitignore（v0.3.5 之前从未写过它）。
+      await this.#assertNotNested()
       await this.#assertRepoOwnership()
       await this.#ensureGitignore()
     }
@@ -467,6 +479,28 @@ export class SnapshotEngine {
     // 一旦 git 把 LF 转成 CRLF（Windows 默认 core.autocrlf=true），恢复时的校验
     // 就会把"一次完全正常的拉取"判成 snapshot-corrupt——假篡改比真篡改更难查。
     await this.#pinLineEndings()
+  }
+
+  /**
+   * 防御「repo.path 是别的 Git 仓库的子目录」：`git rev-parse --git-dir` 会返回
+   * 父目录的 .git，probe 成功走 else 分支，随后的 `git add -A` 会把父目录项目文件
+   * （含 .env 等敏感文件）一并提交推送（评价四 P0-3 实测复现）。
+   *
+   * 尺子是 work-tree 顶层：dsm 数据根的 show-toplevel 必须等于数据根本身。
+   * Windows 路径大小写不敏感，用 toLowerCase 比较。
+   */
+  async #assertNotNested(): Promise<void> {
+    const toplevel = await this.#git.run(['rev-parse', '--show-toplevel'])
+    if (toplevel.code !== 0) return // 无 work tree（如裸仓库），交给后续步骤处理。
+    const top = resolve(toplevel.stdout.trim()).toLowerCase()
+    const root = resolve(this.#root).toLowerCase()
+    if (top !== root) {
+      throw new SnapshotError(
+        'repo-hijack',
+        `repo.path 嵌套在另一个 Git 仓库内（仓库根「${toplevel.stdout.trim()}」≠ 数据根「${this.#root}」），在此 git add -A 会把外层项目文件一并提交推送，拒绝快照`,
+        { toplevel: top, root },
+      )
+    }
   }
 
   /**
