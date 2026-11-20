@@ -77,7 +77,10 @@ cold → pulling → verifying → replaying → ready
 
 ```bash
 # 需要 Node >= 22.5（node:sqlite），DSH >= 0.2.1-rc.3
-npm i dsh-shared-memories
+# 包未发布到公共 npm registry，从 GitHub Release 下载 tgz 后本地安装：
+# 1. 打开 https://github.com/Thousand-Beam/dsh-shared-memories/releases 下载最新 dsh-shared-memories-*.tgz
+# 2. 在 tgz 所在目录执行：
+npm i ./dsh-shared-memories-0.3.6.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里挂上（插件自带一份可直接用的 `cordis.patch.yml`）：

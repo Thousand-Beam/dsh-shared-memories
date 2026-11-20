@@ -16,6 +16,7 @@ import { TemporalTree } from '../src/host/memory/timetree.js'
 import { PersonaIdentityStore } from '../src/host/memory/persona-identity.js'
 import { purgeAgent } from '../src/host/memory/purge.js'
 import { ScopedQuery } from '../src/host/memory/scoped-query.js'
+import { ReplayApplier } from '../src/host/snapshot/restore.js'
 
 const WORKSPACE = 'ws-purge'
 
@@ -184,4 +185,44 @@ test('purge 不误删另一个工作区里同名人格的绑定记录', async (t
   const text = await readFile(file, 'utf8')
   assert.equal(text.includes('session-a'), false, '本工作区绑定记录应从 journal 剔除')
   assert.ok(text.includes('session-other'), '另一工作区同名人格绑定必须保留')
+})
+
+test('P0-1 回归：真实落盘墓碑（seq=1）能进重放流并删掉另一设备的记忆', async (t) => {
+  const dbA = await openTestDb(t)
+  if (dbA === undefined) return
+  const root = await tempRoot(t, 'purge-replay-')
+
+  // 设备 A：写一条记忆。
+  const journalA = new Journal({ root, deviceId: 'dev-a' })
+  await journalA.open()
+  const tree = new TemporalTree(dbA, journalA)
+  const scope = { workspaceId: WORKSPACE, agentId: 'session-replay', deviceId: 'dev-a' }
+  await tree.openVersion({ scope, kind: 'fact', subjectKey: 'secret', text: '绝密记忆', author: 'user', trust: 1 })
+  assert.equal(new ScopedQuery(dbA, scope).stats().entities, 1)
+
+  // 设备 B：从 A 的 journal 重放出记忆（模拟 B 已同步到这份记忆）。
+  const dbB = await openTestDb(t)
+  if (dbB === undefined) return
+  const journalB = new Journal({ root, deviceId: 'dev-b' })
+  await journalB.open()
+  const synced = await journalB.readMerged()
+  new ReplayApplier(dbB).apply(synced)
+  assert.equal(new ScopedQuery(dbB, { ...scope, deviceId: 'dev-b' }).stats().entities, 1, 'B 应先重放出记忆')
+
+  // 设备 A：真实 purge —— 物理抹除 A 的 upsert、落盘墓碑。
+  await purgeAgent({ db: dbA, root, workspaceId: WORKSPACE, agentId: 'session-replay' })
+
+  // B 冷启动重放：A 的 upsert 已抹除，journal 里只剩墓碑。
+  const cold = new Journal({ root, deviceId: 'dev-b' })
+  await cold.open()
+  const records = await cold.readMerged()
+  const tombstones = records.filter((r) => r.op === 'agent.purge')
+  assert.equal(tombstones.length, 1, 'readMerged 必须吐出 agent.purge 墓碑（seq=0 会被 seq>0 过滤，即 P0-1）')
+  assert.equal(tombstones[0]!.seq, 1, '墓碑 seq 必须是 1')
+  assert.equal(tombstones[0]!.agentId, 'session-replay')
+
+  // 墓碑重放应删掉 B 已同步的记忆。
+  const stats = new ReplayApplier(dbB).apply(records)
+  assert.ok(stats.purged >= 1, 'agent.purge 重放应执行')
+  assert.equal(new ScopedQuery(dbB, { ...scope, deviceId: 'dev-b' }).stats().entities, 0, '墓碑重放后 B 的记忆应被删掉')
 })

@@ -446,7 +446,7 @@ async function dropHostSessionTraces(options: HostTraceOptions): Promise<number>
   // 上次运行的 residue 可能留在回收区里（rename 成功、rm 失败），重跑 purge 时
   // 目标已移出 sessions/、dropSessionLogs 扫描不到，这些完整副本会永久残留。
   // 所以每次入口先清扫回收区，把上次没删干净的东西删掉。
-  await sweepTrash(trashDir, options.warn)
+  await sweepTrash(trashDir, options.warn, options.failures)
   return dropSessionLogs({
     sessionStoreRoot: join(options.hostRoot, 'sessions'),
     // 回收区放在 sessions/ 之外：宿主扫 header 时不会把 .purge-trash 当会话目录。
@@ -463,20 +463,26 @@ async function dropHostSessionTraces(options: HostTraceOptions): Promise<number>
  * 完整会话日志副本，重跑 purge 时它已不在 sessions/ 下、扫描不到，必须在这里
  * 主动清掉，否则「彻底销毁」会永久留一份可恢复的副本。
  */
-async function sweepTrash(trashDir: string, warn: (message: string) => void): Promise<void> {
+async function sweepTrash(trashDir: string, warn: (message: string) => void, failures: string[]): Promise<void> {
   let entries
   try {
     entries = await readdir(trashDir, { withFileTypes: true })
   } catch (cause) {
     // 回收区不存在是正常情况（从未产生 residue）。
-    if (codeOf(cause) !== 'ENOENT') warn(`清扫回收区失败：${messageOf(cause)}`)
+    if (codeOf(cause) !== 'ENOENT') {
+      warn(`清扫回收区失败：${messageOf(cause)}`)
+      failures.push(`清扫回收区失败：${messageOf(cause)}`)
+    }
     return
   }
   for (const entry of entries) {
     try {
       await rm(join(trashDir, entry.name), { recursive: true, force: true, maxRetries: 3 })
     } catch (cause) {
+      // 残留删不掉 = 完整会话日志副本还躺在回收区里，「彻底销毁」不能报成功。
+      // 与 dropSessionLogs 的 residue 同等待遇：进 failures，让 purge 抛 partial。
       warn(`清扫回收区残留失败：${entry.name}：${messageOf(cause)}`)
+      failures.push(`回收区残留未清：${entry.name}：${messageOf(cause)}`)
     }
   }
 }
@@ -780,7 +786,11 @@ async function appendTombstone(options: {
   const tombstone = JSON.stringify({
     v: 1,
     lc,
-    seq: 0,
+    // seq 必须是 >= 1：readDevice 用 `record.seq > sinceSeq`（水位默认 0）过滤，
+    // seq=0 会被 `0 > 0` 判假而永久过滤，墓碑就进不了 readMerged 的重放流，
+    // agent.purge 的删除语句在任何设备上都不会执行。purge 设备没有自己的 seq
+    // 计数（墓碑是绕过 Journal 直接落盘的），这里恒写 1，靠 lc 保证因果顺序。
+    seq: 1,
     op: 'agent.purge',
     workspaceId,
     agentId,

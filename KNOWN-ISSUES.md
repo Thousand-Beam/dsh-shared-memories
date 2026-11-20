@@ -6,7 +6,8 @@
 ## 1. 跨设备时钟偏移导致 purge 复活（已修复：Lamport 逻辑时钟）
 - 位置：`src/shared/journal.ts`（`JournalRecord.lc` 字段 + `readMerged()` 排序键）、`src/host/snapshot/restore.ts`（agent.purge 墓碑重放）。
 - 修复：每条 journal 记录带单调递增的 `lc`（Lamport 逻辑时钟）；`Journal.open()` 恢复本设备 seq 后遍历所有设备最后一条记录对齐最大 lc 水位；`readMerged()` 排序键改为 `(lc, at, device, seq)`，旧记录（lc 缺失）回退用 0 + 墙钟。purge 墓碑本身也带 `lc`（`appendTombstone` 在改写 journal 前先扫全 journal 最大 lc，墓碑取 max+1）；`Journal.realignClock()` 让 pull 到远端后重新对齐水位。墓碑 lc 压过所有已落盘记录，replay 时墓碑最后执行、把之前重放出的 agent 记录删掉，杜绝复活。
-- 验证：`test/journal.spec.ts`「Lamport 墓碑：跨设备墙钟漂移时墓碑仍先于复活记录」+「realignClock：pull 到远端后重新对齐 Lamport 水位」；`test/purge.spec.ts` 墓碑测试断言墓碑 lc 压过现有记录。
+- 验证：`test/journal.spec.ts`「Lamport 墓碑：跨设备墙钟漂移时墓碑仍先于复活记录」+「realignClock：pull 到远端后重新对齐 Lamport 水位」；`test/purge.spec.ts` 墓碑测试断言墓碑 lc 压过现有记录 + 新增「P0-1 回归：真实落盘墓碑（seq=1）能进重放流并删掉另一设备的记忆」端到端测试。
+- 已知边界（多设备实验性）：墓碑 `lc = 本机 purge 时 scanJournalMaxLc + 1`，它保证压过「本机 purge 时刻之前、已同步到本机的所有记录」。但压不过「**其他设备在本机 purge 之后、且尚未同步到墓碑之前继续写入**」的记录——那些记录从别的设备本地计数继续增长，合并后 lc 可能大于墓碑，replay 时排在墓碑之后把已销毁 agent 复活。彻底解法需要「删除向量时钟 / 语义合并层」或「哨兵 lc（恒排最后）」；但哨兵 lc 会与「purge 后 realignClock 让本机新写入排在墓碑之后、不被误删」的语义冲突（本机 re-bind 的新记忆 lc < MAX_SAFE_INTEGER，会被哨兵墓碑一并抹掉）。两者不可兼得，当前选择「墓碑压过已落盘 + purge 后 realignClock 保护本机新写入」，把「其他设备并发未来」标记为多设备实验性的已知边界。
 
 ## 2. 冷启动 journal 全量重放随规模线性变慢（评估：暂缓，需状态快照层）
 - 位置：`src/host/snapshot/restore.ts`（verifyAndReplay 全量 `readMerged()` + `ReplayApplier.apply` 重放到本机 memory.db）。

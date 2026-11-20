@@ -868,18 +868,30 @@ function readBody(req: IncomingMessage, cap = 2 * 1024 * 1024): Promise<string> 
   return new Promise((resolve, reject) => {
     let body = ''
     let bytes = 0
+    let settled = false
     req.on('data', (chunk: Buffer) => {
+      if (settled) return
       bytes += chunk.length
       if (bytes > cap) {
         // 超限直接拒绝而不是截断：半截 JSON 比明确报错更危险。
+        // 不要在这里 req.destroy()——那会在 413 响应写出去之前掐断 socket，
+        // 客户端只会看到 ECONNRESET 而非明确的 413。让 reject 的 ApiError 向上
+        // 传播，由 dispatch 统一 sendError(413)，随后连接自然结束。
+        settled = true
         reject(new ApiError('body-too-large', `请求体超过 ${cap} 字节`, 413))
-        req.destroy()
         return
       }
       body += chunk.toString('utf8')
     })
-    req.on('end', () => resolve(body))
-    req.on('error', reject)
+    req.on('end', () => {
+      if (!settled) resolve(body)
+    })
+    req.on('error', (error) => {
+      if (!settled) {
+        settled = true
+        reject(error)
+      }
+    })
   })
 }
 

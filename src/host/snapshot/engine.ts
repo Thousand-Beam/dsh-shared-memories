@@ -685,6 +685,10 @@ export class SnapshotEngine {
       return out
     }
     for (const device of devices) {
+      // purge 设备装的是墓碑（agent.purge），不是真实设备的 seq 水位。墓碑必须
+      // 无条件重放，绝不能进 checkpoint 水位——否则未来一旦恢复增量回放
+      // （seq > sinceSeq[device]），墓碑会因为 seq<=水位 被跳过，被销毁的 agent 复活。
+      if (device === 'purge') continue
       const files = (await readdir(join(dir, device))).filter((name) => name.endsWith('.jsonl')).sort()
       let max = 0
       for (const file of files) {

@@ -568,7 +568,29 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           // 两者并发会算出与磁盘脱节的 manifest sha。所以 purge 也走 withGate 与快照互斥。
           const journal = runtime.journal
           if (journal) await journal.flush()
-          return await (journal ? journal.withGate(run) : run())
+          // 内存登记清理：purge 删了 persona_state（墓碑九条 DELETE），但 runtime.liveAgents
+          // 这个内存 Map 没动。不删掉的话，下一次快照 collectAgents 会把它并回来，生成
+          // persona/<id>.json 空壳 + agents.json 幽灵登记（评价三 P1）。这里把被销毁的
+          // 人格 id 与原始会话 id 都从内存登记里摘掉。
+          const dropPresence = (): void => {
+            runtime.liveAgents.delete(input.agentId)
+            if (input.sessionId && input.sessionId !== input.agentId) runtime.liveAgents.delete(input.sessionId)
+          }
+          if (journal === undefined) {
+            const result = await run()
+            dropPresence()
+            return result
+          }
+          return await journal.withGate(async () => {
+            const result = await run()
+            // 墓碑的 lc 是 maxLc+1，但 Journal.#lc 内存计数没动（墓碑绕过 Journal 直接
+            // 落盘）。不重对齐的话，进程内下一条 append 的 lc 会 <= maxLc < 墓碑 lc，
+            // 排在墓碑前，重放时被墓碑的 DELETE 一并抹掉——销毁把销毁之后的数据删了。
+            // 这里把内存时钟对齐到墓碑水位之上，让后续写入排在墓碑之后、不被误删。
+            await journal.realignClock()
+            dropPresence()
+            return result
+          })
         } catch (cause) {
           // 关键：这里绝不能让裸异常冒到宿主。
           // 文件被占用（EBUSY）、库只读这类事故会被 purgeAgent 收进 PurgeError；

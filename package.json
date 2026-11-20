@@ -32,6 +32,7 @@
   "files": [
     "lib/**/*",
     "scripts/wrap-client.mjs",
+    "scripts/self-test.mjs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
