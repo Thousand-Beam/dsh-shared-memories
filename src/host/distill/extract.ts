@@ -133,6 +133,15 @@ const LAYOUT_NOISE = /^\s*(?:[-*•#>]|\d+[.、)）])|\*\*|`{1,3}/
 /** 元话语：讨论"记忆/插件/提示词本身"的句子，不是用户的事实。 */
 const META_NOISE = /(记忆总览|召回段|上下文注入|提示词|prompt|Toast|reinforce_count|测试用例|断言|日志里|插件)/i
 
+/**
+ * 召回段 header（recall.ts renderRecallBlock 注入的那行元文本）。召回块本身是
+ * systemPrompt.context 逐轮拼进 prompt 的，宿主在 in-history 模式下会把它当一条消息
+ * 记进事件流，于是 distill 会把它当"用户说的话"重读一遍。header 命中 `/(不要|别把…)/`
+ * 规则被抽成 pitfall，升入规则段后下次召回又召回它——循环繁殖。内容行以 `- (` 开头
+ * 已被 LAYOUT_NOISE 挡住，漏网的是这行 header，单独精确拦截，不误伤正常句子。
+ */
+const RECALL_HEADER = /跟当前这句话可能相关的长期记忆|只作背景|不要逐字复述|不确定就说不确定/
+
 /** 去掉 markdown 修饰，只留能独立读懂的那句话。 */
 function cleanup(line: string): string {
   return line
@@ -157,6 +166,7 @@ function collect(
       // 排版与元话语一律不进记忆：宁可漏一条，也别让噪声占据注入预算。
       if (LAYOUT_NOISE.test(line)) continue
       if (META_NOISE.test(line)) continue
+      if (RECALL_HEADER.test(line)) continue
       if (turn.role === 'assistant' && ACK_ONLY.test(line)) continue
       const rule = RULES.find((candidate) => candidate.test.test(line))
       if (rule === undefined) continue

@@ -24,7 +24,7 @@ import type { SnapshotEngine } from '../snapshot/engine.js'
 import type { RestoreEngine } from '../snapshot/restore.js'
 import type { PitfallRow, PitfallStore, PromotionRequest } from '../memory/pitfall.js'
 import type { EmotionAttribution } from '../../shared/types.js'
-import { EMOTION_LABELS, isEmotionLabel } from '../../shared/types.js'
+import { isEmotionLabel } from '../../shared/types.js'
 import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeSkillId, normalizeSkillVersion } from '../../shared/skills.js'
 import { SkillRegistry, countSkills, readSkillBindings } from '../memory/skill-registry.js'
@@ -74,6 +74,16 @@ export interface WebServerLike {
   }): () => void
 }
 
+/**
+ * 宿主 connection 服务的最小面。宿主的 webServer.register 会静默忽略 route.policy
+ * （实测：dsh-host-webserver 只存 kind/path/handler，从不检查 policy 字段），所以
+ * token-write 的鉴权不能靠宿主的 policy 声明，只能由插件自己在 handler 里调宿主的
+ * connection.admit 补齐。`requestRejection` 返回 401/403 表示该拒绝，undefined 放行。
+ */
+export interface ConnectionLike {
+  requestRejection?(req: IncomingMessage): number | undefined
+}
+
 /** 路由需要的一切，全部用 accessor 传进来——避免和 index.ts 循环引用。 */
 export interface MemoriesApiDeps {
   readonly config: SharedConfig
@@ -83,6 +93,12 @@ export interface MemoriesApiDeps {
   db(): SqlDriver | undefined
   snapshots(): SnapshotEngine | undefined
   restore(): RestoreEngine | undefined
+  /**
+   * 宿主 connection 服务（可选）。宿主的 webServer.register 会静默忽略 route.policy，
+   * 所以写接口的鉴权由 dispatch 自己调 connection.requestRejection 补齐；拿不到就
+   * 跳过鉴权（headless 等无 webServer 的 profile 本就没有 HTTP 面）。
+   */
+  readonly connection?: ConnectionLike
   /** 手动保存：走 SnapshotEngine.snapshot('manual')。 */
   saveNow(): Promise<{ snapshotId: string; commit?: string }>
   /** 测试连接：探测网络 / Token / 权限（不落库、不改仓库）。 */
@@ -104,11 +120,20 @@ export interface MemoriesApiDeps {
     emotion: EmotionAttribution | null
   }): Promise<void>
   /** 忘记一条记忆：关闭活跃版本并置 status='forgotten'（写 journal，可跨设备漫游）。 */
-  forgetMemory?(input: { entityId: string; agentId: string }): Promise<{ forgotten: boolean }>
+  forgetMemory?(input: { entityId: string; agentId: string }): Promise<{ forgotten: boolean; exists: boolean }>
   /** 修改一条记忆的正文：开新版本，旧版本进时间树（写 journal）。 */
   editMemory?(input: { entityId: string; agentId: string; text: string }): Promise<{ versionId: string }>
   /** 删除一条踩坑记录（物理删除 + 审计，不写 journal）。 */
   deletePitfall?(input: { pitfallId: string; agentId: string }): Promise<{ deleted: boolean }>
+  /** 情感纠错：改版本的情感标注，写 version.emotion journal 可跨设备漫游（P1-E）。 */
+  fixEmotion?(input: {
+    versionId: string
+    label: string
+    subject?: string | null
+    trigger?: string | null
+    intensity?: number | null
+    agentId?: string
+  }): Promise<{ versionId: string; changed: boolean }>
   /** 踩坑库（四段式观察 → 规则），「规则与人格」视图的升格入口。 */
   pitfalls?(): PitfallStore | undefined
   /**
@@ -178,6 +203,21 @@ async function dispatch(
   const path = url.pathname.slice(API_PREFIX.length) || '/'
   const method = (req.method ?? 'GET').toUpperCase()
 
+  // P0（评价三）：宿主的 webServer.register 会静默忽略 route.policy（token-write 从不
+  // 被检查），所以「彻底销毁」这类破坏性写操作对任何能摸到本机端口的人都是裸奔的。
+  // 这里对写操作补一道宿主 connection 鉴权（cookie / API 令牌 / Host-Origin 栅栏）。
+  // 读接口保持开放（面板要能读）；connection 拿不到时跳过（无 webServer 的 profile）。
+  if (method !== 'GET' && method !== 'HEAD' && typeof deps.connection?.requestRejection === 'function') {
+    const rejection = deps.connection.requestRejection(req)
+    if (rejection !== undefined) {
+      const status = rejection === 403 ? 403 : 401
+      return sendJson(res, status, {
+        ok: false,
+        error: { code: 'unauthorized', message: '需要有效的浏览器会话或 API 令牌' },
+      })
+    }
+  }
+
   try {
     if (method === 'GET' && path === '/state') return sendJson(res, 200, ok(stateOf(deps)))
     if (method === 'GET' && path === '/memories') return sendJson(res, 200, ok(listMemories(deps, url)))
@@ -189,8 +229,24 @@ async function dispatch(
     }
     if (method === 'POST' && path === '/emotion') {
       const body = await readJson(req)
-      fixEmotion(deps, body)
-      return sendJson(res, 200, ok({ versionId: str(body.versionId) ?? '' }))
+      const fix = deps.fixEmotion
+      if (!fix) throw new ApiError('emotion-unavailable', '情感纠错服务尚未就绪', 503)
+      deps.barrier.assertWritable('emotion-fix')
+      const versionId = reqStr(body, 'versionId')
+      const label = str(body.label) ?? ''
+      // 标签合法性在路由层拦截：deps.fixEmotion 内部只负责落库，不在 HTTP 层抛域错误。
+      if (!isEmotionLabel(label)) throw new ApiError('bad-emotion-label', `非法情感标签：${label}`, 400)
+      const result = await fix({
+        versionId,
+        label,
+        subject: str(body.subject) ?? null,
+        trigger: str(body.trigger) ?? null,
+        intensity: num(body.intensity) ?? null,
+        agentId: str(body.agentId) ?? undefined,
+      })
+      // P1-F：版本不存在时不再假 200，改 404，让前端能区分"改到了"和"改了个寂寞"。
+      if (!result.changed) throw new ApiError('not-found', `版本不存在：${versionId}`, 404)
+      return sendJson(res, 200, ok(result))
     }
     if (method === 'POST' && path === '/memory/forget') {
       const body = await readJson(req)
@@ -201,7 +257,9 @@ async function dispatch(
         entityId: reqStr(body, 'entityId'),
         agentId: str(body.agentId) ?? 'default',
       })
-      return sendJson(res, 200, ok(result))
+      // P1-F：entityId 从未存在（id 拼错）→ 404；已 forgotten 的重复删 → 幂等 200 false。
+      if (!result.exists) throw new ApiError('memory-not-found', '记忆不存在或不属于当前会话', 404)
+      return sendJson(res, 200, ok({ forgotten: result.forgotten }))
     }
     if (method === 'POST' && path === '/memory/edit') {
       const body = await readJson(req)
@@ -375,6 +433,9 @@ async function dispatch(
         pitfallId: reqStr(body, 'pitfallId'),
         agentId: str(body.agentId) ?? 'default',
       })
+      // 物理删除是幂等语义：重复删返回 {deleted:false} 而非报错——物理删掉后行已
+      // 不存在，无法（也不应）区分「从未存在」和「已删除」，与 /memory/forget 的
+      // 软删（status 字段可区分）不同。调用方靠 deleted:false 即可知道「没删到」。
       return sendJson(res, 200, ok(result))
     }
     if (method === 'POST' && path === '/snapshots/pin') {
@@ -538,7 +599,12 @@ export function listAgents(deps: MemoriesApiDeps): AgentSummary[] {
 function listMemories(deps: MemoriesApiDeps, url: URL): MemoryCard[] {
   const db = deps.db()
   if (!db) return []
-  const agentId = url.searchParams.get('agentId') ?? ''
+  const rawAgentId = url.searchParams.get('agentId') ?? ''
+  // P1-D：这里必须和 forget/edit/import 一样把会话 id 解析成人格 id。
+  // 记忆是写在 personaId 下的（写路径 scope.agentId = personaId），列表却拿原始
+  // 会话 id 直接查，前端换会话后传新 id 就"列表 0 条"——同一批数据删除/编辑能
+  // 命中、列表却看不见。resolvePersonaId 是纯查询（查不到返回原值），不写库。
+  const agentId = rawAgentId ? resolvePersonaId(db, rawAgentId) : ''
   const query = url.searchParams.get('q') ?? ''
   const kinds = (url.searchParams.get('kinds') ?? '').split(',').filter(Boolean)
   const emotions = (url.searchParams.get('emotions') ?? '').split(',').filter(Boolean)
@@ -700,30 +766,6 @@ function listQuarantine(deps: MemoriesApiDeps, url: URL): QuarantineItem[] {
   } catch {
     return []
   }
-}
-
-/** 情感纠错：只改当前活跃版本，且不写 journal（用户纠错属于元数据修正，不参与时间树）。 */
-function fixEmotion(deps: MemoriesApiDeps, body: Record<string, unknown>): void {
-  const db = deps.db()
-  if (!db) throw new ApiError('not-ready', '记忆库尚未就绪', 503)
-  const versionId = reqStr(body, 'versionId')
-  const label = str(body.label) ?? ''
-  const allowed: readonly string[] = EMOTION_LABELS
-  if (!allowed.includes(label)) throw new ApiError('bad-emotion-label', `未知情感标签：${label}`)
-  db.run(
-    `UPDATE memory_version
-        SET emo_label = ?, emo_subject = COALESCE(?, emo_subject),
-            emo_trigger = COALESCE(?, emo_trigger),
-            emo_intensity = COALESCE(?, emo_intensity),
-            emo_confidence = 1.0
-      WHERE version_id = ?`,
-    [label, str(body.subject) ?? null, str(body.trigger) ?? null, num(body.intensity) ?? null, versionId],
-  )
-  db.run(
-    `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
-     VALUES (?,?,?,?,?,?)`,
-    [`aud_${Date.now().toString(36)}`, deps.workspaceId, '', 'emotion.fix', versionId, Date.now()],
-  )
 }
 
 /**
@@ -1156,8 +1198,11 @@ function plainObject(value: unknown): Record<string, unknown> | undefined {
  * 哈希变了 = 底线声明被改过，控制台必须弹强确认，而不是静默接受。
  */
 function readPersona(deps: MemoriesApiDeps, url: URL): PersonaDoc {
-  const agentId = url.searchParams.get('agentId') ?? 'default'
+  const rawAgentId = url.searchParams.get('agentId') ?? 'default'
   const db = deps.db()
+  // P1-D：persona_state.agent_id 存的是**人格 id**（不是会话 id），这里同样要过
+  // 一遍 resolvePersonaId，否则前端传会话 id 时查不到已写的人格、凭空返回默认值。
+  const agentId = db ? resolvePersonaId(db, rawAgentId) : rawAgentId
   const empty: PersonaDoc = {
     agentId,
     workspaceId: deps.workspaceId,
@@ -1179,7 +1224,12 @@ function readPersona(deps: MemoriesApiDeps, url: URL): PersonaDoc {
       WHERE agent_id = ? AND workspace_id = ?`,
     [agentId, deps.workspaceId],
   )
-  if (!row) return empty
+  if (!row) {
+    // P1-D：明确指定了不存在的 id 时返回 404，不凭空造一个"默认人格"。
+    // `default` 是"用户还没写过人格"的合法初态，仍返回空文档让 UI 有初值。
+    if (rawAgentId !== 'default') throw new ApiError('persona-not-found', `人格不存在：${rawAgentId}`, 404)
+    return empty
+  }
   return {
     agentId,
     workspaceId: deps.workspaceId,
@@ -1199,7 +1249,10 @@ function readPersona(deps: MemoriesApiDeps, url: URL): PersonaDoc {
 function writePersona(deps: MemoriesApiDeps, body: Record<string, unknown>): PersonaDoc {
   const db = deps.db()
   if (!db) throw new ApiError('not-ready', '记忆库尚未就绪', 503)
-  const agentId = str(body.agentId) ?? 'default'
+  const rawAgentId = str(body.agentId) ?? 'default'
+  // P1-D：与 readPersona 对称，同样把会话 id 解析成人格 id 再写，否则前端传
+  // 会话 id 时会在 persona_state 里另起一行（跟 ensureAgentRow 写的人格 id 对不上）。
+  const agentId = resolvePersonaId(db, rawAgentId)
   const name = (str(body.name) ?? agentId).slice(0, 40)
   const age = Math.min(999, Math.max(1, Math.round(num(body.age) ?? 10)))
   const traits: Record<string, number> = {}

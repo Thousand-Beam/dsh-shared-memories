@@ -27,7 +27,7 @@ import type { Scope } from '../src/shared/scope.js'
 import { ScopedQuery } from '../src/host/memory/scoped-query.js'
 import { TemporalTree } from '../src/host/memory/timetree.js'
 import { RestoreBarrier } from '../src/host/snapshot/barrier.js'
-import { SnapshotEngine } from '../src/host/snapshot/engine.js'
+import { SnapshotEngine, SnapshotError } from '../src/host/snapshot/engine.js'
 import { ExecGitRunner } from '../src/host/snapshot/git.js'
 import type { SnapshotManifest } from '../src/host/snapshot/manifest.js'
 import { RestoreEngine } from '../src/host/snapshot/restore.js'
@@ -244,4 +244,56 @@ test('快照被篡改 → 设备 B 进入 degraded 只读，错误码 snapshot-c
   assert.equal(barrier2.phase, 'degraded')
   assert.equal(barrier2.acceptsWrites, false, '降级后必须拒绝写入')
   assert.equal(barrier2.readOnly, true)
+})
+
+test('repo.path 指向陌生 git 仓库 → 拒绝快照（repo-hijack）', async (t) => {
+  const dsmRemote = await makeBareRemote(t) // 配置的同步远端
+  const projectRemote = await makeBareRemote(t) // "项目"自己的远端（陌生）
+
+  // root 是一个已存在的 git 仓库，origin 指向项目远程——这是别人的仓库。
+  const root = await tempRoot(t, 'hijack-snap-')
+  await git(root, ['init', '-b', 'main'])
+  await git(root, ['remote', 'add', 'origin', projectRemote])
+  await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'someone-elses-project' }))
+
+  const engine = new SnapshotEngine({
+    root,
+    deviceId: 'devA',
+    git: new ExecGitRunner({ cwd: root }),
+    remote: dsmRemote,
+    branch: 'main',
+    clock: () => NOW,
+    collectState: () => ({ agents: [] }),
+  })
+
+  await assert.rejects(
+    () => engine.snapshot('shutdown'),
+    (error: unknown) => error instanceof SnapshotError && error.code === 'repo-hijack',
+    '快照必须拒绝在别人的仓库里 git add -A + push',
+  )
+})
+
+test('restore 时 repo.path 指向陌生 git 仓库 → 降级只读（repo-hijack）', async (t) => {
+  const dsmRemote = await makeBareRemote(t)
+  const projectRemote = await makeBareRemote(t)
+
+  const root = await tempRoot(t, 'hijack-restore-')
+  await git(root, ['init', '-b', 'main'])
+  await git(root, ['remote', 'add', 'origin', projectRemote])
+
+  const db = await openTestDb(t)
+  if (!db) return
+  const restore = new RestoreEngine({
+    root,
+    db,
+    journal: new Journal({ root, deviceId: 'devB' }),
+    barrier: new RestoreBarrier(),
+    git: new ExecGitRunner({ cwd: root }),
+    remote: dsmRemote,
+    branch: 'main',
+  })
+
+  const outcome = await restore.restoreOnBoot()
+  assert.equal(outcome.status, 'degraded')
+  assert.equal(outcome.code, 'repo-hijack', '拒绝把记忆拉进别人的仓库，宁可只读降级')
 })

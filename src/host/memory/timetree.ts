@@ -205,6 +205,69 @@ export class TemporalTree {
     return closed
   }
 
+  /**
+   * 情感纠错（P1-E）：只改某个版本的情感标注，不开新版本、不动正文。
+   *
+   * 之前 routes 层直接裸 UPDATE memory_version 不写 journal，情感纠错在冷启动
+   * 回放时被吞掉（journal 里没这条，B 机重放后标签回到旧值）。现在写
+   * `version.emotion` journal，跨设备可回放。
+   *
+   * subject/trigger/intensity 传 null 表示"不覆盖，保留原值"（与旧 routes 的
+   * COALESCE 语义一致）；label 必填且必须合法。
+   */
+  async fixEmotion(input: {
+    versionId: string
+    label: string
+    subject?: string | null
+    trigger?: string | null
+    intensity?: number | null
+    scope: Scope
+    author?: Author
+  }): Promise<{ versionId: string; changed: boolean }> {
+    assertScope(input.scope, 'TemporalTree.fixEmotion')
+    const label = input.label
+    if (!(EMOTION_LABELS as readonly string[]).includes(label)) {
+      throw new Error(`TemporalTree.fixEmotion: 未知情感标签 ${label}`)
+    }
+    const subject = input.subject ?? null
+    const trigger = input.trigger ?? null
+    const intensity = input.intensity ?? null
+    const author: Author = input.author ?? 'user'
+
+    const outcome = this.#db.transaction(() => {
+      const version = this.#db.one<VersionRow>(
+        `SELECT * FROM memory_version WHERE version_id = ?`,
+        [input.versionId],
+      )
+      if (!version) return null
+      this.#db.run(
+        `UPDATE memory_version
+            SET emo_label = ?, emo_subject = COALESCE(?, emo_subject),
+                emo_trigger = COALESCE(?, emo_trigger),
+                emo_intensity = COALESCE(?, emo_intensity),
+                emo_confidence = 1.0
+          WHERE version_id = ?`,
+        [label, subject, trigger, intensity, input.versionId],
+      )
+      return { entityId: version.entity_id }
+    })
+
+    if (!outcome) return { versionId: input.versionId, changed: false }
+
+    await this.#journal.append({
+      op: 'version.emotion',
+      entityId: outcome.entityId,
+      versionId: input.versionId,
+      label,
+      subject,
+      trigger,
+      intensity,
+      confidence: 1,
+      author,
+    })
+    return { versionId: input.versionId, changed: true }
+  }
+
   /** 查询某实体在指定时刻的版本（时间旅行读）。 */
   asOf(entityId: string, at: number, scope: Scope): VersionRow | undefined {
     assertScope(scope, 'TemporalTree.asOf')

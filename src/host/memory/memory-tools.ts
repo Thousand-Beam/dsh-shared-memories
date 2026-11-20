@@ -20,6 +20,7 @@ import type { MemoryKind, SqlDriver } from '../../shared/types.js'
 import type { Scope } from '../../shared/scope.js'
 import type { TemporalTree } from './timetree.js'
 import type { PitfallStore } from './pitfall.js'
+import type { PoisonGuard } from './poison.js'
 import { recallMemories } from './recall.js'
 
 /** 宿主 `ctx.tools` 的最小面。 */
@@ -38,6 +39,10 @@ export interface MemoryToolDeps {
   readonly personaOf: (sessionId: string) => string
   /** 踩坑链（四段式）；kind=pitfall 时同步写入，缺失则只写记忆不写链。 */
   readonly pitfalls?: () => PitfallStore | undefined
+  /** 污染防御闸门；记忆主动写入前过一遍，缺失则不拦（但 trust 回落到 agent 基线）。 */
+  readonly guard?: () => PoisonGuard | undefined
+  /** 恢复闸门（degraded 只读承诺）：未就绪时拒写。 */
+  readonly assertWritable?: (operation: string) => void
   readonly onWarn: (message: string) => void
 }
 
@@ -155,13 +160,30 @@ export function registerMemoryTools(
           : text.slice(0, 24)
 
       try {
+        // 恢复闸门：degraded 只读时拒写（与 /memory、/import 等写路径一致）。
+        deps.assertWritable?.('memory_remember')
+        // 污染防御：模型主动记的当 agent 来源过闸门，不再伪装成 user 直写。
+        // agent 基线信任 0.6（poison.ts DEFAULT_TRUST），过闸门后取评估值。
+        let trust = 0.6
+        const guard = deps.guard?.()
+        if (guard !== undefined) {
+          const guarded = await guard.guard({ text, scope, kind, source: 'agent', subjectKey })
+          if (guarded.assessment.action === 'quarantine') {
+            return JSON.stringify({
+              ok: false,
+              quarantined: true,
+              reasons: guarded.assessment.reasons,
+            })
+          }
+          trust = guarded.assessment.trust
+        }
         const opened = await tree.openVersion({
           scope,
           kind,
           subjectKey,
           text,
-          author: 'user',
-          trust: 0.9,
+          author: 'agent',
+          trust,
           distillStatus: 'distilled',
           distillModel: 'model-tool',
         })

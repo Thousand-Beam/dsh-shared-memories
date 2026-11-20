@@ -175,10 +175,15 @@ async function safeUnlink(file: string): Promise<void> {
 
 /** 物理销毁：库 + journal 一起清。返回真实删除的行数（不是"影响行数"的估算）。 */
 export async function purgeAgent(options: PurgeOptions): Promise<PurgeResult> {
-  const { db, root, workspaceId, agentId } = options
+  const { db, root, workspaceId, agentId, sessionId } = options
   const warn = options.onWarn ?? (() => undefined)
   const at = (options.clock ?? (() => Date.now()))()
   const failures: string[] = []
+
+  // 待清理的 id 集合：persona_state 行与 persona/<id>.json 的 key 既可能是人格 id
+  // 也可能是会话 id（历史数据、继承路径、手动改绑），两者都要清，否则"销毁了但人格
+  // 文件还在"会被下一次快照漫游到别的机器复活（P0-C）。
+  const idKeys = [...new Set([agentId, sessionId].filter((v): v is string => typeof v === 'string' && v !== ''))]
 
   const fail = (label: string, cause: unknown): void => {
     const text = `${label}：${messageOf(cause)}`
@@ -204,8 +209,8 @@ export async function purgeAgent(options: PurgeOptions): Promise<PurgeResult> {
     [workspaceId, agentId],
   )
   const quarantine = countRows(db, 'SELECT quarantine_id FROM quarantine WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-  const personas = countRows(db, 'SELECT agent_id FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-  const identities = countRows(db, 'SELECT agent_id FROM persona_identity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+  const personas = countRows(db, `SELECT agent_id FROM persona_state WHERE workspace_id = ? AND agent_id IN (${placeholders(idKeys)})`, [workspaceId, ...idKeys])
+  const identities = countRows(db, `SELECT agent_id FROM persona_identity WHERE workspace_id = ? AND agent_id IN (${placeholders(idKeys)})`, [workspaceId, ...idKeys])
   const skills = countRows(db, 'SELECT skill_id FROM agent_skill WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
   const policies = countRows(db, 'SELECT session_id FROM session_policy WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
   const audits = countRows(db, 'SELECT audit_id FROM audit_log WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
@@ -228,10 +233,10 @@ export async function purgeAgent(options: PurgeOptions): Promise<PurgeResult> {
     step('删实体', 'DELETE FROM memory_entity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
     step('删踩坑', 'DELETE FROM pitfall WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
     step('删隔离区', 'DELETE FROM quarantine WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-    step('删人格状态', 'DELETE FROM persona_state WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
-    step('删身份绑定', 'DELETE FROM persona_identity WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
+    step('删人格状态', `DELETE FROM persona_state WHERE workspace_id = ? AND agent_id IN (${placeholders(idKeys)})`, [workspaceId, ...idKeys])
+    step('删身份绑定', `DELETE FROM persona_identity WHERE workspace_id = ? AND agent_id IN (${placeholders(idKeys)})`, [workspaceId, ...idKeys])
     // 别的会话可能绑到这个人格上：一并解绑，否则"销毁了还继承"。
-    step('断人格引用', 'DELETE FROM persona_identity WHERE workspace_id = ? AND persona_id = ?', [workspaceId, agentId])
+    step('断人格引用', `DELETE FROM persona_identity WHERE workspace_id = ? AND persona_id IN (${placeholders(idKeys)})`, [workspaceId, ...idKeys])
     step('删技能', 'DELETE FROM agent_skill WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
     // 提炼水位也一起烧掉：留着会让"销毁后重开同名会话"以为已经记过了。
     step(
@@ -275,7 +280,7 @@ export async function purgeAgent(options: PurgeOptions): Promise<PurgeResult> {
   // ── ③ 派生状态文件（persona/*.json、state/*.json）──
   // 这些文件不进库、但会被快照带走；留着它们等于给"复活"留了条备胎。
   try {
-    await scrubDerivedState({ root, workspaceId, agentId, warn, failures })
+    await scrubDerivedState({ root, workspaceId, agentId, sessionId, warn, failures })
   } catch (cause) {
     fail('清理派生状态失败', cause)
   }
@@ -518,6 +523,16 @@ function countRows(db: SqlDriver, sql: string, params: readonly unknown[]): numb
   } catch {
     return 0
   }
+}
+
+/** 与快照引擎落文件名一致：`persona/<sanitizeName(id)>.json`。删除必须用同一套消毒。 */
+function sanitizeName(value: string): string {
+  return value.replace(/[^0-9A-Za-z._-]/g, '_').slice(0, 120) || 'anonymous'
+}
+
+/** 生成 `?, ?, ...` 占位符串（长度 = 数组长度）。 */
+function placeholders(values: readonly unknown[]): string {
+  return Array.from({ length: values.length }, () => '?').join(', ')
 }
 
 type AtomicOutcome = 'renamed' | 'inplace' | 'failed'
@@ -763,6 +778,35 @@ async function scanJournalMaxLc(devicesDir: string): Promise<number> {
   return maxLc
 }
 
+/** 扫描 purge 设备的墓碑最大 seq（无记录返回 0）。 */
+async function scanPurgeMaxSeq(purgeDir: string): Promise<number> {
+  let maxSeq = 0
+  let names: string[]
+  try {
+    names = (await readdir(purgeDir)).filter((name) => name.endsWith('.jsonl'))
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    let raw: string
+    try {
+      raw = await readFile(join(purgeDir, name), 'utf8')
+    } catch {
+      continue
+    }
+    for (const line of raw.split('\n')) {
+      if (line.trim() === '') continue
+      try {
+        const record = JSON.parse(line) as JournalRecordShape
+        if (typeof record.seq === 'number' && record.seq > maxSeq) maxSeq = record.seq
+      } catch {
+        continue
+      }
+    }
+  }
+  return maxSeq
+}
+
 /** 追加墓碑。失败返回 false（不抛），由调用方决定是否重试。 */
 async function appendTombstone(options: {
   root: string
@@ -783,14 +827,15 @@ async function appendTombstone(options: {
   // baseLc 由 purgeJournal 在改写前扫描传入——改写会删掉本 agent 的记录，
   // 若改写后再扫会漏掉它们的 lc，单设备时墓碑退化成 lc=1。
   const lc = (options.baseLc ?? (await scanJournalMaxLc(devicesDir))) + 1
+  // seq 递增：墓碑虽绕过 Journal 落盘，但 purge 设备内仍需唯一递增的 seq。
+  // 否则 readMerged({sinceSeq:{purge:n}}) 会一次跳过所有墓碑（它们都 seq=1），
+  // 被销毁的 agent 在增量回放时复活（P2-I）。第一个墓碑 seq=1（readDevice 的
+  // seq > 0 过滤要求 seq 必须 >=1），后续每次 +1。
+  const seq = (await scanPurgeMaxSeq(dir)) + 1
   const tombstone = JSON.stringify({
     v: 1,
     lc,
-    // seq 必须是 >= 1：readDevice 用 `record.seq > sinceSeq`（水位默认 0）过滤，
-    // seq=0 会被 `0 > 0` 判假而永久过滤，墓碑就进不了 readMerged 的重放流，
-    // agent.purge 的删除语句在任何设备上都不会执行。purge 设备没有自己的 seq
-    // 计数（墓碑是绕过 Journal 直接落盘的），这里恒写 1，靠 lc 保证因果顺序。
-    seq: 1,
+    seq,
     op: 'agent.purge',
     workspaceId,
     agentId,
@@ -826,18 +871,26 @@ async function scrubDerivedState(options: {
   root: string
   workspaceId: string
   agentId: string
+  sessionId?: string
   warn: (message: string) => void
   failures: string[]
 }): Promise<void> {
-  const { root, workspaceId, agentId, warn, failures } = options
+  const { root, workspaceId, agentId, sessionId, warn, failures } = options
 
-  // persona 文件路径由 agentId 拼成，必须先过 scope 令牌校验——`../` 之类的
-  // 穿越字符会把 `persona/<agentId>.json` 变成删到 persona/ 之外的文件。
-  if (!isSafeScopeToken(agentId)) {
-    failures.push(`agentId 含非法字符，跳过人格文件删除：${agentId}`)
-    warn(`agentId 含非法字符，跳过人格文件删除：${agentId}`)
-  } else {
-    const personaFile = join(root, 'persona', `${agentId}.json`)
+  // persona 文件 key 与 persona_state 行一样可能混用「人格 id」与「会话 id」两套
+  // 空间（继承路径、历史数据、手动改绑），两个都要按快照引擎的 sanitizeName 消毒后
+  // 删除；漏掉一个，「销毁了但 persona/<id>.json 还在」会被下一次快照漫游到别的
+  // 机器复活（P0-C）。
+  const idKeys = [...new Set([agentId, sessionId].filter((v): v is string => typeof v === 'string' && v !== ''))]
+  for (const key of idKeys) {
+    // 文件路径由 id 拼成，必须先过 scope 令牌校验——`../` 之类的穿越字符会把
+    // `persona/<id>.json` 变成删到 persona/ 之外的文件。
+    if (!isSafeScopeToken(key)) {
+      failures.push(`id 含非法字符，跳过人格文件删除：${key}`)
+      warn(`id 含非法字符，跳过人格文件删除：${key}`)
+      continue
+    }
+    const personaFile = join(root, 'persona', `${sanitizeName(key)}.json`)
     try {
       await rm(personaFile, { force: true })
     } catch (cause) {
@@ -850,7 +903,7 @@ async function scrubDerivedState(options: {
   await scrubJson(identityFile, (doc) => {
     const identities = Array.isArray(doc.identities) ? (doc.identities as Record<string, unknown>[]) : []
     const kept = identities.filter(
-      (row) => row.agentId !== agentId && row.personaId !== agentId && row.workspaceId === workspaceId,
+      (row) => !idKeys.includes(row.agentId as string) && !idKeys.includes(row.personaId as string) && row.workspaceId === workspaceId,
     )
     return { ...doc, identities: [...kept, ...identities.filter((row) => row.workspaceId !== workspaceId)] }
   }, warn, failures)
@@ -858,7 +911,7 @@ async function scrubDerivedState(options: {
   const agentsFile = join(root, 'state', 'agents.json')
   await scrubJson(agentsFile, (doc) => {
     const agents = Array.isArray(doc.agents) ? (doc.agents as Record<string, unknown>[]) : []
-    return { ...doc, agents: agents.filter((row) => row.agentId !== agentId) }
+    return { ...doc, agents: agents.filter((row) => !idKeys.includes(row.agentId as string)) }
   }, warn, failures)
 }
 

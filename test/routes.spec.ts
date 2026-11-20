@@ -23,6 +23,7 @@ import { promisify } from 'node:util'
 import {
   API_PREFIX,
   registerRoutes,
+  type ConnectionLike,
   type MemoriesApiDeps,
   type WebServerLike,
 } from '../src/host/http/routes.js'
@@ -149,7 +150,10 @@ async function serve(t: TestContext, deps: MemoriesApiDeps): Promise<string> {
   return `http://127.0.0.1:${port}${API_PREFIX}`
 }
 
-async function makeHarness(t: TestContext, options: { ready?: boolean } = {}): Promise<Harness | undefined> {
+async function makeHarness(
+  t: TestContext,
+  options: { ready?: boolean; connection?: ConnectionLike } = {},
+): Promise<Harness | undefined> {
   const db = await openTestDb(t)
   if (!db) return undefined
 
@@ -225,6 +229,7 @@ async function makeHarness(t: TestContext, options: { ready?: boolean } = {}): P
     db: () => db,
     snapshots: () => engine,
     restore: () => undefined,
+    connection: options.connection,
     saveNow: async () => {
       const result = await engine.snapshot('manual')
       return { snapshotId: result.manifest.snapshotId }
@@ -248,24 +253,27 @@ async function makeHarness(t: TestContext, options: { ready?: boolean } = {}): P
     forgetMemory: async (input: { entityId: string; agentId: string }) => {
       const agentId = input.agentId || AGENT
       const scope: Scope = { workspaceId: WORKSPACE, agentId, deviceId: 'dev-routes' }
-      const entity = db.one<{ entity_id: string }>(
-        `SELECT entity_id FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+      const entity = db.one<{ entity_id: string; status: string }>(
+        `SELECT entity_id, status FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
         [input.entityId, WORKSPACE, agentId],
       )
-      if (!entity) return { forgotten: false }
-      const active = db.one<{ valid_from: number }>(
-        `SELECT valid_from FROM memory_version WHERE entity_id = ? AND valid_until IS NULL`,
-        [input.entityId],
-      )
-      if (active) {
-        const at = Math.max(NOW + 1000, active.valid_from + 1)
-        await tree.closeAt(input.entityId, at, scope, 'user')
+      if (!entity) return { forgotten: false, exists: false }
+      if (entity.status !== 'forgotten') {
+        const active = db.one<{ valid_from: number }>(
+          `SELECT valid_from FROM memory_version WHERE entity_id = ? AND valid_until IS NULL`,
+          [input.entityId],
+        )
+        if (active) {
+          const at = Math.max(NOW + 1000, active.valid_from + 1)
+          await tree.closeAt(input.entityId, at, scope, 'user')
+        }
+        db.run(
+          `UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+          [NOW + 1000, input.entityId, WORKSPACE, agentId],
+        )
+        return { forgotten: true, exists: true }
       }
-      const updated = db.run(
-        `UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ? AND workspace_id = ? AND agent_id = ? AND status != 'forgotten'`,
-        [NOW + 1000, input.entityId, WORKSPACE, agentId],
-      )
-      return { forgotten: updated.changes > 0 }
+      return { forgotten: false, exists: true }
     },
     editMemory: async (input: { entityId: string; agentId: string; text: string }) => {
       const agentId = input.agentId || AGENT
@@ -288,6 +296,15 @@ async function makeHarness(t: TestContext, options: { ready?: boolean } = {}): P
     deletePitfall: async (input: { pitfallId: string; agentId: string }) => {
       const agentId = input.agentId || AGENT
       return pitfalls.remove(input.pitfallId, { workspaceId: WORKSPACE, agentId, deviceId: 'dev-routes' })
+    },
+    fixEmotion: async (input: { versionId: string; label: string; subject?: string | null; trigger?: string | null; intensity?: number | null; agentId?: string }) => {
+      const row = db.one('SELECT version_id FROM memory_version WHERE version_id = ?', [input.versionId])
+      if (!row) return { versionId: input.versionId, changed: false }
+      db.run(
+        `UPDATE memory_version SET emo_label = ?, emo_subject = COALESCE(?, emo_subject), emo_trigger = COALESCE(?, emo_trigger), emo_intensity = COALESCE(?, emo_intensity), emo_confidence = 1.0 WHERE version_id = ?`,
+        [input.label, input.subject ?? null, input.trigger ?? null, input.intensity ?? null, input.versionId],
+      )
+      return { versionId: input.versionId, changed: true }
     },
   } as unknown as MemoriesApiDeps
 
@@ -653,4 +670,59 @@ test('POST /rules/delete：物理删除踩坑并写审计', async (t) => {
     body: { pitfallId: 'pf_test', agentId: AGENT },
   })
   assert.equal(again.body.data?.deleted, false, '重复删应是幂等 false')
+})
+
+test('P0 鉴权：写操作被 connection 拒绝时返回 401/403，读接口不拦', async (t) => {
+  const h = await makeHarness(t, {
+    connection: { requestRejection: () => 401 },
+  })
+  if (!h) return
+
+  // 读接口：connection 拦不到 GET，正常返回。
+  const read = await call<MemoryCard[]>(h.base, `/memories?agentId=${AGENT}`)
+  assert.equal(read.status, 200, '读接口不应被 connection 鉴权拦截')
+
+  // 写接口：requestRejection 返回 401 → 401 拒绝，handler 根本不执行。
+  const denied = await call(h.base, '/emotion', {
+    method: 'POST',
+    body: { versionId: 'v_x', label: 'anxiety' },
+  })
+  assert.equal(denied.status, 401)
+  assert.equal(denied.body.error?.code, 'unauthorized')
+})
+
+test('P0 鉴权：connection 返回 403 时写操作 403，放行时正常执行', async (t) => {
+  const h = await makeHarness(t, {
+    connection: { requestRejection: () => 403 },
+  })
+  if (!h) return
+
+  const denied = await call(h.base, '/sync-interval', {
+    method: 'POST',
+    body: { intervalSec: 120 },
+  })
+  assert.equal(denied.status, 403, '跨站/跨源应映射成 403')
+
+  // connection 放行（undefined）时，写操作照常执行。
+  const h2 = await makeHarness(t, {
+    connection: { requestRejection: () => undefined },
+  })
+  if (!h2) return
+  const ok = await call<{ intervalSec: number }>(h2.base, '/sync-interval', {
+    method: 'POST',
+    body: { intervalSec: 120 },
+  })
+  assert.equal(ok.status, 200)
+  assert.equal(ok.body.data?.intervalSec, 120)
+})
+
+test('P0 鉴权：connection 缺失时不鉴权（无 webServer 的 profile）', async (t) => {
+  const h = await makeHarness(t, { connection: undefined })
+  if (!h) return
+
+  const ok = await call<{ intervalSec: number }>(h.base, '/sync-interval', {
+    method: 'POST',
+    body: { intervalSec: 120 },
+  })
+  assert.equal(ok.status, 200, 'connection 拿不到时写操作不鉴权（保持旧行为）')
 })

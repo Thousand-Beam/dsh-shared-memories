@@ -237,7 +237,12 @@ export class SnapshotEngine {
     const sha = head.stdout.trim()
 
     const tag = `snap/${manifest.snapshotId}`
-    const tagged = await this.#git.run(['tag', '-f', '-a', tag, '-m', message, sha])
+    // annotated tag 同样需要 committer 身份：commit 传了 -c 而这里漏掉时，
+    // 无全局 git 身份的环境会在 tag 这一步 exit 128「Committer identity unknown」，
+    // 使 snapshot 在 commit 之后、rotate/push 之前抛错，整个漫游静默失效。
+    const tagged = await this.#git.run(['tag', '-f', '-a', tag, '-m', message, sha], {
+      config: { 'user.name': this.#authorName, 'user.email': this.#authorEmail },
+    })
     assertGitOk(tagged, ['tag', tag], 'git-tag-failed')
 
     return { commit: sha, tag }
@@ -430,13 +435,44 @@ export class SnapshotEngine {
         config: { 'user.name': this.#authorName, 'user.email': this.#authorEmail },
       })
     } else {
-      // 已存在的仓库也可能缺 .gitignore（v0.3.5 之前从未写过它）。
+      // 已存在的仓库也可能是陌生仓库（repo.path 指向了别人的项目目录），
+      // 先验证归属，再补 .gitignore（v0.3.5 之前从未写过它）。
+      await this.#assertRepoOwnership()
       await this.#ensureGitignore()
     }
     // 新旧仓库都钉死行尾策略：清单里记的是工作区字节的 sha256。
     // 一旦 git 把 LF 转成 CRLF（Windows 默认 core.autocrlf=true），恢复时的校验
     // 就会把"一次完全正常的拉取"判成 snapshot-corrupt——假篡改比真篡改更难查。
     await this.#pinLineEndings()
+  }
+
+  /**
+   * 防御「repo.path 指向陌生 git 仓库」：目录里已有一个 git 仓库时，它可能是
+   * 用户的项目仓库（origin 指向项目远程）。若直接在这里 `git add -A` + commit +
+   * push，会污染外层仓库、并把记忆推送到项目远程。
+   *
+   * 归属的尺子是 origin：dsm 专用仓库的 origin 要么与配置一致，要么（纯本地）没有。
+   * 一旦 origin 指向别处，就是劫持，宁可拒快照也不能往别人的仓库里塞记忆。
+   */
+  async #assertRepoOwnership(): Promise<void> {
+    const url = await this.#git.run(['remote', 'get-url', 'origin'])
+    if (url.code !== 0) return // 无 origin：纯本地 dsm 仓库，安全。
+    const existing = url.stdout.trim()
+    if (this.#remote.trim()) {
+      if (existing !== this.#remote) {
+        throw new SnapshotError(
+          'repo-hijack',
+          `repo.path 指向的仓库已绑定 remote「${existing}」，与配置「${this.#remote}」不一致，拒绝快照`,
+          { existing, configured: this.#remote },
+        )
+      }
+    } else {
+      throw new SnapshotError(
+        'repo-hijack',
+        `repo.path 指向的仓库已绑定 remote「${existing}」，但未配置同步远端，拒绝快照（这是别人的仓库）`,
+        { existing },
+      )
+    }
   }
 
   /**

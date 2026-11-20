@@ -36,6 +36,7 @@ export type JournalOp =
   | 'entity.upsert'
   | 'version.open'
   | 'version.close'
+  | 'version.emotion'
   | 'pitfall.promote'
   | 'persona.shift'
   | 'quarantine.add'

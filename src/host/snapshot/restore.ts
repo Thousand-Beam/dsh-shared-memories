@@ -70,6 +70,7 @@ interface ReplayStats {
   versions: number
   closed: number
   forgotten: number
+  emotions: number
   quarantined: number
   skills: number
   userProfiles: number
@@ -99,6 +100,7 @@ export class ReplayApplier {
       versions: 0,
       closed: 0,
       forgotten: 0,
+      emotions: 0,
       quarantined: 0,
       skills: 0,
       userProfiles: 0,
@@ -133,6 +135,34 @@ export class ReplayApplier {
               versionId,
             ])
             stats.closed++
+            break
+          }
+          case 'version.emotion': {
+            // 情感纠错（P1-E）：必须跟着漫游，否则 A 机改的情感在 B 机冷启动后被
+            // journal 回放吞掉、标签回到旧值。COALESCE 语义与写入端一致：subject/
+            // trigger/intensity 为 null 表示"不覆盖，保留原值"，避免回放时误清空。
+            const versionId = str(record.versionId)
+            if (!versionId) {
+              stats.skipped++
+              break
+            }
+            this.#run(
+              `UPDATE memory_version
+                  SET emo_label = ?, emo_subject = COALESCE(?, emo_subject),
+                      emo_trigger = COALESCE(?, emo_trigger),
+                      emo_intensity = COALESCE(?, emo_intensity),
+                      emo_confidence = ?
+                WHERE version_id = ?`,
+              [
+                str(record.label) ?? null,
+                (record.subject ?? null) as string | null,
+                (record.trigger ?? null) as string | null,
+                (record.intensity ?? null) as number | null,
+                num(record.confidence) ?? 1,
+                versionId,
+              ],
+            )
+            stats.emotions++
             break
           }
           case 'memory.forget': {
@@ -638,6 +668,13 @@ export class RestoreEngine {
       if (pull.code === 0) return
 
       const stderr = pull.stderr.trim()
+      // 空远端 = 首次播种：远端还没有该分支，没有历史可拉。
+      // 这不是网络错误（fetch 已成功），也不是冲突——是"第一次把数据推上去之前"的常态。
+      // 若按 pull-failed 降级只读，README 模式 B 的首次启动会永久锁死。
+      if (/couldn't find remote ref|unknown revision|not our ref|empty repository|does not have any commits/i.test(stderr)) {
+        this.#onWarn(`远端仓库为空（${stderr}），按首次播种处理：以本地数据为准，稍后 snapshot 推送`)
+        return
+      }
       if (/divergent|not possible to fast-forward|CONFLICT/i.test(stderr)) {
         // 快进不了 = 两条时间线分叉，属于冲突而不是网络问题，重试没有意义。
         throw new RestoreError('pull-conflict', `历史分叉，需要人工合并：${stderr}`, stderr)
@@ -686,7 +723,28 @@ export class RestoreEngine {
       const add = await this.#git.run(['remote', 'add', 'origin', this.#remote])
       assertGitOk(add, ['remote', 'add', 'origin'], 'git-remote-add-failed')
     } else {
+      // origin 已存在：先验证归属（repo.path 可能指向陌生项目仓库，其 origin 指向
+      // 项目远程），一致才允许 set-url 覆盖，防止把记忆拉进/推出别人的仓库。
+      await this.#assertRepoOwnership()
       await this.#git.run(['remote', 'set-url', 'origin', this.#remote])
+    }
+  }
+
+  /**
+   * 防御「repo.path 指向陌生 git 仓库」。restore 只走同步模式（`#pull` 仅在配置了
+   * remote 时调用），所以这里的尺子是：已存在的 origin 必须与配置的 remote 一致。
+   * 不一致 = 用户把 repo.path 配到了别人的项目目录，拒绝拉取。
+   */
+  async #assertRepoOwnership(): Promise<void> {
+    const url = await this.#git.run(['remote', 'get-url', 'origin'])
+    if (url.code !== 0) return // 无 origin，安全。
+    const existing = url.stdout.trim()
+    if (existing !== this.#remote) {
+      throw new RestoreError(
+        'repo-hijack',
+        `repo.path 指向的仓库已绑定 remote「${existing}」，与配置「${this.#remote}」不一致，拒绝拉取`,
+        { existing, configured: this.#remote },
+      )
     }
   }
 

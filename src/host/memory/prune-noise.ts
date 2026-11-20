@@ -24,7 +24,9 @@ export function noiseReason(text: string): string | null {
   if (body === '') return 'empty'
   // ①② 排版标记：记忆该是"一句话"，不是渲染后的列表项。
   if (/^\s*(?:[-*•#>]|\d+[.、)）])/.test(body)) return 'layout-list'
-  if (body.includes('**') || body.includes('`')) return 'layout-markdown'
+  // 只判加粗（**）：反引号可能是合法内容（"用 `npm run build` 构建"），
+  // 单独一个反引号不该判噪声——之前 `body.includes('`')` 误杀了含代码的合法记忆。
+  if (body.includes('**')) return 'layout-markdown'
   // ③ 元话语：讨论"记忆机制/注入管线本身"的句子不是用户的事实。
   //    注意别把"插件"「prompt」这类**单独出现**的词也算进来——"项目是个 DSH 插件"
   //    是一条正经的项目记忆，误杀它比漏杀更难解释。
@@ -32,7 +34,6 @@ export function noiseReason(text: string): string | null {
   if (/(提示词|prompt|系统段).{0,12}(注入|组装|拼接|模板)/i.test(body)) return 'meta'
   // ④ 明显是"操作指令"的祈使句：再重复一次 / 然后看 / 请输出…
   if (/^(?:再|然后|请|记得把|不要忘)/.test(body)) return 'imperative'
-  if (body.length > 200) return 'too-long'
   return null
 }
 

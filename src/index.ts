@@ -44,13 +44,13 @@ import { migrate, SCHEMA_VERSION } from './host/storage/schema.js'
 import { openSqliteDriver } from './host/storage/sqlite-driver.js'
 import { RestoreBarrier } from './host/snapshot/barrier.js'
 import { ExecGitRunner } from './host/snapshot/git.js'
-import { SnapshotEngine, type SnapshotAgentState } from './host/snapshot/engine.js'
+import { SnapshotEngine, SnapshotError, type SnapshotAgentState } from './host/snapshot/engine.js'
 import type { SnapshotTrigger } from './host/snapshot/manifest.js'
 import { RestoreEngine } from './host/snapshot/restore.js'
 import { PoisonGuard } from './host/memory/poison.js'
 import { Importer } from './host/memory/importer.js'
 import { PitfallStore } from './host/memory/pitfall.js'
-import { registerRoutes, type MemoriesApiDeps, type WebServerLike } from './host/http/routes.js'
+import { registerRoutes, type ConnectionLike, type MemoriesApiDeps, type WebServerLike } from './host/http/routes.js'
 import { SessionPolicyStore, ephemeralLeaks } from './host/memory/session-policy.js'
 import { PurgeError, purgeAgent } from './host/memory/purge.js'
 import { DistillService, type Complete } from './host/distill/service.js'
@@ -65,16 +65,16 @@ import { PLUGIN_ID, producerMessages } from './shared/message-source.js'
 export const name = PLUGIN_ID
 
 /**
- * 硬依赖。两条都不能少，而且原因不一样：
+ * 硬依赖只有一条：`systemPrompt`。
  *
- * - `systemPrompt`：注入 [Persona]/[Rules]/[回忆] 三段要用它的 `section()`。
- * - `webServer`：**必须写进 inject**。cordis 的 apply 时机由 inject 的依赖图决定，
- *   没声明的服务在 apply 时可能还没激活——那时 `ctx.get('webServer')` 返回
- *   `undefined`，控制台的 19 个端点就一个都没注册，前端拿到的全是 404，
- *   而宿主日志里只有一行 warn。这正是"物理库建好了、面板却一直转圈"的真因。
- *   宁可没有 webServer 的宿主里整插件不加载，也不要"加载了但接口不存在"。
+ * `webServer` 和 `tools` 都是**可选服务**：宿主没有它们，记忆功能（journal /
+ * 快照 / 召回 / 人格）照常工作，只是控制台接口 / 模型工具不注册。所以它们不能
+ * 写进插件级 inject——inject 里声明的服务缺失会让整个 fiber 停在 INACTIVE，
+ * headless / acp / sdk / sdk-minimal 四个 profile 里没有 webServer，插件就整块
+ * 不激活（P2-G）。改为在 apply 里用 `host.inject([...])` 局部注入：服务就绪后才
+ * 注册对应的接口 / 工具，既不拖垮无 webServer 的 profile，也不赌 bundle 顺序。
  */
-export const inject = ['systemPrompt', 'webServer', 'tools']
+export const inject = ['systemPrompt']
 
 export { Config }
 
@@ -96,6 +96,11 @@ interface SharedHost {
   /** 服务解析：cordis 4 的正规入口是 `ctx.reflect.get(name)`；老宿主上可能只有 `ctx.get`。 */
   reflect?: { get(name: string): unknown }
   get?(service: string): unknown
+  /**
+   * 局部注入（cordis 的 `ctx.inject`）：等依赖服务就绪后再调 callback，
+   * 不因缺服务拖垮整个插件加载。老宿主可能没有此方法（退回 lookupService 同步取）。
+   */
+  inject?(inject: string[], callback: (ctx: unknown) => void): unknown
   logger?: {
     info?: (message: string) => void
     warn?: (message: string) => void
@@ -118,8 +123,8 @@ interface SharedHost {
 
 /**
  * 取一个可选服务。两种宿主形态都试：`reflect.get`（cordis 4 反射层）与旧式 `get`。
- * 注意：这里只能取**已经写进 inject** 的服务——未声明的属性在 cordis 的 Proxy 上
- * 直接读会抛错，也拿不到就绪保证。
+ * 注意：这里只能取**已经注入**的服务——插件级 inject 声明过的，或局部 inject 的
+ * callback ctx 里注入过的。未注入的属性在 cordis 的 Proxy 上直接读会抛错。
  */
 function lookupService(host: SharedHost, name: string): unknown {
   if (typeof host.reflect?.get === 'function') {
@@ -312,6 +317,9 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         })
         .catch((error: unknown) => {
           warn(`快照失败（${trigger}）：${error instanceof Error ? error.message : String(error)}`)
+          // 手动保存必须把失败冒到 /save：否则前端收到 200 {"snapshotId":""} 假成功，
+          // 用户以为漫游已落地，实际一次都没推上去。
+          if (trigger === 'manual') throw error
           return undefined
         })
     })()
@@ -510,9 +518,14 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       db: () => runtime.db,
       snapshots: () => runtime.snapshots,
       restore: () => runtime.restore,
+      connection: lookupService(host, 'connection') as ConnectionLike | undefined,
       saveNow: async () => {
         const result = (await snapshotNow('manual')) as { manifest?: { snapshotId: string }; commit?: string } | undefined
-        return { snapshotId: result?.manifest?.snapshotId ?? '', commit: result?.commit }
+        const snapshotId = result?.manifest?.snapshotId
+        if (!snapshotId) {
+          throw new SnapshotError('snapshot-failed', '手动保存未生成快照（恢复未就绪、无痕巡检跳过或引擎失败）')
+        }
+        return { snapshotId, commit: result?.commit }
       },
       testConnection: async () => {
         if (!config.repo.remote) {
@@ -632,25 +645,30 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         if (!db || !runtime.tree) throw new Error('记忆库尚未就绪')
         const agentId = runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default')
         const scope = { workspaceId, agentId, deviceId }
-        const entity = db.one<{ entity_id: string }>(
-          `SELECT entity_id FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+        // 区分「从未存在」与「已 forgotten」：前者是调用方 id 拼错（404），
+        // 后者是幂等重复删（200 false），两者不能混成同一个 {forgotten:false}。
+        const entity = db.one<{ entity_id: string; status: string }>(
+          `SELECT entity_id, status FROM memory_entity WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
           [input.entityId, workspaceId, agentId],
         )
-        if (!entity) return { forgotten: false }
-        const active = db.one<{ valid_from: number }>(
-          `SELECT valid_from FROM memory_version WHERE entity_id = ? AND valid_until IS NULL`,
-          [input.entityId],
-        )
-        if (active) {
-          const at = Math.max(Date.now(), active.valid_from + 1)
-          await runtime.tree.closeAt(input.entityId, at, scope, 'user')
+        if (!entity) return { forgotten: false, exists: false }
+        if (entity.status !== 'forgotten') {
+          const active = db.one<{ valid_from: number }>(
+            `SELECT valid_from FROM memory_version WHERE entity_id = ? AND valid_until IS NULL`,
+            [input.entityId],
+          )
+          if (active) {
+            const at = Math.max(Date.now(), active.valid_from + 1)
+            await runtime.tree.closeAt(input.entityId, at, scope, 'user')
+          }
+          db.run(
+            `UPDATE memory_entity SET status = 'forgotten', updated_at = ?
+             WHERE entity_id = ? AND workspace_id = ? AND agent_id = ?`,
+            [Date.now(), input.entityId, workspaceId, agentId],
+          )
+          return { forgotten: true, exists: true }
         }
-        const updated = db.run(
-          `UPDATE memory_entity SET status = 'forgotten', updated_at = ?
-           WHERE entity_id = ? AND workspace_id = ? AND agent_id = ? AND status != 'forgotten'`,
-          [Date.now(), input.entityId, workspaceId, agentId],
-        )
-        return { forgotten: updated.changes > 0 }
+        return { forgotten: false, exists: true }
       },
       // 修改一条记忆的正文：开新版本（旧版本自动进时间树），不直接覆盖原文。
       editMemory: async (input) => {
@@ -680,13 +698,38 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         const agentId = runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default')
         return pitfalls.remove(input.pitfallId, { workspaceId, agentId, deviceId })
       },
+      // 情感纠错：改版本的情感标注，写 version.emotion journal 可跨设备漫游（P1-E）。
+      fixEmotion: async (input) => {
+        const db = runtime.db
+        if (!db || !runtime.tree) throw new Error('记忆库尚未就绪')
+        const agentId = runtime.identity?.resolve(input.agentId || 'default') ?? (input.agentId || 'default')
+        const scope = { workspaceId, agentId, deviceId }
+        return runtime.tree.fixEmotion({
+          versionId: input.versionId,
+          label: input.label,
+          subject: input.subject,
+          trigger: input.trigger,
+          intensity: input.intensity,
+          scope,
+          author: 'user',
+        })
+      },
     }
 
-    const webServer = lookupService(host, 'webServer') as WebServerLike | undefined
-    if (webServer) {
-      disposers.push(registerRoutes(webServer, apiDeps))
+    // webServer 是可选服务：宿主就绪后再注册接口（局部注入，不因缺服务拖垮插件加载）。
+    // 老宿主没有 inject 方法时退回同步 lookupService。
+    if (typeof host.inject === 'function') {
+      host.inject(['webServer'], (webCtx) => {
+        const ws = lookupService(webCtx as SharedHost, 'webServer') as WebServerLike | undefined
+        if (ws) disposers.push(registerRoutes(ws, apiDeps))
+      })
     } else {
-      warn('宿主没有 webServer 服务，控制台接口未注册（记忆功能不受影响）')
+      const webServer = lookupService(host, 'webServer') as WebServerLike | undefined
+      if (webServer) {
+        disposers.push(registerRoutes(webServer, apiDeps))
+      } else {
+        warn('宿主没有 webServer 服务，控制台接口未注册（记忆功能不受影响）')
+      }
     }
 
     // ③-1 冷启动闸门：serial 事件，await 之后宿主才放行排队中的输入。
@@ -710,23 +753,29 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           return undefined
         }
 
+        // 先等闸门：resolveIdentity 底层是 touch，有副作用（lookup miss 会新建
+        // 会话→人格绑定并写 journal）。若在冷启动 replay 中途抢写，会造成「新设备
+        // 首会话继承不到旧人格」的竞态——绑定表还没回灌完，touch 就用会话 id 当
+        // 新人格 id，设备 A 的人格因此漫游失败。
+        const phase = await barrier.wait()
+        if (phase === 'degraded') {
+          warn(`记忆只读降级（${barrier.reason ?? 'unknown'}），agent ${sessionAgentId || '?'} 以受限模式启动`)
+        }
+        // ready 才 touch（可能新建绑定）；degraded 只读退纯查询 resolve，无副作用。
         const agentId = sessionAgentId
-          ? await resolveIdentity(runtime, sessionAgentId, workspaceId)
+          ? phase === 'ready'
+            ? await resolveIdentity(runtime, sessionAgentId, workspaceId)
+            : (runtime.identity?.resolve(sessionAgentId) ?? sessionAgentId)
           : ''
         if (sessionAgentId && agentId !== sessionAgentId) {
           host.logger?.info?.(
             `[shared-memories] 会话 ${sessionAgentId} 继承人格 ${agentId}`,
           )
         }
-        // 内存登记（trackPresence 只写 liveAgents Map，不落库）可以立刻做；
-        // 落库登记（ensureAgentRow 写 persona_state）必须等闸门 ready——
+        // 内存登记（trackPresence 只写 liveAgents Map，不落库）；
+        // 落库登记（ensureAgentRow 写 persona_state）只在 ready 做——
         // 冷启动时 persona_state 还没从 journal 恢复完，先写会被 replay 覆盖。
         trackPresence(runtime, agentId, readSessionId(args[0]))
-        const phase = await barrier.wait()
-        if (phase === 'degraded') {
-          warn(`记忆只读降级（${barrier.reason ?? 'unknown'}），agent ${agentId || '?'} 以受限模式启动`)
-        }
-        // 只在 ready 时补 persona_state 行：degraded（只读降级）不该写库。
         if (agentId && phase === 'ready') ensureAgentRow(runtime, agentId, workspaceId)
         await refreshPrompt(runtime, config)
         return undefined
@@ -873,18 +922,30 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       warn('宿主未提供 systemPrompt.context：逐轮召回不可用，仅保留静态人格段')
     }
 
-    // ④-c 模型可主动调用的记忆工具（查 / 记 / 忘 / 看）。
-    // 只有注入没有工具时，模型想确认"上次那个阈值是多少"就只能猜。
-    const toolDisposers = registerMemoryTools(lookupService(host, 'tools') as ToolRegistryLike | undefined, {
-      workspaceId,
-      deviceId: runtime.deviceId,
-      db: () => runtime.db,
-      tree: () => runtime.tree,
-      personaOf: (sessionId: string) => runtime.identity?.resolve(sessionId) ?? sessionId,
-      pitfalls: () => runtime.pitfalls,
-      onWarn: warn,
-    })
-    disposers.push(...toolDisposers)
+    // ④-c 模型可主动调用的记忆工具（查 / 记 / 忘 / 看）。tools 是可选服务：
+    // 就绪后再注册（局部注入），无 tools 的宿主（headless 等）记忆功能照常。
+    const registerTools = (toolCtx: unknown): void => {
+      const toolDisposers = registerMemoryTools(
+        lookupService(toolCtx as SharedHost, 'tools') as ToolRegistryLike | undefined,
+        {
+          workspaceId,
+          deviceId: runtime.deviceId,
+          db: () => runtime.db,
+          tree: () => runtime.tree,
+          personaOf: (sessionId: string) => runtime.identity?.resolve(sessionId) ?? sessionId,
+          pitfalls: () => runtime.pitfalls,
+          guard: () => runtime.guard,
+          assertWritable: (operation: string) => barrier.assertWritable(operation),
+          onWarn: warn,
+        },
+      )
+      disposers.push(...toolDisposers)
+    }
+    if (typeof host.inject === 'function') {
+      host.inject(['tools'], registerTools)
+    } else {
+      registerTools(host)
+    }
 
     const onSignal = (signal: string): void => {
       host.logger?.info?.(`[shared-memories] 收到 ${signal}，正在落盘快照`)
