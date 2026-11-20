@@ -33,6 +33,7 @@
     "lib/**/*",
     "scripts/wrap-client.mjs",
     "scripts/self-test.mjs",
+    "scripts/doctor.mjs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -65,7 +66,8 @@
     "test:watch": "tsc -p tsconfig.test.json --watch --preserveWatchOutput",
     "preview:build": "tsc -p preview/tsconfig.preview.json",
     "preview": "npm run preview:build && node preview/server.mjs 5199",
-    "self-test": "node scripts/self-test.mjs"
+    "self-test": "node scripts/self-test.mjs",
+    "doctor": "node scripts/doctor.mjs"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "~3.18.5",

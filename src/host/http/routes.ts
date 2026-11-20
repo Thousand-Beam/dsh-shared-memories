@@ -45,6 +45,7 @@ import { RestoreBlockedError, RestoreStateError } from '../snapshot/barrier.js'
 import { SnapshotError } from '../snapshot/engine.js'
 import { RestoreError } from '../snapshot/restore.js'
 import { GitCommandError } from '../snapshot/git.js'
+import type { DoctorReport } from '../doctor.js'
 import { PitfallError } from '../memory/pitfall.js'
 import { ScopeViolation } from '../../shared/scope.js'
 import type {
@@ -103,6 +104,8 @@ export interface MemoriesApiDeps {
   saveNow(): Promise<{ snapshotId: string; commit?: string }>
   /** 测试连接：探测网络 / Token / 权限（不落库、不改仓库）。 */
   testConnection(): Promise<{ ok: boolean; remote?: string; latencyMs: number; detail: string }>
+  /** doctor 自检：检查 Node/Git/身份/仓库/快照/CRLF/时钟/权限，返回结构化报告。 */
+  doctor?(): Promise<DoctorReport>
   /** 改同步间隔（内存即时生效；持久化由宿主配置写回）。 */
   setIntervalSec(seconds: number): void
   importMemories(input: {
@@ -219,6 +222,11 @@ async function dispatch(
   }
 
   try {
+    if (method === 'GET' && path === '/doctor') {
+      const doctor = deps.doctor
+      if (!doctor) throw new ApiError('doctor-unavailable', '自检服务尚未就绪', 503)
+      return sendJson(res, 200, ok(await doctor()))
+    }
     if (method === 'GET' && path === '/state') return sendJson(res, 200, ok(stateOf(deps)))
     if (method === 'GET' && path === '/memories') return sendJson(res, 200, ok(listMemories(deps, url)))
     if (method === 'GET' && path === '/snapshots') {

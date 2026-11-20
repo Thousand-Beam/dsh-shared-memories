@@ -45,6 +45,7 @@ import { openSqliteDriver } from './host/storage/sqlite-driver.js'
 import { RestoreBarrier } from './host/snapshot/barrier.js'
 import { ExecGitRunner } from './host/snapshot/git.js'
 import { SnapshotEngine, SnapshotError, type SnapshotAgentState } from './host/snapshot/engine.js'
+import { runDoctor } from './host/doctor.js'
 import type { SnapshotTrigger } from './host/snapshot/manifest.js'
 import { RestoreEngine } from './host/snapshot/restore.js'
 import { PoisonGuard } from './host/memory/poison.js'
@@ -556,6 +557,15 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         }
       },
       setIntervalSec: applyInterval,
+      doctor: async () =>
+        runDoctor({
+          root,
+          keep: config.snapshot.keep,
+          remote: config.repo.remote,
+          authorName: config.repo.authorName,
+          authorEmail: config.repo.authorEmail,
+          timeoutMs: config.sync.timeoutMs,
+        }),
       pitfalls: () => runtime.pitfalls,
       skills: () => runtime.skills,
     userProfile: () => runtime.userProfile,

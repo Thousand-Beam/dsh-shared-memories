@@ -31,6 +31,28 @@ export interface ApiError {
   message: string
 }
 
+/** doctor 自检报告（前端展示用，与 src/host/doctor.ts 的 DoctorReport 对齐）。 */
+export interface DoctorFindingDto {
+  id: string
+  severity: 'ok' | 'warn' | 'error'
+  title: string
+  detail: string
+  fix?: string
+}
+export interface DoctorReportDto {
+  ok: boolean
+  summary: { ok: number; warn: number; error: number }
+  environment: {
+    node: string
+    git: string
+    dataRoot: string
+    snapshots: number
+    commits: number
+    journalBytes: number
+  }
+  findings: DoctorFindingDto[]
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
@@ -139,6 +161,8 @@ export const api = {
     request<{ ok: boolean; remote?: string; latencyMs: number; detail: string }>('/test-connection', {
       method: 'POST',
     }),
+
+  doctor: () => request<DoctorReportDto>('/doctor'),
 
   setInterval: (seconds: number) =>
     request<{ intervalSec: number }>('/sync-interval', {

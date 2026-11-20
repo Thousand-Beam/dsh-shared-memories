@@ -58,7 +58,7 @@ export function createPanel(shared?: ConsoleStore): { root: ReactNode; store: Co
 function Panel(): ReactNode {
   const store = useStore()
   const state = useConsole((snapshot) => snapshot)
-  const [busy, setBusy] = useState<'test' | 'save' | null>(null)
+  const [busy, setBusy] = useState<'test' | 'save' | 'doctor' | null>(null)
 
   const booting =
     state.status === 'loading' ||
@@ -186,6 +186,26 @@ function Panel(): ReactNode {
     }
   }
 
+  const doctor = async (): Promise<void> => {
+    setBusy('doctor')
+    try {
+      const report = await api.doctor()
+      const { ok, warn, error } = report.summary
+      store.toast(error > 0 ? 'error' : 'ok', `自检完成：${ok} 通过 / ${warn} 注意 / ${error} 错误`)
+      for (const f of report.findings) {
+        if (f.severity === 'error') store.toast('error', `${f.title}：${f.detail}`)
+      }
+      if (error === 0 && warn > 0) {
+        const firstWarn = report.findings.find((f) => f.severity === 'warn')
+        if (firstWarn) store.toast('ok', `提示：${firstWarn.title}（${firstWarn.detail}）`)
+      }
+    } catch (cause) {
+      store.toast('error', cause instanceof Error ? cause.message : '自检失败')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   if (booting) {
     return (
       <div className='dsm-root'>
@@ -282,6 +302,15 @@ function Panel(): ReactNode {
             title='立即把当前记忆打成一个新快照（不等自动触发）'
           >
             {busy === 'save' ? '保存中…' : '手动保存'}
+          </button>
+          <button
+            type='button'
+            className='dsm-btn dsm-btn--sm dsm-btn--ghost'
+            onClick={() => void doctor()}
+            disabled={busy !== null}
+            title='检查 Node/Git/仓库完整性/权限/时钟，定位插件损坏或拉取问题'
+          >
+            {busy === 'doctor' ? '自检中…' : '自检'}
           </button>
         </header>
 
