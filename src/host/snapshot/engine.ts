@@ -127,6 +127,11 @@ export interface SnapshotResult {
   readonly tag: string
   readonly pushed: boolean
   readonly pushReason?: string
+  /**
+   * 分叉（push-diverged）时，本机与远端最近一次共同祖先对应的快照 id。
+   * 用户据此知道「从哪个快照开始两条历史分开了」，手工 rebase 时有明确对照点。
+   */
+  readonly pushBaseSnapshotId?: string
   readonly removed: readonly string[]
 }
 
@@ -252,7 +257,7 @@ export class SnapshotEngine {
    * 推送，带指数退避重试。
    * 纯本地模式（remote 为空）不是失败，是设计允许的形态。
    */
-  async push(): Promise<{ pushed: boolean; reason?: string }> {
+  async push(): Promise<{ pushed: boolean; reason?: string; baseSnapshotId?: string }> {
     if (!this.#remote.trim()) return { pushed: false, reason: 'no-remote' }
     await this.#ensureRemote()
     let lastError: unknown
@@ -285,10 +290,13 @@ export class SnapshotEngine {
           }
           // 分叉且无法自动合并是「一等状态」，不是可重试的网络抖动：直接抛，交给上层
           // 把 pushed=false / reason=diverged 冒到 API 与前端，让用户知道同步已停摆。
+          // 顺手把「最近一次共同祖先的快照 id」带出去：用户据此知道从哪个快照开始分叉，
+          // 手工 rebase 时也有明确的对照点（终审 P4 建议）。
+          const baseSnapshotId = await this.#findCommonAncestorSnapshot()
           throw new SnapshotError(
             'push-diverged',
             `本机与远端历史分叉且自动合并失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`,
-            pulled.stderr,
+            { stderr: pulled.stderr, baseSnapshotId },
           )
         }
         if (attempt < this.#retries) {
@@ -307,6 +315,23 @@ export class SnapshotEngine {
       return { pushed: true }
     }
     throw new SnapshotError('git-push-failed', `push 最终失败：${String(lastError)}`, lastError)
+  }
+
+  /**
+   * 找本机与远端最近一次共同祖先对应的快照 id。
+   *
+   * 只用于分叉时的用户提示：`merge-base` 给出共同祖先 commit，
+   * `describe --match 'snap/*'` 在该 commit 上找最近的快照书签。
+   * 找不到（远端为空、祖先不是快照提交）就返回 undefined，不阻断分叉流程。
+   */
+  async #findCommonAncestorSnapshot(): Promise<string | undefined> {
+    const mb = await this.#git.run(['merge-base', `origin/${this.#branch}`, this.#branch])
+    const base = mb.stdout.trim()
+    if (mb.code !== 0 || !base) return undefined
+    const described = await this.#git.run(['describe', '--tags', '--abbrev=0', '--match', 'snap/*', base])
+    const tag = described.stdout.trim()
+    if (described.code !== 0 || !tag) return undefined
+    return tag.replace(/^snap\//, '')
   }
 
   /**
@@ -404,7 +429,7 @@ export class SnapshotEngine {
     // push 失败不致命：本地快照（capture + commit）已经落地有效，推送只是同步到远端。
     // 若把 push 失败抛成整个快照失败，上层 idle 防抖会因 lastSnapshotAt 未刷新而疯狂重试，
     // 每次重试又 push 失败，git 操作拖死 agent（真机事故：思考 5 分钟无响应）。
-    let push: { pushed: boolean; reason?: string }
+    let push: { pushed: boolean; reason?: string; baseSnapshotId?: string }
     if (this.#pushOnCommit) {
       try {
         push = await this.push()
@@ -414,9 +439,17 @@ export class SnapshotEngine {
         )
         // 分叉是「同步已停摆」的一等状态，网络/鉴权失败才是可重试的 push-failed。
         // 两者都要把 pushed=false 冒到上层，让 /save 与前端不再假装「已保存」。
+        const detail =
+          error instanceof SnapshotError &&
+          error.code === 'push-diverged' &&
+          error.detail &&
+          typeof error.detail === 'object'
+            ? (error.detail as { baseSnapshotId?: string })
+            : undefined
         push = {
           pushed: false,
           reason: error instanceof SnapshotError && error.code === 'push-diverged' ? 'diverged' : 'push-failed',
+          baseSnapshotId: detail?.baseSnapshotId,
         }
       }
     } else {
@@ -428,6 +461,7 @@ export class SnapshotEngine {
       tag,
       pushed: push.pushed,
       pushReason: push.reason,
+      pushBaseSnapshotId: push.baseSnapshotId,
       removed,
     }
   }

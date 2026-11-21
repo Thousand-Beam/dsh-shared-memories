@@ -611,3 +611,63 @@ test('跨设备同逻辑状态、不同墙钟：状态文件确定性，不触�
   assert.match(remoteTags, /-devA/, '远端必须有 A 的 tag')
   assert.match(remoteTags, /-devB/, '远端必须有 B 的 tag')
 })
+
+test('真分叉（两台设备各改不同人格）→ diverged 且 pushBaseSnapshotId 指向共同祖先快照', async (t) => {
+  const bare = await makeBareRemote(t)
+  const at = NOW
+
+  const mkEngine = async (
+    deviceId: string,
+    tag: string,
+    name: string,
+    existingRoot?: string,
+  ): Promise<{ engine: SnapshotEngine; root: string; warnings: string[] }> => {
+    const root = existingRoot ?? (await tempRoot(t, `diverge-${tag}-`))
+    if (!existingRoot) await git(root, ['init', '-b', 'main'])
+    await git(root, ['config', 'user.email', `${tag}@example.test`])
+    await git(root, ['config', 'user.name', tag])
+    const warnings: string[] = []
+    const engine = new SnapshotEngine({
+      root,
+      deviceId,
+      git: new ExecGitRunner({ cwd: root }),
+      remote: bare,
+      branch: 'main',
+      clock: () => at,
+      sleep: async () => {},
+      onWarn: (message) => warnings.push(message),
+      collectState: () => ({
+        agents: [
+          { agentId: 'lead', workspaceIds: [WORKSPACE], sessions: ['sess-1'], persona: { name, age: 20 } },
+        ],
+      }),
+    })
+    return { engine, root, warnings }
+  }
+
+  // A 连拍两次：远端从 A1 前进到 A2。
+  const a = await mkEngine(DEVICE_A, 'dev-a', '大肥鱼')
+  const snapA1 = await a.engine.snapshot('shutdown')
+  assert.equal(snapA1.pushed, true, `A1 必须推上远端；${a.warnings.join(' | ')}`)
+  const snapA2 = await a.engine.snapshot('shutdown')
+  assert.equal(snapA2.pushed, true, `A2 必须推上远端；${a.warnings.join(' | ')}`)
+  assert.notEqual(snapA1.manifest.snapshotId, snapA2.manifest.snapshotId)
+
+  // B 从远端 clone 后回到 A1 的位置，再改成人格「小狐狸」提交——
+  // 此时远端已走到 A2，B1 与 A2 从 A1 处真正分叉（不是同秒 id 冲突）。
+  const rootB = await tempRoot(t, 'diverge-dev-b-')
+  await execFileAsync('git', ['clone', bare, rootB], { windowsHide: true })
+  await git(rootB, ['reset', '--hard', snapA1.commit])
+  const b = await mkEngine(DEVICE_B, 'dev-b', '小狐狸', rootB)
+
+  const snapB = await b.engine.snapshot('shutdown')
+  assert.equal(snapB.pushed, false, '真分叉必须诚实报未推送')
+  assert.equal(snapB.pushReason, 'diverged', `应为 diverged；warnings=${b.warnings.join(' | ')}`)
+  // 终审 P4 第 3 件：分叉时要告诉用户「最近一次共同祖先的快照 id」——
+  // 这里共同祖先就是 A1（B 从 A1 的 commit 起步，远端已走到 A2）。
+  assert.equal(
+    snapB.pushBaseSnapshotId,
+    snapA1.manifest.snapshotId,
+    '分叉时必须给出最近一次共同祖先的快照 id',
+  )
+})

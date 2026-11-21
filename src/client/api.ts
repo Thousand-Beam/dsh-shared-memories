@@ -160,7 +160,14 @@ export const api = {
     }),
 
   saveNow: () =>
-    request<{ snapshotId: string; commit?: string; pushed: boolean; pushReason?: string }>('/save', {
+    request<{
+      snapshotId: string
+      commit?: string
+      pushed: boolean
+      pushReason?: string
+      /** 分叉时后端附带的「最近一次共同祖先的快照 id」。 */
+      pushBaseSnapshotId?: string
+    }>('/save', {
       method: 'POST',
     }),
 

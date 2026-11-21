@@ -152,7 +152,7 @@ async function serve(t: TestContext, deps: MemoriesApiDeps): Promise<string> {
 
 async function makeHarness(
   t: TestContext,
-  options: { ready?: boolean; connection?: ConnectionLike; saveNowPushed?: boolean } = {},
+  options: { ready?: boolean; connection?: ConnectionLike; saveNowPushed?: boolean; saveNowBaseSnapshotId?: string } = {},
 ): Promise<Harness | undefined> {
   const db = await openTestDb(t)
   if (!db) return undefined
@@ -232,7 +232,11 @@ async function makeHarness(
     connection: options.connection,
     saveNow: async () => {
       const result = await engine.snapshot('manual')
-      return { snapshotId: result.manifest.snapshotId, pushed: options.saveNowPushed ?? true }
+      return {
+        snapshotId: result.manifest.snapshotId,
+        pushed: options.saveNowPushed ?? true,
+        pushBaseSnapshotId: options.saveNowBaseSnapshotId,
+      }
     },
     testConnection: async () => ({ mode: 'local-only' as const, ok: true }),
     setIntervalSec: () => {},
@@ -399,6 +403,16 @@ test('POST /save：pushed=false 时 409 而非 200（API 契约诚实）', async
   assert.equal(saved.status, 409, '推送失败不能返回 200，HTTP 状态码本身要诚实')
   assert.equal(saved.body.error?.code, 'push-failed')
   assert.equal(saved.body.data?.pushed, false)
+})
+
+test('POST /save：分叉时 409 的 data 带 baseSnapshotId（共同祖先快照可定位）', async (t) => {
+  const h = await makeHarness(t, { saveNowPushed: false, saveNowBaseSnapshotId: '20260115T030000Z-devA' })
+  if (!h) return
+
+  const saved = await call<{ pushed: boolean; baseSnapshotId?: string }>(h.base, '/save', { method: 'POST' })
+  assert.equal(saved.status, 409)
+  // 这段字段是终审 P4 第 3 件：分叉时告诉用户「从哪个快照开始两条历史分开」。
+  assert.equal(saved.body.data?.baseSnapshotId, '20260115T030000Z-devA')
 })
 
 test('POST /sync-interval：<30 秒被拒，合法值回显', async (t) => {

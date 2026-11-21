@@ -101,7 +101,13 @@ export interface MemoriesApiDeps {
    */
   readonly connection?: ConnectionLike
   /** 手动保存：走 SnapshotEngine.snapshot('manual')。pushed=false 表示本机 commit 成功但未推到远端。 */
-  saveNow(): Promise<{ snapshotId: string; commit?: string; pushed: boolean; pushReason?: string }>
+  saveNow(): Promise<{
+    snapshotId: string
+    commit?: string
+    pushed: boolean
+    pushReason?: string
+    pushBaseSnapshotId?: string
+  }>
   /** 测试连接：探测网络 / Token / 权限（不落库、不改仓库）。 */
   testConnection(): Promise<{ ok: boolean; remote?: string; latencyMs: number; detail: string }>
   /** doctor 自检：检查 Node/Git/身份/仓库/快照/CRLF/时钟/权限，返回结构化报告。 */
@@ -494,7 +500,14 @@ async function dispatch(
               ? '本机与远端历史分叉，快照已本地保存但未推送。真并发改出不同内容时 git pull --rebase 会停在冲突态：需手工解决快照簿记（snapshot manifest）与状态文件的冲突后 git add + git rebase --continue（其间本机新记忆滞留本地，不会丢）'
               : `快照已本地保存，但推送失败：${result.pushReason ?? '未知原因'}`,
           },
-          data: { snapshotId: result.snapshotId, pushed: false, pushReason: result.pushReason },
+          data: {
+            snapshotId: result.snapshotId,
+            pushed: false,
+            pushReason: result.pushReason,
+            // 分叉时带上「最近一次共同祖先的快照 id」：界面上告诉用户从哪个快照开始分开，
+            // 手工 rebase 时也能直接对照那一版的状态（终审 P4 建议）。
+            baseSnapshotId: result.pushBaseSnapshotId,
+          },
         })
       }
       return sendJson(res, 200, ok(result))

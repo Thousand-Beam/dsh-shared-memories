@@ -564,7 +564,13 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       connection: lookupService(host, 'connection') as ConnectionLike | undefined,
       saveNow: async () => {
         const result = (await snapshotNow('manual')) as
-          | { manifest?: { snapshotId: string }; commit?: string; pushed?: boolean; pushReason?: string }
+          | {
+              manifest?: { snapshotId: string }
+              commit?: string
+              pushed?: boolean
+              pushReason?: string
+              pushBaseSnapshotId?: string
+            }
           | undefined
         const snapshotId = result?.manifest?.snapshotId
         if (!snapshotId) {
@@ -578,6 +584,8 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           commit: result?.commit,
           pushed: result?.pushed ?? false,
           pushReason: result?.pushReason,
+          // 分叉时附上最近一次共同祖先的快照 id（终审 P4）：用户据此知道从哪个快照开始分叉。
+          pushBaseSnapshotId: result?.pushBaseSnapshotId,
         }
       },
       testConnection: async () => {
