@@ -80,7 +80,7 @@ cold → pulling → verifying → replaying → ready
 # 包未发布到公共 npm registry，从 GitHub Release 下载 tgz 后本地安装：
 # 1. 打开 https://github.com/Thousand-Beam/dsh-shared-memories/releases 下载最新 dsh-shared-memories-*.tgz
 # 2. 在 tgz 所在目录执行：
-npm i ./dsh-shared-memories-0.5.5.tgz
+npm i ./dsh-shared-memories-0.5.6.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里挂上（插件自带一份可直接用的 `cordis.patch.yml`）：

@@ -139,9 +139,12 @@ function lookupService(host: SharedHost, name: string): unknown {
   return undefined
 }
 
-/** 宿主 workspaceRegistry（dsh-workspace）的最小投影：只取 list 与 detachSession。 */
+/** 宿主 workspaceRegistry（dsh-workspace）的最小投影：只取 list / unarchive / detach。 */
 interface WorkspaceRegistryLike {
-  list?(): readonly { detachSession?(sessionId: string): Promise<void> }[]
+  list?(): readonly {
+    unarchiveSession?(sessionId: string): void | Promise<void>
+    detachSession?(sessionId: string): Promise<void>
+  }[]
 }
 
 /**
@@ -164,7 +167,21 @@ export async function detachSessionFromWorkspaces(
   if (sessionId === '') return 0
   let detached = 0
   for (const ws of registry.list() ?? []) {
-    if (ws === null || typeof ws !== 'object' || typeof ws.detachSession !== 'function') continue
+    if (ws === null || typeof ws !== 'object') continue
+    // 先摘归档标记：只 detach 不 unarchive 的话，id 从 workspace.sessionIds 里没了、
+    // 却还躺在 archivedSessionIds 里，宿主 UI 对「已归档但没有归属」的会话会兜底渲染成
+    // 「未分组」组的一行——比原来的「重启复活」更难看。unarchiveSession 只做列表过滤，
+    // 不会把 id 塞回 sessionIds（dsh-workspace 的 archived 槽位与 sessionIds 是两张表）。
+    if (typeof ws.unarchiveSession === 'function') {
+      try {
+        await ws.unarchiveSession(sessionId)
+      } catch (cause) {
+        warn(
+          `取消会话 ${sessionId} 的归档标记失败：${cause instanceof Error ? cause.message : String(cause)}`,
+        )
+      }
+    }
+    if (typeof ws.detachSession !== 'function') continue
     try {
       await ws.detachSession(sessionId)
       detached += 1
