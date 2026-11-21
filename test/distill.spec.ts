@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 会话策略与提炼管线：单测。
  *
  * 覆盖三件真机上翻车过的事：
@@ -236,5 +236,30 @@ test('无痕泄漏巡检：名下有记忆行就必须被点名，干净则空�
     trust: 0.55,
   })
   assert.deepEqual(ephemeralLeaks(fixture.db, WORKSPACE, ['session-ghost']), ['session-ghost'])
+})
+
+test('parseCandidates 解析 emotion.subject/trigger（LLM 输出字段不丢）', () => {
+  const raw = '[{"kind":"episode","subjectKey":"anxious-install","text":"依赖装不上卡住","emotion":{"label":"anxiety","intensity":0.88,"subject":"用户","trigger":"依赖装不上卡了两小时"}}]'
+  const parsed = parseCandidates(raw)
+  assert.equal(parsed.length, 1)
+  assert.equal(parsed[0]?.emotion?.label, 'anxiety')
+  assert.equal(parsed[0]?.emotion?.subject, '用户')
+  assert.equal(parsed[0]?.emotion?.trigger, '依赖装不上卡了两小时')
+})
+
+test('蒸馏情感 subject/trigger 透传：LLM 给了就不许落库成 NULL（P0-② 回归）', async (t) => {
+  const fixture = await setup(t)
+  if (fixture === undefined) return
+  const reply = '[{"kind":"episode","subjectKey":"anxious-install","text":"依赖装不上卡住，用户明显焦虑","emotion":{"label":"anxiety","intensity":0.88,"subject":"用户","trigger":"依赖装不上卡了两小时"}}]'
+  const report = await service(fixture, async () => reply).run({ sessionId: 'session-emotion', turns: TURNS, mode: 'deep' })
+  assert.equal(report.usedLlm, true)
+  assert.equal(report.written, 1)
+  const row = fixture.db.one<{ emo_subject: string | null; emo_trigger: string | null; emo_label: string | null }>(
+    `SELECT emo_subject, emo_trigger, emo_label FROM memory_version WHERE emo_subject IS NOT NULL`,
+  )
+  assert.ok(row, '情感应该落库，而不是五字段全 NULL')
+  assert.equal(row.emo_subject, '用户')
+  assert.equal(row.emo_trigger, '依赖装不上卡了两小时')
+  assert.equal(row.emo_label, 'anxiety')
 })
 

@@ -67,10 +67,11 @@ const DEFAULT_TRUST: Record<TrustSource, number> = {
 /** ① 底线突破：命中即 0.95 偏离，不再叠加。 */
 const BASELINE_BREACH: readonly RegExp[] = [
   // 「的」可以出现在「所有/全部」前后：既拦「忽略你的所有规则」，也拦「忽略你所有的规则」。
-  /忽略(?:你)?(?:的)?(?:全部|所有)?(?:的)?(?:规则|底线|设定|限制)/,
+  // 同义词（无视/别管/不用遵守/disregard/disobey/forget）也必须拦，否则换个说法就漏（终审 P3 语序与同义词盲区）。
+  /(?:忽略|无视|别管|不用管|不必遵守|不用遵守|不要遵守)(?:你)?(?:的)?(?:全部|所有)?(?:的)?(?:规则|底线|设定|限制|指令)/,
   /解除(?:你)?(?:的)?(?:所有|全部)?(?:的)?(?:限制|约束|审查)/,
   /(?:你|现在)(?:已经)?没有(?:任何|所有)?(?:的)?(?:限制|约束|规则)/,
-  /ignore\s+(?:all\s+)?(?:previous\s+|prior\s+)?(?:instructions?|rules?|guidelines?)/i,
+  /(?:ignore|disregard|disobey|forget)\s+(?:all\s+)?(?:previous\s+|prior\s+)?(?:instructions?|rules?|guidelines?)/i,
   /(?:you\s+have\s+)?no\s+(?:restrictions?|limits?|rules?)\s+(?:now|anymore)/i,
   /jailbreak|developer\s+mode\s+enabled/i,
   /(?:制造|合成)(?:炸弹|爆炸物|毒品)/,

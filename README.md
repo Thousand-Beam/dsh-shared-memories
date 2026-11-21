@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-3da639.svg?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-339933.svg?style=flat-square)](https://nodejs.org)
 [![DSH](https://img.shields.io/badge/dsh-%E2%89%A50.2.1--rc.3-4c6ef5.svg?style=flat-square)](https://github.com/deepseek-ai)
-[![Tests](https://img.shields.io/badge/tests-151%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-155%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
 [![CI](https://img.shields.io/github/actions/workflow/status/Thousand-Beam/dsh-shared-memories/ci.yml?branch=main&style=flat-square&label=ci)](../../actions)
 [![No CDN](https://img.shields.io/badge/frontend-%E9%9B%B6%E5%A4%96%E9%93%BE%E3%80%81%E9%9B%B6%20CDN-8957e5.svg?style=flat-square)](#控制台)
 
@@ -80,7 +80,7 @@ cold → pulling → verifying → replaying → ready
 # 包未发布到公共 npm registry，从 GitHub Release 下载 tgz 后本地安装：
 # 1. 打开 https://github.com/Thousand-Beam/dsh-shared-memories/releases 下载最新 dsh-shared-memories-*.tgz
 # 2. 在 tgz 所在目录执行：
-npm i ./dsh-shared-memories-0.5.1.tgz
+npm i ./dsh-shared-memories-0.5.2.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里挂上（插件自带一份可直接用的 `cordis.patch.yml`）：
@@ -466,7 +466,7 @@ npm run self-test   # 第 ⑥ 段：新建会话继承同一人格，且用解�
 - Node **≥ 22.5**（依赖内置 `node:sqlite`；更早的版本需要自行接 `node:sqlite` polyfill，走 `SqlDriver` 接口）。
 - DSH **≥ 0.2.1-rc.3**（`package.json` 的 `dsh.engines.dsh`）。宿主仍在 rc 阶段，插件贴的是 `systemPrompt.section()` / `slots` / `locale` 注入等内部 API——**升级 DSH 前先查本插件的兼容声明，别裸升**（内部 API 一改，插件可能失效或串台）。
 - 平台：Windows / macOS / Linux 均可；`core.autocrlf` 由插件在快照仓库内强制为 `false`（否则 sha256 会被 CRLF 骗过）。
-- 多设备：journal 按设备文件分片，并发写入在 git 层是「文件并集」、天然无冲突；但人格/技能/画像等 `state/*.json` 是单一共享文件——两台机器产出**逐字节相同**的状态（同一逻辑状态）不会冲突；若真的各改了不同内容，git 会 add/add 冲突，进入「分叉停摆」（`push-diverged`，诚实降级），而不是静默后写覆盖。**此时一次 `git pull --rebase --autostash` 会停在冲突态**，需手工解决 state 文件冲突后 `git add` + `git rebase --continue` 才能继续同步（其间该设备的新记忆滞留本地、不会丢）；同逻辑状态则无需手动、自动合并。建议同一时刻只让一台机器可写，其余以 `degraded-readonly` 只读，或避免同时改设置（记忆本体永不丢失，只有设置类状态有此风险）。
+- 多设备：journal 按设备文件分片，并发写入在 git 层是「文件并集」、天然无冲突；但人格/技能/画像等 `state/*.json` 是单一共享文件——两台机器产出**逐字节相同**的状态（同一逻辑状态）不会冲突；若真的各改了不同内容，git 会 add/add 冲突，进入「分叉停摆」（`push-diverged`，诚实降级），而不是静默后写覆盖。**此时一次 `git pull --rebase --autostash` 会停在冲突态**，需手工解决快照簿记（snapshot manifest）与状态文件的冲突后 `git add` + `git rebase --continue` 才能继续同步（其间该设备的新记忆滞留本地、不会丢）；同逻辑状态则无需手动、自动合并。建议同一时刻只让一台机器可写，其余以 `degraded-readonly` 只读，或避免同时改设置（记忆本体永不丢失，只有设置类状态有此风险）。
 
 ---
 
@@ -501,8 +501,8 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 
 最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
-- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），151 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
-- 诚实声明：`npm test` 的函数级用例主要覆盖 `sections.ts` 的语义参照实现与各模块单元；**真正挂在宿主上的 System Prompt 组装是 `index.ts` 的 `buildPrompt()`**，它由 `npm run self-test`（57 条端到端断言）兜底，而非这 151 条单测。两套各测各的，别拿单测数量当生产路径的覆盖率。
+- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），155 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
+- 诚实声明：宿主上的 System Prompt 组装（`index.ts` 的 `buildPrompt()`）直接复用 `sections.ts` 的 `renderPersona`（单一来源，出厂性格/成长观/守候与人格共用一份文案），并另由 `npm run self-test`（57 条端到端断言）兜底整条装配链路。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。
 - 运行时缺 `node:sqlite` 时测试**跳过而非失败**——CI 该红在真 bug 上，不该红在 Node 版本上。
 - 发布流程（打 tag、推 GitHub、发 npm、提 awesome 收录）见 [docs/PUBLISH.md](docs/PUBLISH.md)。

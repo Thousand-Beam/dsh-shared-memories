@@ -33,7 +33,7 @@ import { PersonaIdentityStore, backfillPersonaIdentities } from './host/memory/p
 import { mergeOrphanAgents } from './host/memory/merge-agent.js'
 import { pruneNoiseMemories } from './host/memory/prune-noise.js'
 import type { PersonaIdentity } from './shared/persona-identity.js'
-import { looksLikeSessionId } from './shared/persona-identity.js'
+import { renderPersona, type PersonaSnapshot } from './host/prompt/sections.js'
 import { readSkillBindings } from './host/memory/skill-registry.js'
 import { SkillRegistry } from './host/memory/skill-registry.js'
 import { TemporalTree } from './host/memory/timetree.js'
@@ -1395,7 +1395,7 @@ async function refreshPrompt(runtime: Runtime, config: SharedConfig): Promise<vo
  * 组装某个人格的系统提示片段。**同步 + 纯读**：渲染期现算也不会写库，
  * 所以无痕会话可以临时借锚点人格的提示，而不留下一行登记。
  */
-function buildPrompt(runtime: Runtime, config: SharedConfig, agentId: string): string {
+export function buildPrompt(runtime: Runtime, config: SharedConfig, agentId: string): string {
   const db = runtime.db
   // refreshPrompt 里已经挡过一次，但渲染期现算的入口也要自己挡：没库就当没有记忆。
   if (db === undefined) return ''
@@ -1408,11 +1408,20 @@ function buildPrompt(runtime: Runtime, config: SharedConfig, agentId: string): s
     allowGlobalSearch: config.isolation.allowGlobalSearch,
   })
 
-  const persona = db.one<{ name: string; age: number; traits: string; baseline_hash: string }>(
+  const personaRow = db.one<{ name: string; age: number; traits: string; baseline_hash: string }>(
     `SELECT name, age, traits, baseline_hash FROM persona_state
       WHERE agent_id = ? AND workspace_id = ?`,
     [agentId, runtime.workspaceId],
   )
+  const persona: PersonaSnapshot | undefined = personaRow
+    ? {
+        agentId,
+        workspaceId: runtime.workspaceId,
+        name: personaRow.name,
+        age: personaRow.age,
+        traits: safeJson(personaRow.traits) as Readonly<Record<string, number>>,
+      }
+    : undefined
 
   const rules = safeHits(query, { kinds: ['pitfall', 'preference', 'persona'], limit: 6 })
   const lines: string[] = []
@@ -1428,9 +1437,9 @@ function buildPrompt(runtime: Runtime, config: SharedConfig, agentId: string): s
       '- 你的用户：名字尚未记录。不要从仓库署名、提交记录、设备名、工作区路径或别处出现过的名字里猜，需要时直接问。',
     )
   }
-  lines.push(
-    `- 当前智能体：${displayName(persona?.name) || '（还没起名）'}`,
-  )
+  // 人格段：renderPersona 是单一来源（含出厂性格、成长观、守候、行为基调），
+  // 这里去掉它自带的「## 当前人格」二级标题，直接并入外层大标题下，避免双标题。
+  lines.push(...renderPersona(persona, scope).split('\n').slice(1))
   lines.push(`- 工作区：${runtime.workspaceId}`)
   lines.push(`- 底线：${config.persona.baselineNotice}`)
   // 技能段：按 (workspaceId, agentId) 精确取，缺一个条件就会串台。
@@ -1491,12 +1500,6 @@ function safeHits(query: ScopedQuery, options: Parameters<ScopedQuery['search']>
  * 把 uuid 原样写进提示，"当前智能体"就会变成一串 session id，模型还可能把它当名字念。
  * 所以这里统一把"看起来像会话 id"的名字视为未起名。
  */
-function displayName(name: string | undefined): string {
-  const value = (name ?? '').trim()
-  if (value === '') return ''
-  return looksLikeSessionId(value) ? '' : value
-}
-
 function compact(text: string, limit: number): string {  const oneLine = text.replace(/\s+/g, ' ').trim()
   return oneLine.length <= limit ? oneLine : `${oneLine.slice(0, limit - 1)}…`
 }

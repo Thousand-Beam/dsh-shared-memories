@@ -491,7 +491,7 @@ async function dispatch(
           error: {
             code: diverged ? 'push-diverged' : 'push-failed',
             message: diverged
-              ? '本机与远端历史分叉，快照已本地保存但未推送。真并发改出不同内容时 git pull --rebase 会停在冲突态：需手工解决 state 文件冲突后 git add + git rebase --continue（其间本机新记忆滞留本地，不会丢）'
+              ? '本机与远端历史分叉，快照已本地保存但未推送。真并发改出不同内容时 git pull --rebase 会停在冲突态：需手工解决快照簿记（snapshot manifest）与状态文件的冲突后 git add + git rebase --continue（其间本机新记忆滞留本地，不会丢）'
               : `快照已本地保存，但推送失败：${result.pushReason ?? '未知原因'}`,
           },
           data: { snapshotId: result.snapshotId, pushed: false, pushReason: result.pushReason },

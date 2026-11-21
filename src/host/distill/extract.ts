@@ -15,19 +15,27 @@ export interface DistillCandidate {
   readonly kind: MemoryKind
   readonly subjectKey: string
   readonly text: string
-  readonly emotion?: { readonly label: string; readonly intensity?: number }
+  readonly emotion?: {
+    readonly label: string
+    readonly intensity?: number
+    /** 情绪指向的对象（谁/什么引发）。非空才会落库，否则被时间树消毒整块置空。 */
+    readonly subject?: string
+    /** 触发原因。同上：非空才落库。 */
+    readonly trigger?: string
+  }
 }
 
 export const MAP_SYSTEM = [
   '你是一个记忆提炼器。用户会给你一段 AI 与用户的对话片段。',
   '你的任务是抽取「值得长期记住」的事实，不要复述整段对话。',
   '只输出 JSON 数组，不要解释、不要代码围栏。数组每一项形如：',
-  '{"kind":"fact|preference|decision|pitfall|episode","subjectKey":"短横线小写词组","text":"一句话，第三人称，不超过 80 字","emotion":{"label":"joy|anxiety|frustration|pride|curiosity|anger|sadness|neutral","intensity":0到1}}',
+  '{"kind":"fact|preference|decision|pitfall|episode","subjectKey":"短横线小写词组","text":"一句话，第三人称，不超过 80 字","emotion":{"label":"joy|anxiety|frustration|pride|curiosity|anger|sadness|neutral","subject":"情绪指向的对象（谁/什么，非空）","trigger":"触发原因（非空）","intensity":0到1}}',
   '规则：',
   '1. 只记用户明确表达过、或调试中确认过的结论；推测不要写。',
   '2. preference 记用户的稳定偏好；decision 记已定的方案；pitfall 记踩过的坑和正确做法。',
   '3. 一段对话最多 6 条；没有值得记的就输出 []。',
   '4. text 必须是完整句子，能被未来的自己在没有上下文时看懂。',
+  '5. 带 emotion 时，subject 和 trigger 必须都非空：subject 是情绪指向的对象，trigger 是触发原因。',
 ].join('\n')
 
 export function mapPrompt(chunkText: string, index: number, total: number): string {
@@ -79,7 +87,9 @@ export function parseCandidates(raw: string, limit = 8): DistillCandidate[] {
       const label = typeof emo.label === 'string' && EMOTIONS.includes(emo.label) ? emo.label : undefined
       if (label !== undefined) {
         const intensity = typeof emo.intensity === 'number' ? Math.min(1, Math.max(0, emo.intensity)) : 0.6
-        emotion = { label, intensity }
+        const subject = typeof emo.subject === 'string' ? emo.subject.trim() : ''
+        const trigger = typeof emo.trigger === 'string' ? emo.trigger.trim() : ''
+        emotion = { label, intensity, ...(subject !== '' ? { subject } : {}), ...(trigger !== '' ? { trigger } : {}) }
       }
     }
     out.push({ kind: asKind(record.kind), subjectKey: subject, text: body.slice(0, 200), ...(emotion ? { emotion } : {}) })

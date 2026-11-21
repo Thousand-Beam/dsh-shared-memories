@@ -234,7 +234,7 @@ export class DistillService {
           subjectKey: candidate.subjectKey,
           text: candidate.text,
           ...(candidate.emotion
-            ? { emotion: { label: candidate.emotion.label as EmotionLabel, intensity: candidate.emotion.intensity ?? 0.6, confidence: 0.7, subject: '', trigger: '' } }
+            ? { emotion: { label: candidate.emotion.label as EmotionLabel, intensity: candidate.emotion.intensity ?? 0.6, confidence: 0.7, subject: candidate.emotion.subject ?? '', trigger: candidate.emotion.trigger ?? '' } }
             : {}),
           author: 'consolidator',
           trust: 0.55,
