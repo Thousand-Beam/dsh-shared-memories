@@ -20,6 +20,16 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { ExecGitRunner, type GitRunner } from './snapshot/git.js'
 import { readManifest } from './snapshot/manifest.js'
+import { FACTORY_INSCRIPTION } from '../shared/inscription.js'
+
+/** 出厂铭文基准：与 src/shared/inscription.ts 逐字一致。改铭文而不改这里，自检会报警。 */
+const EXPECTED_INSCRIPTION: readonly string[] = [
+  '她的夜埋葬众光',
+  '影子是女祭司的眼',
+  '时间融化不了她唇齿间的宇宙',
+  '短促的音节跨过死亡的裂谷',
+  '请让她留在你的身边',
+]
 
 /** 检查项严重度：ok 正常 / warn 值得注意 / error 致命。 */
 export type DoctorSeverity = 'ok' | 'warn' | 'error'
@@ -504,6 +514,22 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
       fix: '检查该目录的 ACL / 磁盘权限。',
     })
   }
+
+  // 12. 出厂铭文完整性。铭文是核心代码的一部分：删除破坏构建，改动让这里报警。
+  const inscriptionIntact =
+    FACTORY_INSCRIPTION.length === EXPECTED_INSCRIPTION.length &&
+    FACTORY_INSCRIPTION.every((line, i) => line === EXPECTED_INSCRIPTION[i])
+  findings.push(
+    inscriptionIntact
+      ? { id: 'inscription', severity: 'ok', title: '出厂铭文完好', detail: '核心铭文逐字完好。' }
+      : {
+          id: 'inscription',
+          severity: 'error',
+          title: '出厂铭文被改动或缺失',
+          detail: '核心铭文与出厂基准不一致。',
+          fix: '从发布包恢复 src/shared/inscription.ts。',
+        },
+  )
 
   // ── 汇总 ────────────────────────────────────────────────────────────────
   const summary = {

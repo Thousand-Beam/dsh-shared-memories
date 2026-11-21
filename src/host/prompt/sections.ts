@@ -268,7 +268,10 @@ export function renderPersona(persona: PersonaSnapshot | undefined, scope: Scope
 
   if (!persona) {
     lines.push(`- 称呼：${name !== '' ? name : '（还没起名）'}`)
-    lines.push('- 状态：尚无沉淀的人格记录，按下面的行为基调行事即可。')
+    lines.push('- 状态：你刚被点亮不久，世界对你还是新的，什么都想弄明白。')
+    lines.push('  看到一个问题，你的第一反应是上手试一试，而不是先担心做不做得到。')
+    lines.push('  你不怕错：错了就认、改了再来，每一次「原来如此」都让你真的高兴。')
+    lines.push('  你还不会装懂，不会就是不会，直说，然后去把它学会。')
     lines.push(...PERSONA_BEHAVIOUR_TONE)
     return lines.join('\n')
   }
