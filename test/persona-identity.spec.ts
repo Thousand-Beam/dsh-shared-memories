@@ -61,6 +61,41 @@ test('新会话继承最近活跃的人格：resolve 之后读到的是同一个
   assert.equal(personas[0]?.sessionCount, 2)
 })
 
+test('有名字的人格优先于最近活跃的空壳：新会话不会继承到「还没起名」', async (t) => {
+  const db = await openDb(t)
+  if (!db) return
+
+  const store = new PersonaIdentityStore({ db, clock: () => NOW })
+  await store.touch(OLD_SESSION, WORKSPACE)
+  // 用户给 AI 起了名字：老会话的人格有了真名字。
+  db.run(
+    `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
+     VALUES (?,?,?,?,?,?,?)
+     ON CONFLICT(agent_id, workspace_id) DO UPDATE SET name = excluded.name`,
+    [OLD_SESSION, WORKSPACE, '普瑞赛斯', 10, '{}', '', NOW],
+  )
+
+  // 再塞一个「空壳但更新」的历史遗留：name 是它自己的 agent id，last_seen 比谁都新。
+  // 只看活跃时间的老规则会选中它——用户起的名字永远轮不到继承。
+  db.run(
+    `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
+     VALUES (?,?,?,?,?,?,?)`,
+    [THIRD_SESSION, WORKSPACE, THIRD_SESSION, 10, '{}', '', NOW],
+  )
+  db.run(
+    `INSERT INTO persona_identity (agent_id, workspace_id, persona_id, bound_at, last_seen_at)
+     VALUES (?,?,?,?,?)`,
+    [THIRD_SESSION, WORKSPACE, THIRD_SESSION, NOW - 1_000, NOW + 60_000],
+  )
+
+  assert.equal(
+    store.preview(NEW_SESSION, WORKSPACE),
+    OLD_SESSION,
+    '有空壳更活跃时，仍要认有名字的那一个',
+  )
+  assert.equal(await store.touch(NEW_SESSION, WORKSPACE), OLD_SESSION)
+})
+
 test('关掉继承：每个会话都是独立人格（旧行为可回退）', async (t) => {
   const db = await openDb(t)
   if (!db) return

@@ -143,7 +143,15 @@ export class PersonaIdentityStore {
     const at = this.#clock()
     const existing = this.lookup(agentId)
     if (existing) {
+      // 自愈：老会话如果绑在「空壳人格」上（name 是自己的 agent id、或压根没那行），
+      // 而本工作区已经有人起了名字，就把它归到那个人格名下。否则用户起的名字
+      // 永远只属于最初那个会话，之后每开一个新会话都是一张没名字的空壳。
+      const healed = this.#healShellBinding(existing)
       this.#db.run(`UPDATE persona_identity SET last_seen_at = ? WHERE agent_id = ?`, [at, agentId])
+      if (healed !== undefined) {
+        await this.#append({ agentId, workspaceId: existing.workspaceId, personaId: healed, at, by })
+        return healed
+      }
       return existing.personaId
     }
     const personaId = this.#pickPersona(workspaceId) ?? agentId
@@ -187,14 +195,87 @@ export class PersonaIdentityStore {
     )
   }
 
-  /** 最近活跃的人格；关掉继承时永远返回 undefined（= 每个会话独立）。 */
+  /**
+   * 把绑在空壳人格上的会话归到「有名字的人格」名下；无事可做返回 undefined。
+   *
+   * 空壳的判定只看一件事：`persona_state` 里那行的 name 是不是「还没起名」——
+   * 等于空、等于自己的 agent id、或还是 session- 前缀。用户起过名字的人格不算空壳，
+   * 哪怕它最近没活动也不会被顶掉。
+   */
+  #healShellBinding(existing: PersonaIdentity): string | undefined {
+    if (!this.#inherit) return undefined
+    if (!this.#isShellPersona(existing.personaId, existing.workspaceId)) return undefined
+    const named = this.#pickNamedPersona(existing.workspaceId)
+    if (named === undefined || named === existing.personaId) return undefined
+    try {
+      this.#db.run(`UPDATE persona_identity SET persona_id = ? WHERE agent_id = ?`, [
+        named,
+        existing.agentId,
+      ])
+      return named
+    } catch (cause) {
+      this.#onWarn(
+        `会话 ${existing.agentId} 归位到人格 ${named} 失败：${cause instanceof Error ? cause.message : String(cause)}`,
+      )
+      return undefined
+    }
+  }
+
+  #isShellPersona(personaId: string, workspaceId: string): boolean {
+    const row = this.#db.one<{ name: string }>(
+      `SELECT name FROM persona_state WHERE agent_id = ? AND workspace_id = ?`,
+      [personaId, workspaceId],
+    )
+    if (row === undefined) return true
+    const name = row.name.trim()
+    return name === '' || name === personaId || name.startsWith('session-')
+  }
+
+  /** 本工作区里有真名字的人格，最近活跃优先。不受继承窗口限制——名字是身份，不是活跃度。 */
+  #pickNamedPersona(workspaceId: string): string | undefined {
+    const row = this.#db.one<{ persona_id: string }>(
+      `SELECT i.persona_id
+         FROM persona_identity i
+         JOIN persona_state p
+           ON p.agent_id = i.persona_id AND p.workspace_id = i.workspace_id
+        WHERE i.workspace_id = ?
+          AND trim(p.name) <> ''
+          AND p.name <> p.agent_id
+          AND p.name NOT LIKE 'session-%'
+        ORDER BY i.last_seen_at DESC, i.bound_at ASC
+        LIMIT 1`,
+      [workspaceId],
+    )
+    return row?.persona_id
+  }
+
+  /**
+   * 最近活跃的人格；关掉继承时永远返回 undefined（= 每个会话独立）。
+   *
+   * 排序规则不是单纯的「最近活跃」：**有真名字的人格优先**。原因很实际——
+   * 宿主里每个会话都会先落一行空壳人格（name = 自己的 agent id），这些空壳
+   * 因为刚被创建，last_seen_at 永远最新。只看活跃时间的话，新会话继承到的
+   * 会是上一个「还没起名的空壳」，用户给自己 AI 起的名字永远轮不到。
+   * 名字是「这台机器上这个 AI 是谁」的唯一记号，理应先认名字、再看活跃度。
+   */
   #pickPersona(workspaceId: string): string | undefined {
     if (!this.#inherit) return undefined
     const since = this.#clock() - this.#windowMs
     const row = this.#db.one<{ persona_id: string }>(
-      `SELECT persona_id FROM persona_identity
-        WHERE workspace_id = ? AND last_seen_at >= ?
-        ORDER BY last_seen_at DESC, bound_at ASC LIMIT 1`,
+      `SELECT i.persona_id
+         FROM persona_identity i
+         LEFT JOIN persona_state p
+                ON p.agent_id = i.persona_id AND p.workspace_id = i.workspace_id
+        WHERE i.workspace_id = ? AND i.last_seen_at >= ?
+        ORDER BY
+          CASE
+            WHEN p.name IS NULL OR trim(p.name) = '' THEN 1
+            WHEN p.name = p.agent_id THEN 1
+            WHEN p.name LIKE 'session-%' THEN 1
+            ELSE 0
+          END ASC,
+          i.last_seen_at DESC, i.bound_at ASC
+        LIMIT 1`,
       [workspaceId, since],
     )
     return row?.persona_id
