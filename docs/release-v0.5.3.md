@@ -54,6 +54,7 @@ npm run self-test   # 57 条断言，真 git + 真 SQLite，绿字收尾
 - **真并发改出不同内容会分叉停摆**（诚实停摆、不脏写）：需手工解决快照簿记（snapshot manifest）与状态文件的冲突并 `git rebase --continue`；同逻辑状态则自动合并。
 - Git 历史物理擦除仍是插件外 opt-in。
 - `memory.db` 不入快照，冷启动从 journal 全量重放（O(n)）。
+- `reinforce_count`（「说过 N 次」的强化计数）不跨设备漫游：去重强化不产生独立 journal 事件，重建后回到默认值；记忆本体、版本时间线与情感标注完整，仅召回权重加成降级。
 - 多设备需要各机 NTP 对时（`doctor` 自检含时钟偏移检测）。
 
 ---
