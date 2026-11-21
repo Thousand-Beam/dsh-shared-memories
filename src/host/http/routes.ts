@@ -100,8 +100,8 @@ export interface MemoriesApiDeps {
    * 跳过鉴权（headless 等无 webServer 的 profile 本就没有 HTTP 面）。
    */
   readonly connection?: ConnectionLike
-  /** 手动保存：走 SnapshotEngine.snapshot('manual')。 */
-  saveNow(): Promise<{ snapshotId: string; commit?: string }>
+  /** 手动保存：走 SnapshotEngine.snapshot('manual')。pushed=false 表示本机 commit 成功但未推到远端。 */
+  saveNow(): Promise<{ snapshotId: string; commit?: string; pushed: boolean; pushReason?: string }>
   /** 测试连接：探测网络 / Token / 权限（不落库、不改仓库）。 */
   testConnection(): Promise<{ ok: boolean; remote?: string; latencyMs: number; detail: string }>
   /** doctor 自检：检查 Node/Git/身份/仓库/快照/CRLF/时钟/权限，返回结构化报告。 */

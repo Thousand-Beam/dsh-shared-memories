@@ -724,6 +724,7 @@ export const CONSOLE_CSS = `
   animation: dsm-rise 180ms ease-out;
 }
 .dsm-toast--error { background: var(--dsm-danger); }
+.dsm-toast--warn { background: var(--dsm-warn); }
 
 /* ── 代码 / 预览 ────────────────────────────────────────────────────────── */
 .dsm-code {

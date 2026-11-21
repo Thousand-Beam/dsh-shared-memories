@@ -155,7 +155,10 @@ export const api = {
       body: JSON.stringify({ quarantineId, by }),
     }),
 
-  saveNow: () => request<{ snapshotId: string; commit?: string }>('/save', { method: 'POST' }),
+  saveNow: () =>
+    request<{ snapshotId: string; commit?: string; pushed: boolean; pushReason?: string }>('/save', {
+      method: 'POST',
+    }),
 
   testConnection: () =>
     request<{ ok: boolean; remote?: string; latencyMs: number; detail: string }>('/test-connection', {

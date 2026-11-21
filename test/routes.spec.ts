@@ -380,9 +380,9 @@ test('POST /save：ready 时出快照；cold 时 423 拒绝写入', async (t) =>
 
   const saved = await call<{ snapshotId: string }>(h.base, '/save', { method: 'POST' })
   assert.equal(saved.status, 200)
-  // 快照 id 是固定时钟派生的可排序时间戳（如 20260115T040000Z），不是随机串：
-  // 时间轴要能靠 id 排序，靠 uuid 就得额外读 manifest。
-  assert.equal(saved.body.data?.snapshotId, '20260115T040000Z')
+  // 快照 id 是固定时钟派生的可排序时间戳（如 20260115T040000Z）+ deviceId 后缀，
+  // 不是随机串：时间轴要能靠 id 排序，靠 uuid 就得额外读 manifest。
+  assert.equal(saved.body.data?.snapshotId, '20260115T040000Z-dev-routes')
 
   const cold = await makeHarness(t, { ready: false })
   if (!cold) return

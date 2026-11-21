@@ -206,9 +206,15 @@ export function CardSkeleton(props: { rows?: number }): ReactNode {
 
 /* ── Toast ────────────────────────────────────────────────────────────── */
 
-export function Toast(props: { kind: 'ok' | 'error'; message: string }): ReactNode {
+export function Toast(props: { kind: 'ok' | 'warn' | 'error'; message: string }): ReactNode {
+  const cls =
+    props.kind === 'error'
+      ? 'dsm-toast dsm-toast--error'
+      : props.kind === 'warn'
+        ? 'dsm-toast dsm-toast--warn'
+        : 'dsm-toast'
   return (
-    <div className={props.kind === 'error' ? 'dsm-toast dsm-toast--error' : 'dsm-toast'} role='status'>
+    <div className={cls} role='status'>
       {props.message}
     </div>
   )

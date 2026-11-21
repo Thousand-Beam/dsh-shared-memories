@@ -111,29 +111,24 @@ export class ReplayApplier {
       deferred: 0,
       skipped: 0,
     }
-    // v0.4 墓碑语义合并（销毁优先）：先扫一遍找所有 agent.purge，记每个
-    // (workspaceId, agentId) 的最大墓碑 lc。多设备并发写时，某台机器在销毁前已经
-    // 发出的 entity.upsert / persona.update 等，lc 可能大于墓碑，若按 (lc, at, device)
-    // 顺序重放，会把「已销毁」的 agent 又 INSERT 回来（评价一/三实测的并发复活）。
-    // 这里改成：针对某个 agent 的写事件，只要它的 lc 严格大于该 agent 墓碑的 lc，
-    // 就视为「销毁之后的残留」跳过——销毁优先，根治复活。
-    const tombstones = new Map<string, number>()
-    for (const record of records) {
-      if (record.op === 'agent.purge') {
-        const ws = str(record.workspaceId)
-        const aid = str(record.agentId)
-        if (ws !== undefined && aid !== undefined) {
-          const lc = num(record.lc) ?? 0
-          const key = `${ws}\u0000${aid}`
-          const cur = tombstones.get(key)
-          if (cur === undefined || lc > cur) tombstones.set(key, lc)
-        }
-      }
-    }
-    const tombstoned = (ws: string | undefined, aid: string | undefined, lc: number): boolean => {
+    // v0.4.2 墓碑语义（销毁优先 + 可重建）：按 lc 顺序重放时动态跟踪每个
+    // (workspaceId, agentId) 的「当前是否已销毁」。agent.purge 置位；之后若出现新的
+    // persona.bind（同名重建），撤销墓碑。
+    //
+    // 为什么不能像 v0.4.1 那样「预扫最大墓碑 lc + 无条件跳过 lc>墓碑」：
+    //   1. 守卫不对称——version.open / close / emotion 没挂守卫，销毁后重建的记忆
+    //      journal 是 [entity.upsert(被跳过) → version.open(照常执行)]，version.open 往
+    //      不存在的实体下插版本 → 外键炸 → 整个事务回滚 → degraded 只读（评价 1/2
+    //      实测 P0-2，本机重启同样中招）。
+    //   2. 语义自相矛盾——无条件跳过等于宣布「销毁过的 agentId 永不复用」，与
+    //      KNOWN-ISSUES #1「purge 后 realignClock 保护本机新写入」相反。
+    // 状态机式重放同时满足两条：销毁前的并发残留写（lc>purge 且无重建信号）被跳过，
+    // 销毁后的同名重建（有 persona.bind 重新武装）正常落库、不炸外键。
+    const purged = new Map<string, number>()
+    const isPurged = (ws: string | undefined, aid: string | undefined, lc: number): boolean => {
       if (ws === undefined || aid === undefined) return false
-      const tlc = tombstones.get(`${ws}\u0000${aid}`)
-      return tlc !== undefined && lc > tlc
+      const plc = purged.get(`${ws}\u0000${aid}`)
+      return plc !== undefined && lc > plc
     }
 
     this.#db.transaction(() => {
@@ -142,7 +137,7 @@ export class ReplayApplier {
         switch (record.op) {
           case 'entity.upsert': {
             // 墓碑优先：销毁之后残留的并发写跳过，否则已销毁 agent 复活（评价一/三）。
-            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
               stats.skipped++
               break
             }
@@ -151,11 +146,22 @@ export class ReplayApplier {
             break
           }
           case 'version.open': {
+            // 对称守卫（P0-② 修复）：销毁后残留的 version.open 若照常执行，会在
+            // 「实体已被 entity.upsert 跳过」的情况下往不存在的实体下插版本 → 外键
+            // 炸 → 整个重放事务回滚 → degraded 只读（评价 1/2 实测的 FK 炸库）。
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             this.#openVersion(record)
             stats.versions++
             break
           }
           case 'version.close': {
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             const versionId = str(record.versionId)
             const validUntil = num(record.validUntil)
             if (!versionId || validUntil === undefined) {
@@ -170,6 +176,13 @@ export class ReplayApplier {
             break
           }
           case 'version.emotion': {
+            // 对称守卫：销毁后残留的情感纠错照常执行只会 UPDATE 一个已删版本（0 行），
+            // 无害，但为了和 version.open/close 一致、避免任何「写已销毁 agent」的路径，
+            // 统一跳过。
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             // 情感纠错（P1-E）：必须跟着漫游，否则 A 机改的情感在 B 机冷启动后被
             // journal 回放吞掉、标签回到旧值。COALESCE 语义与写入端一致：subject/
             // trigger/intensity 为 null 表示"不覆盖，保留原值"，避免回放时误清空。
@@ -211,7 +224,7 @@ export class ReplayApplier {
             break
           }
           case 'quarantine.add': {
-            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
               stats.skipped++
               break
             }
@@ -250,7 +263,7 @@ export class ReplayApplier {
             break
           }
           case 'skill.bind': {
-            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
               stats.skipped++
               break
             }
@@ -287,7 +300,7 @@ export class ReplayApplier {
             break
           }
           case 'skill.unbind': {
-            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
               stats.skipped++
               break
             }
@@ -306,9 +319,19 @@ export class ReplayApplier {
             break
           }
           case 'persona.bind': {
-            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
-              stats.skipped++
-              break
+            // 同名重建信号：agent.purge 之后出现新的 persona.bind，说明用户销毁后又
+            // 重建了这个 agentId。撤销墓碑，让后续 entity.upsert / version.* 正常重放
+            //（否则等于"销毁过的 agentId 永不复用"，与 KNOWN-ISSUES #1 的承诺相反）。
+            const bindWs = str(record.workspaceId)
+            const bindAid = str(record.agentId)
+            const bindLc = num(record.lc) ?? 0
+            // 墓碑可能以 personaId（purge 侧解析后的人格的 id）或 sessionId（persona.bind
+            // 的 agent_id）为键——两套 id 空间并存，重建信号必须两个都撤销，否则
+            // 「销毁 → 同名重建」在真实宿主里会漏掉墓碑、新记忆仍被跳过。
+            for (const key of [bindAid, str(record.personaId)]) {
+              if (key && isPurged(bindWs, key, bindLc)) {
+                purged.delete(`${bindWs}\u0000${key}`)
+              }
             }
             // 会话 → 人格 绑定：这一条掉了，新会话在恢复后的机器上又变成"新人格"，
             // 表现就是"人格与记忆都在，但新建会话读不到"。
@@ -333,7 +356,7 @@ export class ReplayApplier {
             break
           }
           case 'persona.update': {
-            if (tombstoned(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
               stats.skipped++
               break
             }
@@ -406,6 +429,10 @@ export class ReplayApplier {
               stats.skipped++
               break
             }
+            // 置位墓碑：之后该 agent 的并发残留写（lc>此值）跳过，直到出现新的
+            // persona.bind 撤销。用当前 purge 的 lc（不是"最大 lc"预扫），配合状态机
+            // 式 isPurged 判断，支持「销毁 → 同名重建 → 再销毁」的完整生命周期。
+            purged.set(`${workspaceId}\u0000${agentId}`, num(record.lc) ?? 0)
             this.#run(
               'DELETE FROM memory_version WHERE entity_id IN (SELECT entity_id FROM memory_entity WHERE workspace_id = ? AND agent_id = ?)',
               [workspaceId, agentId],
@@ -1004,6 +1031,22 @@ export class RestoreEngine {
    * 没有快照时：如果允许缺失（全新设备第一次开机）就直接过；
    * 否则抛 `snapshot-missing`——"我明明应该有历史，但一份都没有"是危险信号。
    */
+  /**
+   * 自愈辅助：从 git HEAD（最新快照提交）恢复工作区里的单个文件。
+   * 校验失败时先试一次，git 里有干净副本就能救回，避免"截断成 0 字节"这种
+   * 可恢复损坏直接降级只读（评价 2 实测新发现）。
+   */
+  async #selfHealFile(path: string): Promise<boolean> {
+    try {
+      const checkout = await this.#git.run(['checkout', 'HEAD', '--', path], {
+        timeoutMs: this.#timeoutMs,
+      })
+      return checkout.code === 0
+    } catch {
+      return false
+    }
+  }
+
   async #verifySnapshotHashes(): Promise<{ snapshotId?: string; files: number }> {
     const snapshotId = await this.#latestSnapshotId()
     if (!snapshotId) {
@@ -1041,6 +1084,28 @@ export class RestoreEngine {
         if (prefix === entry.sha256 && validJournalTail(bytes.subarray(entry.bytes))) {
           checked++
           continue
+        }
+      }
+
+      // 自愈（P0-⑥）：只对「截断成 0 字节」这种可恢复损坏才从 git HEAD 救回——进程被
+      // 强杀 / 磁盘写一半会把文件清空，但 git HEAD（最新快照提交）里还有干净副本。非空
+      // 但内容对不上 = 真篡改（有人往里塞东西）或坏提交，必须拦下来降级，绝不能静默用
+      // git 副本盖掉，否则「篡改检测」形同虚设（评价 2 的篡改测试就是这种：文件非空但
+      // 被加了 {"tampered":true}，必须判 snapshot-corrupt 而不是自愈）。
+      if (bytes.length === 0) {
+        const healed = await this.#selfHealFile(entry.path)
+        if (healed) {
+          let healedBytes: Buffer
+          try {
+            healedBytes = await readFile(absolute)
+          } catch {
+            throw new RestoreError('snapshot-file-missing', `快照文件缺失：${entry.path}`, entry)
+          }
+          if (createHash('sha256').update(healedBytes).digest('hex') === entry.sha256) {
+            this.#onWarn(`自愈：${entry.path} 已被截断成 0 字节，已从 git HEAD 恢复并校验通过`)
+            checked++
+            continue
+          }
         }
       }
 

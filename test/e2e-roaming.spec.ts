@@ -477,7 +477,9 @@ test('A 销毁 lead → push → B 冷启动：被销毁记忆与人格都不复
 test('远端已有同名 snap tag（两台设备同一秒各拍一次）→ 分支照常推送，不算 push 失败', async (t) => {
   const bare = await makeBareRemote(t)
   const at = NOW
-  const clashTag = `snap/${snapshotIdOf(at)}`
+  // id 已掺 deviceId（见 engine.#uniqueSnapshotId），本引擎 deviceId=DEVICE_B='devB'，
+  // 真实 tag 是 `snap/<at>-devB`；预置同名 tag 才能复现「远端已有同名 tag」的冲突前提。
+  const clashTag = `snap/${snapshotIdOf(at)}-devB`
 
   // 模拟"另一台设备在同一秒先拍过一次"：远端已存在同名 tag，指向别的提交。
   // git 不允许改写远端同名 tag，把 tag 和分支塞进同一条 push 会让整条命令失败。
@@ -515,4 +517,52 @@ test('远端已有同名 snap tag（两台设备同一秒各拍一次）→ 分�
   // 数据（分支）必须真的落到远端，否则"推成功"是假的。
   const remoteLog = await git(bare, ['log', '--format=%s', 'main'])
   assert.match(remoteLog, /snapshot\(shutdown\)/, '远端分支必须拿到本机提交')
+})
+
+test('跨设备同秒互推：两台设备同一秒各拍一次，id 掺 deviceId，两边都推上远端', async (t) => {
+  const bare = await makeBareRemote(t)
+  const at = NOW
+
+  // 两台设备用同一个固定时钟（同一秒）各建一个仓库 + 引擎，collectState 完全相同，
+  // 这样唯一的分歧来源就是「同秒 id 撞名」——正是 v0.4.1 宣称修复、却只修了本机的场景。
+  async function boot(t2: TestContext, deviceId: string, name: string): Promise<SnapshotEngine | undefined> {
+    const root = await tempRoot(t2, `same-sec-${name}-`)
+    await git(root, ['init', '-b', 'main'])
+    await git(root, ['config', 'user.email', `${name}@example.test`])
+    await git(root, ['config', 'user.name', name])
+    return new SnapshotEngine({
+      root,
+      deviceId,
+      git: new ExecGitRunner({ cwd: root }),
+      remote: bare,
+      branch: 'main',
+      clock: () => at,
+      sleep: async () => {},
+      collectState: () => ({ agents: [] }),
+    })
+  }
+
+  const engineA = await boot(t, DEVICE_A, 'dev-a')
+  const engineB = await boot(t, DEVICE_B, 'dev-b')
+  if (!engineA || !engineB) return
+
+  // 同一秒各拍一次。
+  const snapA = await engineA.snapshot('shutdown')
+  const snapB = await engineB.snapshot('shutdown')
+
+  // 核心断言：id 掺 deviceId，两台设备同秒不再撞同一个 …Z（修复前会是同一个 id，
+  // 同名 manifest.json → push 被拒 → pull --rebase add/add 冲突）。
+  assert.equal(snapA.manifest.snapshotId, `${snapshotIdOf(at)}-devA`, 'A 的 id 应带 devA 后缀')
+  assert.equal(snapB.manifest.snapshotId, `${snapshotIdOf(at)}-devB`, 'B 的 id 应带 devB 后缀')
+  assert.notEqual(snapA.manifest.snapshotId, snapB.manifest.snapshotId, '同秒快照 id 必须去重')
+
+  // 两台都推上远端（B 后推，会走 pull --rebase 追平 A 的提交，但同秒 id 已不同，
+  // 不再 add/add 冲突，rebase 干净合并后 push 成功）。
+  assert.equal(snapA.pushed, true, 'A 必须推上远端')
+  assert.equal(snapB.pushed, true, 'B 必须推上远端（同秒 id 已去重，不应 rebase 卡死）')
+
+  // 远端同时保留两台设备的快照 tag，不是互相覆盖。
+  const remoteTags = await git(bare, ['tag', '--list', `snap/${snapshotIdOf(at)}-*`])
+  assert.match(remoteTags, /snap\/[^-]+-devA/, '远端必须有 A 的 tag')
+  assert.match(remoteTags, /snap\/[^-]+-devB/, '远端必须有 B 的 tag')
 })

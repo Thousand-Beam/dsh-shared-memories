@@ -96,6 +96,94 @@ test('墓碑语义合并：销毁后 lc 更大的并发写不复活已销毁 age
   assert.equal(stats.purged, 1, '墓碑本身必须执行')
 })
 
+test('销毁后同名重建（persona.bind 撤销墓碑）：新记忆落库、不炸 FK、不 degraded', async (t) => {
+  const db = await openTestDb(t)
+  if (!db) return
+
+  // 时间线：旧记忆(lc=1) → 销毁(lc=2) → 同名重建 persona.bind(lc=3) → 新记忆
+  // entity.upsert(lc=4) → 新记忆的版本 version.open(lc=5)。
+  // v0.4.1 的 bug：墓碑是「预扫最大 lc + 无条件跳过 lc>墓碑」，entity.upsert(lc=4) 被
+  // 跳过，但 version.open 没挂守卫照常执行，往不存在的实体下插版本 → 外键炸 →
+  // 整个重放事务回滚 → degraded 只读（评价 1/2 实测 P0-2）。
+  // 修复后：persona.bind 撤销墓碑，entity.upsert + version.open 正常重放，不炸外键。
+  const records: JournalRecord[] = [
+    record({
+      op: 'entity.upsert',
+      lc: 1,
+      at: 1000,
+      device: 'devA',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      entityId: 'lead-entity-old',
+      kind: 'fact',
+      subjectKey: 'lead.old',
+      canonical: '销毁前的旧记忆',
+      salience: 0.5,
+      trust: 0.6,
+      status: 'active',
+    }),
+    record({ op: 'agent.purge', lc: 2, at: 2000, device: 'purge', workspaceId: WORKSPACE, agentId: LEAD }),
+    record({ op: 'persona.bind', lc: 3, at: 3000, device: 'devA', workspaceId: WORKSPACE, agentId: LEAD, personaId: LEAD }),
+    record({
+      op: 'entity.upsert',
+      lc: 4,
+      at: 4000,
+      device: 'devA',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      entityId: 'lead-entity-new',
+      kind: 'fact',
+      subjectKey: 'lead.new',
+      canonical: '重建后的新记忆',
+      salience: 0.5,
+      trust: 0.6,
+      status: 'active',
+    }),
+    record({
+      op: 'version.open',
+      lc: 5,
+      at: 5000,
+      device: 'devA',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      entityId: 'lead-entity-new',
+      versionId: 'v-new',
+      text: '重建后新记忆的版本',
+      validFrom: 5000,
+    }),
+  ]
+
+  const applier = new ReplayApplier(db)
+  // 关键：apply 必须正常返回（不抛 FK 约束错误），否则整个事务回滚 → degraded。
+  const stats = applier.apply(records)
+
+  // 旧记忆被销毁。
+  const oldRows = db.all<{ entity_id: string }>(
+    'SELECT entity_id FROM memory_entity WHERE entity_id = ?',
+    ['lead-entity-old'],
+  )
+  assert.equal(oldRows.length, 0, '销毁前的旧记忆必须被删掉')
+
+  // 重建后的新记忆落库。
+  const newRows = db.all<{ entity_id: string }>(
+    'SELECT entity_id FROM memory_entity WHERE entity_id = ?',
+    ['lead-entity-new'],
+  )
+  assert.equal(newRows.length, 1, '重建后的新记忆必须落库，不得被墓碑误吞')
+
+  // 新记忆的版本也在（外键没炸、事务没回滚）。
+  const versionRows = db.all<{ version_id: string }>(
+    'SELECT version_id FROM memory_version WHERE entity_id = ?',
+    ['lead-entity-new'],
+  )
+  assert.equal(versionRows.length, 1, '新记忆的 version.open 必须正常落库，不能因外键炸而回滚')
+
+  assert.equal(stats.purged, 1, '墓碑必须执行')
+  assert.equal(stats.entities, 2, '旧实体 + 新实体各算一次 upsert')
+  assert.equal(stats.versions, 1, '重建后的 version.open 必须计入')
+  assert.equal(stats.personaIdentities, 1, 'persona.bind 重建信号必须执行')
+})
+
 test('persona.update 重放：人格内容进 persona_state（journal 因果收敛）', async (t) => {
   const db = await openTestDb(t)
   if (!db) return

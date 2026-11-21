@@ -17,6 +17,7 @@
 import { access, readdir, stat } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 import { ExecGitRunner, type GitRunner } from './snapshot/git.js'
 import { readManifest } from './snapshot/manifest.js'
 
@@ -119,6 +120,16 @@ async function isWritable(root: string): Promise<boolean> {
   }
 }
 
+/** 路径是否存在（区分「不存在」与「不可写」用）。 */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.F_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
  * 跑一轮自检，返回结构化报告。不抛错——所有失败都收敛进 findings。
  */
@@ -139,8 +150,11 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
   }
   const nodeVersion = process.versions.node
 
+  // P0-⑦：`git --version` 不依赖数据根。数据根还没创建时，用 cwd=root 的 runner 会
+  // execFile ENOENT → 报「Git 不可用」假红。改用 homedir 作 cwd（git 一定在 PATH）。
+  const versionRunner: GitRunner = new ExecGitRunner({ cwd: homedir(), timeoutMs })
   const gitVersion = await attempt(findings, 'git', 'Git 可用性', async () => {
-    const r = await runner.run(['--version'])
+    const r = await versionRunner.run(['--version'])
     return r.code === 0 ? r.stdout.trim() : null
   })
   const gitAvailable = gitVersion !== null && gitVersion !== undefined
@@ -469,8 +483,17 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
     }
   }
 
-  // 11. 数据根可写。
-  if (await isWritable(root)) {
+  // 11. 数据根可写。P0-⑦：数据根还不存在（首跑未初始化）不能报「不可写」假红——
+  // 首次启动会自动建目录；只有目录存在却没写权限才是真错误。
+  const rootExists = await pathExists(root)
+  if (!rootExists) {
+    findings.push({
+      id: 'writable',
+      severity: 'warn',
+      title: '数据根尚未初始化',
+      detail: `${root} 还不存在，首次启动会自动创建。`,
+    })
+  } else if (await isWritable(root)) {
     findings.push({ id: 'writable', severity: 'ok', title: '数据根可写', detail: `${root} 有写权限。` })
   } else {
     findings.push({

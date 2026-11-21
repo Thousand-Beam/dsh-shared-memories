@@ -111,7 +111,7 @@ export interface ConsoleState {
   policy: SessionPolicyDto | null
   /** 正在跑的提炼任务；`null` = 没有任务在跑。 */
   distill: DistillProgress | null
-  toast: { kind: 'ok' | 'error'; message: string } | null
+  toast: { kind: 'ok' | 'warn' | 'error'; message: string } | null
   error: string | null
 }
 
@@ -202,7 +202,7 @@ export class ConsoleStore {
     this.setFilters({ [key]: next })
   }
 
-  toast(kind: 'ok' | 'error', message: string): void {
+  toast(kind: 'ok' | 'warn' | 'error', message: string): void {
     this.patch({ toast: { kind, message } })
     setTimeout(() => {
       if (this.#state.toast?.message === message) this.patch({ toast: null })

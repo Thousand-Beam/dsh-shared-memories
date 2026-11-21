@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-3da639.svg?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.5-339933.svg?style=flat-square)](https://nodejs.org)
 [![DSH](https://img.shields.io/badge/dsh-%E2%89%A50.2.1--rc.3-4c6ef5.svg?style=flat-square)](https://github.com/deepseek-ai)
-[![Tests](https://img.shields.io/badge/tests-138%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-147%20passing-brightgreen.svg?style=flat-square)](#开发与测试)
 [![CI](https://img.shields.io/github/actions/workflow/status/Thousand-Beam/dsh-shared-memories/ci.yml?branch=main&style=flat-square&label=ci)](../../actions)
 [![No CDN](https://img.shields.io/badge/frontend-%E9%9B%B6%E5%A4%96%E9%93%BE%E3%80%81%E9%9B%B6%20CDN-8957e5.svg?style=flat-square)](#控制台)
 
@@ -80,7 +80,7 @@ cold → pulling → verifying → replaying → ready
 # 包未发布到公共 npm registry，从 GitHub Release 下载 tgz 后本地安装：
 # 1. 打开 https://github.com/Thousand-Beam/dsh-shared-memories/releases 下载最新 dsh-shared-memories-*.tgz
 # 2. 在 tgz 所在目录执行：
-npm i ./dsh-shared-memories-0.4.1.tgz
+npm i ./dsh-shared-memories-0.4.2.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里挂上（插件自带一份可直接用的 `cordis.patch.yml`）：
@@ -501,8 +501,8 @@ npm run preview      # 起本地 UI 预览（mock 数据，不碰真机）→ ht
 
 最后一行是绿字 `全链路通过 ✔`，退出码 0；任何一条断言失败会红字列出并返回 1，可以直接挂 CI。
 
-- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），117 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
-- 诚实声明：`npm test` 的函数级用例主要覆盖 `sections.ts` 的语义参照实现与各模块单元；**真正挂在宿主上的 System Prompt 组装是 `index.ts` 的 `buildPrompt()`**，它由 `npm run self-test`（57 条端到端断言）兜底，而非这 117 条单测。两套各测各的，别拿单测数量当生产路径的覆盖率。
+- 测试用 `:memory:` SQLite + 复用生产 DDL（`src/host/storage/schema.ts`），147 个用例覆盖时间树、作用域泄漏、污染防御、规则升格、技能隔离与漫游、用户画像、会话身份绑定、journal 合并、HTTP 路由、端到端漫游。
+- 诚实声明：`npm test` 的函数级用例主要覆盖 `sections.ts` 的语义参照实现与各模块单元；**真正挂在宿主上的 System Prompt 组装是 `index.ts` 的 `buildPrompt()`**，它由 `npm run self-test`（57 条端到端断言）兜底，而非这 147 条单测。两套各测各的，别拿单测数量当生产路径的覆盖率。
 - 客户端打的是单文件 bundle（`lib/client.js`），由 `scripts/wrap-client.mjs` 套上宿主 `__ModuleLoader__` 外壳；**样式走运行时注入 `<style>`**，所以不存在「忘了加载 CSS 就裸奔」这件事。
 - 运行时缺 `node:sqlite` 时测试**跳过而非失败**——CI 该红在真 bug 上，不该红在 Node 版本上。
 - 发布流程（打 tag、推 GitHub、发 npm、提 awesome 收录）见 [docs/PUBLISH.md](docs/PUBLISH.md)。

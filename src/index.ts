@@ -563,12 +563,22 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       restore: () => runtime.restore,
       connection: lookupService(host, 'connection') as ConnectionLike | undefined,
       saveNow: async () => {
-        const result = (await snapshotNow('manual')) as { manifest?: { snapshotId: string }; commit?: string } | undefined
+        const result = (await snapshotNow('manual')) as
+          | { manifest?: { snapshotId: string }; commit?: string; pushed?: boolean; pushReason?: string }
+          | undefined
         const snapshotId = result?.manifest?.snapshotId
         if (!snapshotId) {
           throw new SnapshotError('snapshot-failed', '手动保存未生成快照（恢复未就绪、无痕巡检跳过或引擎失败）')
         }
-        return { snapshotId, commit: result?.commit }
+        // P0-③：把推送结果冒到 API/前端。本机 commit 成功后，若 push 分叉/失败，必须诚实
+        // 暴露（pushed=false + pushReason），否则前端一直弹绿「已保存」，用户以为漫游已落地，
+        // 实际这台机器可能从此与远端永久分叉（评价 1/2 实测的"最危险的组合"）。
+        return {
+          snapshotId,
+          commit: result?.commit,
+          pushed: result?.pushed ?? false,
+          pushReason: result?.pushReason,
+        }
       },
       testConnection: async () => {
         if (!config.repo.remote) {
@@ -576,6 +586,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         }
         const started = Date.now()
         const git = new ExecGitRunner({ cwd: root, timeoutMs: config.sync.timeoutMs })
+        // 只读探针：能否读到远端分支（网络 + 仓库可达性）。
         const probe = await git.run(['ls-remote', '--heads', 'origin', config.repo.branch])
         const latencyMs = Date.now() - started
         if (probe.code !== 0) {
@@ -587,11 +598,29 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           }
         }
         const hasBranch = probe.stdout.split('\n').some((line) => line.includes(`refs/heads/${config.repo.branch}`))
+        // 写探针（P0-⑧）：--dry-run push 会真正走鉴权 + 权限校验，但不改远端任何东西。
+        // 只读 ls-remote 拿不到「有没有写权限」，所以之前对「能读不能写」的远端也报
+        // 「分支权限均正常」——这里补上：push 被拒（permission denied）时如实报写权限缺失。
+        const write = await git.run(['push', '--dry-run', 'origin', config.repo.branch])
+        if (write.code !== 0) {
+          const err = write.stderr.trim()
+          if (/permission denied|authentication failed|could not read username|access denied|forbidden|not authorized|remote rejected/i.test(err)) {
+            return {
+              ok: false,
+              remote: config.repo.remote,
+              latencyMs,
+              detail: `远端可读但无写权限：${err || `git push --dry-run exit ${write.code}`}`,
+            }
+          }
+          // 非权限类失败（尚无 commit、分支分叉、首次推送）：写权限大概率没问题，只提示。
+        }
         return {
           ok: true,
           remote: config.repo.remote,
           latencyMs,
-          detail: hasBranch ? '网络 / 凭据 / 分支权限均正常' : `远端没有分支 ${config.repo.branch}（首次推送会创建）`,
+          detail: hasBranch
+            ? '网络 / 凭据 / 读写权限均正常'
+            : `远端没有分支 ${config.repo.branch}（首次推送会创建）`,
         }
       },
       setIntervalSec: applyInterval,

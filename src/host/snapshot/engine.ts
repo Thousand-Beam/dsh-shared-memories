@@ -276,7 +276,20 @@ export class SnapshotEngine {
           // 分叉就再也自愈不了，只能整次 push 失败降级。
           const pulled = await this.#git.run(['pull', '--rebase', '--autostash', 'origin', this.#branch])
           if (pulled.code === 0) continue
-          this.#onWarn(`push 分叉且 pull --rebase 失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`)
+          // rebase 撞 AA/UU（两台设备都改过同一批共享 state/*.json）会失败，此时
+          // 必须 abort：否则仓库被留在 rebase-merge 中间态 + 脏索引，之后每次 push 都
+          // 报「already a rebase-merge directory」，机器永久卡死（评价 1/2 实测 P0）。
+          const aborted = await this.#git.run(['rebase', '--abort'])
+          if (aborted.code !== 0) {
+            this.#onWarn(`rebase --abort 失败：${aborted.stderr.trim() || `exit ${aborted.code}`}`)
+          }
+          // 分叉且无法自动合并是「一等状态」，不是可重试的网络抖动：直接抛，交给上层
+          // 把 pushed=false / reason=diverged 冒到 API 与前端，让用户知道同步已停摆。
+          throw new SnapshotError(
+            'push-diverged',
+            `本机与远端历史分叉且自动合并失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`,
+            pulled.stderr,
+          )
         }
         if (attempt < this.#retries) {
           const delay = backoffDelay(attempt)
@@ -359,6 +372,23 @@ export class SnapshotEngine {
       if (commit.code !== 0) this.#onWarn(`清理提交失败：${commit.stderr.trim()}`)
     }
 
+    // 远端 tag 同步删除（隐私 P0）：rotate 只删本地 tag 的话，远端旧 tag 会让已销毁的
+    // 明文永远可达——`git gc --aggressive --prune=now` 也清不掉（tag 使提交保持可达）。
+    // 把删除推到远端，让「逻辑删除」在远端同样生效；真正的历史物理擦除仍靠 opt-in
+    // filter-repo（README「销毁」两档：逻辑删除默认 / 物理擦除可选）。
+    if (removed.length > 0 && this.#remote.trim()) {
+      const remoteTags = removed.map((id) => `snap/${id}`)
+      const del = await this.#git.run(['push', 'origin', '--delete', ...remoteTags])
+      if (
+        del.code !== 0 &&
+        !/remote ref does not exist|unable to delete|does not exist|couldn't find remote ref|no such ref|not found/i.test(
+          del.stderr,
+        )
+      ) {
+        this.#onWarn(`删除远端 tag 失败（隐私书签仍留在远端）：${del.stderr.trim() || `exit ${del.code}`}`)
+      }
+    }
+
     return { removed, kept: [...keep].sort() }
   }
 
@@ -382,7 +412,12 @@ export class SnapshotEngine {
         this.#onWarn(
           `推送失败（本地快照仍有效）：${error instanceof Error ? error.message : String(error)}`,
         )
-        push = { pushed: false, reason: 'push-failed' }
+        // 分叉是「同步已停摆」的一等状态，网络/鉴权失败才是可重试的 push-failed。
+        // 两者都要把 pushed=false 冒到上层，让 /save 与前端不再假装「已保存」。
+        push = {
+          pushed: false,
+          reason: error instanceof SnapshotError && error.code === 'push-diverged' ? 'diverged' : 'push-failed',
+        }
       }
     } else {
       push = { pushed: false, reason: 'disabled' }
@@ -616,7 +651,10 @@ export class SnapshotEngine {
       `${JSON.stringify(
         {
           version: 2,
-          device: this.#deviceId,
+          // 注意：不写 device 字段——两台设备在同一逻辑状态下必须产出**逐字节相同**的
+          // agents.json，否则「内容相同、只因 deviceId 不同」会在 git rebase 时制造假的
+          // add/add 冲突（评价 1 P0-1：并发快照卡 rebase 中间态）。deviceId 已由
+          // snapshotId（带 -deviceId 后缀）与 journal 记录承载，不靠这里。
           capturedAt: this.#clock(),
           agents: state.agents.map((agent) => ({
             agentId: agent.agentId,
@@ -662,8 +700,9 @@ export class SnapshotEngine {
       `${JSON.stringify(
         {
           version: 1,
-          device: this.#deviceId,
-          capturedAt: Date.now(),
+          // capturedAt 用 this.#clock() 而不是 Date.now()：否则两台设备同一秒各拍一次，
+          // 这个字段会因墙钟差异而不同，制造假的 add/add 冲突（评价 1 P0-1）。
+          capturedAt: this.#clock(),
           identities,
         },
         null,
@@ -695,7 +734,6 @@ export class SnapshotEngine {
       `${JSON.stringify(
         {
           version: 1,
-          device: this.#deviceId,
           capturedAt: this.#clock(),
           profiles,
         },
@@ -729,7 +767,7 @@ export class SnapshotEngine {
     }))
     await writeFile(
       join(stateDir, 'skills.json'),
-      `${JSON.stringify({ version: 1, device: this.#deviceId, capturedAt: this.#clock(), agents }, null, 2)}\n`,
+      `${JSON.stringify({ version: 1, capturedAt: this.#clock(), agents }, null, 2)}\n`,
       'utf8',
     )
   }
@@ -828,17 +866,24 @@ export class SnapshotEngine {
    * 被 `git tag -f` 改写 → `git push --tags` 因「远端已有该 tag 且指向别的提交」被
    * 拒：分支其实推上去了，但 push 返回非零，触发退避重试；真机 CI 上再叠加
    * unref 的 sleep，整条测试被判"挂起"直接取消。
-   * 重名时按 `-2`、`-3` 递增，字典序仍与时间序一致。
+   *
+   * 跨设备去重：`#listSnapshotIds()` 只看本地 `snapshots/` 目录，看不到另一台设备在
+   * 同一秒已经占用的 id。把 deviceId 掺进 id 后，两台设备同秒各拍一次会得到不同 tag，
+   * 从根上避免「push --tags 撞名被远端拒」（评价 1/2 实测的跨设备同秒冲突）。
+   * 同一台设备同秒仍靠 `-2`/`-3` 递增兜底，字典序仍与时间序一致。
    */
   async #uniqueSnapshotId(at: number): Promise<string> {
     const base = snapshotIdOf(at)
+    // 与快照文件命名保持一致：deviceId 里不能有会破坏 tag / 目录路径的字符。
+    const device = sanitizeName(this.#deviceId) || 'local'
+    const rooted = `${base}-${device}`
     const taken = new Set(await this.#listSnapshotIds())
-    if (!taken.has(base)) return base
+    if (!taken.has(rooted)) return rooted
     for (let n = 2; n < 1000; n++) {
-      const candidate = `${base}-${n}`
+      const candidate = `${rooted}-${n}`
       if (!taken.has(candidate)) return candidate
     }
-    throw new SnapshotError('snapshot-id-exhausted', `同一秒内快照过多，无法为 ${base} 分配唯一 id`)
+    throw new SnapshotError('snapshot-id-exhausted', `同一秒内快照过多，无法为 ${rooted} 分配唯一 id`)
   }
 
   async #listSnapshotIds(): Promise<string[]> {

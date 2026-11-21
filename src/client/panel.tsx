@@ -173,7 +173,13 @@ function Panel(): ReactNode {
     setBusy('save')
     try {
       const snapshot = await api.saveNow()
-      store.toast('ok', '已保存新快照')
+      // P0-③：push 分叉/失败时不能弹绿「已保存」——快照本机落地了，但没推到远端，
+      // 这台机器可能已与远端分叉。诚实提示，别让用户以为换机就能拿到这份记忆。
+      if (snapshot.pushed) {
+        store.toast('ok', '已保存并推送新快照')
+      } else {
+        store.toast('warn', `快照已本地保存，但未推送到远端：${snapshot.pushReason ?? '推送失败'}`)
+      }
       const [snapshots, memories] = await Promise.all([
         api.snapshots(state.activeAgentId),
         api.memories({ agentId: state.activeAgentId, global: state.filters.global }),
