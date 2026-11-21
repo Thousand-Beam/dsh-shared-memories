@@ -53,7 +53,7 @@ import { Importer } from './host/memory/importer.js'
 import { PitfallStore } from './host/memory/pitfall.js'
 import { registerRoutes, type ConnectionLike, type MemoriesApiDeps, type WebServerLike } from './host/http/routes.js'
 import { SessionPolicyStore, ephemeralLeaks } from './host/memory/session-policy.js'
-import { PurgeError, purgeAgent } from './host/memory/purge.js'
+import { PurgeError, purgeAgent, type PurgeResult } from './host/memory/purge.js'
 import { DistillService, type Complete } from './host/distill/service.js'
 import { DistillJobs } from './host/distill/jobs.js'
 import { DistillCursor } from './host/distill/cursor.js'
@@ -138,6 +138,47 @@ function lookupService(host: SharedHost, name: string): unknown {
   if (typeof host.get === 'function') return host.get(name)
   return undefined
 }
+
+/** 宿主 workspaceRegistry（dsh-workspace）的最小投影：只取 list 与 detachSession。 */
+interface WorkspaceRegistryLike {
+  list?(): readonly { detachSession?(sessionId: string): Promise<void> }[]
+}
+
+/**
+ * 从宿主工作区记账里摘除会话 id（幂等）。
+ *
+ * 为什么销毁必须走这一步：`archiveSession` 只把会话藏进归档组，**保留 sessionIds
+ * 槽位**（dsh-workspace 注释：archived session keeps its sessionIds slot，unarchive
+ * 要恢复原位）——所以「销毁 → 归档」之后，宿主重启重扫时这一行还会出现在侧栏，
+ * 就是「删不掉的 bug」。`detachSession` 走宿主自己的 table.update 写路径，把 id
+ * 从 sessionIds 数组里摘掉，且不直接改磁盘（v0.3.4「未分组幽灵」的教训）。
+ *
+ * @returns 调用过 detachSession 的工作区数量（0 = 服务缺失，属正常情况）。
+ */
+export async function detachSessionFromWorkspaces(
+  registry: WorkspaceRegistryLike | undefined,
+  sessionId: string,
+  warn: (message: string) => void,
+): Promise<number> {
+  if (registry === undefined || typeof registry.list !== 'function') return 0
+  if (sessionId === '') return 0
+  let detached = 0
+  for (const ws of registry.list() ?? []) {
+    if (ws === null || typeof ws !== 'object' || typeof ws.detachSession !== 'function') continue
+    try {
+      await ws.detachSession(sessionId)
+      detached += 1
+    } catch (cause) {
+      warn(
+        `从工作区记账摘除会话 ${sessionId} 失败：${cause instanceof Error ? cause.message : String(cause)}`,
+      )
+    }
+  }
+  return detached
+}
+
+/** 局部注入拿到的 workspaceRegistry（host.inject 回调里赋值，purge 时兜底用）。 */
+let workspaceRegistryRef: WorkspaceRegistryLike | undefined
 
 /** 装配期可变状态（集中管理，避免散落的模块级变量）。 */
 interface Runtime {
@@ -678,21 +719,33 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
             runtime.liveAgents.delete(input.agentId)
             if (input.sessionId && input.sessionId !== input.agentId) runtime.liveAgents.delete(input.sessionId)
           }
+          let result: PurgeResult
           if (journal === undefined) {
-            const result = await run()
+            result = await run()
             dropPresence()
-            return result
+          } else {
+            result = await journal.withGate(async () => {
+              // 墓碑的 lc 是 maxLc+1，但 Journal.#lc 内存计数没动（墓碑绕过 Journal 直接
+              // 落盘）。不重对齐的话，进程内下一条 append 的 lc 会 <= maxLc < 墓碑 lc，
+              // 排在墓碑前，重放时被墓碑的 DELETE 一并抹掉——销毁把销毁之后的数据删了。
+              // 这里把内存时钟对齐到墓碑水位之上，让后续写入排在墓碑之后、不被误删。
+              const r = await run()
+              await journal.realignClock()
+              dropPresence()
+              return r
+            })
           }
-          return await journal.withGate(async () => {
-            const result = await run()
-            // 墓碑的 lc 是 maxLc+1，但 Journal.#lc 内存计数没动（墓碑绕过 Journal 直接
-            // 落盘）。不重对齐的话，进程内下一条 append 的 lc 会 <= maxLc < 墓碑 lc，
-            // 排在墓碑前，重放时被墓碑的 DELETE 一并抹掉——销毁把销毁之后的数据删了。
-            // 这里把内存时钟对齐到墓碑水位之上，让后续写入排在墓碑之后、不被误删。
-            await journal.realignClock()
-            dropPresence()
-            return result
-          })
+          // 宿主工作区记账摘除：archiveSession 只把会话藏进归档组、保留 sessionIds
+          // 槽位（dsh-workspace 注释：archived session keeps its sessionIds slot），
+          // 宿主重启 bootstrap 重扫时会把这行重新列出来——这就是「销毁后侧栏又出现」。
+          // detachSession 走宿主自己的 table.update 写路径（不直接改 workspace.json），
+          // 幂等且不会跟宿主内存态打架（v0.3.4「未分组幽灵」的教训：不碰磁盘记账）。
+          await detachSessionFromWorkspaces(
+            workspaceRegistryRef ?? (lookupService(host, 'workspaceRegistry') as WorkspaceRegistryLike | undefined),
+            input.sessionId ?? input.agentId,
+            warn,
+          )
+          return result
         } catch (cause) {
           // 关键：这里绝不能让裸异常冒到宿主。
           // 文件被占用（EBUSY）、库只读这类事故会被 purgeAgent 收进 PurgeError；
@@ -846,6 +899,20 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           updatedAt: now,
         }
       },
+    }
+
+    // workspaceRegistry 可选注入：彻底销毁后要把会话 id 从工作区记账里摘掉，
+    // 否则宿主重启重扫时侧栏那一行又回来。拿不到也照常跑（老宿主没这服务）。
+    if (typeof host.inject === 'function') {
+      try {
+        host.inject(['workspaceRegistry'], (wsCtx) => {
+          workspaceRegistryRef = lookupService(wsCtx as SharedHost, 'workspaceRegistry') as
+            | WorkspaceRegistryLike
+            | undefined
+        })
+      } catch {
+        /* 服务缺失时宿主可能直接抛，忽略 */
+      }
     }
 
     // webServer 是可选服务：宿主就绪后再注册接口（局部注入，不因缺服务拖垮插件加载）。
