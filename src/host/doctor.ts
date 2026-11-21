@@ -531,6 +531,44 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
         },
   )
 
+  // 13. 孤儿提炼水位：session_policy 已删但 distill_cursor 还挂着。历史版本只有
+  // purge/restore 清理对称，策略删除的其它路径会残留孤儿行（无害，但占行、且会话
+  // 重开时可能继承旧水位）。新版本已在删除路径同步清理，这里把存量报告出来。
+  if (rootExists) {
+    try {
+      const { DatabaseSync } = await import('node:sqlite')
+      const dbPath = join(root, 'memory.db')
+      if (await pathExists(dbPath)) {
+        const db = new DatabaseSync(dbPath, { readOnly: true })
+        try {
+          const row = db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM distill_cursor c
+                LEFT JOIN session_policy p ON p.session_id = c.session_id
+               WHERE p.session_id IS NULL`,
+            )
+            .get() as { n: number } | undefined
+          const orphans = row?.n ?? 0
+          findings.push(
+            orphans === 0
+              ? { id: 'orphan-cursor', severity: 'ok', title: '提炼水位无孤儿', detail: 'distill_cursor 与 session_policy 一一对应。' }
+              : {
+                  id: 'orphan-cursor',
+                  severity: 'warn',
+                  title: `${orphans} 条孤儿提炼水位`,
+                  detail: '会话策略已删除但提炼水位还在：历史版本清理不对称的残留，无害但占行，重开同名会话可能继承旧水位。',
+                  fix: '重启插件后新版本会在策略删除路径同步清理；存量可执行 DELETE FROM distill_cursor WHERE session_id NOT IN (SELECT session_id FROM session_policy)。',
+                },
+          )
+        } finally {
+          db.close()
+        }
+      }
+    } catch {
+      // node:sqlite 不可用（老 Node）时跳过此项，不判失败。
+    }
+  }
+
   // ── 汇总 ────────────────────────────────────────────────────────────────
   const summary = {
     ok: findings.filter((f) => f.severity === 'ok').length,

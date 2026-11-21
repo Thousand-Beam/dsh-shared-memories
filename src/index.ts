@@ -1871,7 +1871,8 @@ async function autoDistill(
     })
     runtime.jobs.finish(job.jobId, report)
     // 只有真跑完才推进水位：失败/跳过的下一轮会重试同一批内容。
-    cursor.set(sessionId, runtime.workspaceId, turns.length)
+    // skipped 也算"没提炼"：策略在排队期间被切到无痕/off 时，这段内容不能白白跨过去。
+    if (!report.skipped) cursor.set(sessionId, runtime.workspaceId, turns.length)
   } catch (cause) {
     runtime.jobs.fail(job.jobId, cause)
     warn(`自动提炼失败（${sessionId}）：${cause instanceof Error ? cause.message : String(cause)}`)

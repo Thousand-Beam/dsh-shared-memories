@@ -235,9 +235,13 @@ export class TemporalTree {
     const author: Author = input.author ?? 'user'
 
     const outcome = this.#db.transaction(() => {
+      // 越权修复：版本必须属于当前 scope 的实体。之前只按 version_id 查，任何会话
+      // 拿到另一个会话的 versionId 就能改它的情感标注（评审 P1「fixEmotion 越权」）。
       const version = this.#db.one<VersionRow>(
-        `SELECT * FROM memory_version WHERE version_id = ?`,
-        [input.versionId],
+        `SELECT v.* FROM memory_version v
+           JOIN memory_entity e ON e.entity_id = v.entity_id
+          WHERE v.version_id = ? AND e.workspace_id = ? AND e.agent_id = ?`,
+        [input.versionId, input.scope.workspaceId, input.scope.agentId],
       )
       if (!version) return null
       this.#db.run(

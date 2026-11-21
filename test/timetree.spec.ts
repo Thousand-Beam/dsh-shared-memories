@@ -229,3 +229,56 @@ test('journal：每次写入都会按"先关旧、再开新"的顺序落日志',
   assert.equal(typeof first.version.version_id, 'string')
   assert.ok(first.version.version_id.length > 0)
 })
+
+// 越权回归（评审 P1「fixEmotion 越权」）：拿别的会话的 versionId 改情感标注必须无效。
+// 修前 fixEmotion 只按 version_id 查行，不校验实体归属，任何会话都能改别人的标注。
+test('fixEmotion：拿别的 Agent 的 versionId 改情感标注被拒绝，且不改库', async (t) => {
+  const h = await harness(t)
+  if (!h) return
+
+  const mine = await h.tree.openVersion({
+    scope: scopeA,
+    kind: 'fact',
+    subjectKey: 'project:dsh-shared-memories/emotion-owner',
+    text: '本会话的版本',
+    validFrom: T1,
+  })
+
+  // 另一个 Agent 试图改本会话版本的情感标注。
+  const intruder: Scope = { workspaceId: scopeA.workspaceId, agentId: 'agent_intruder', deviceId: 'testdev' }
+  const outcome = await h.tree.fixEmotion({
+    versionId: mine.version.version_id,
+    label: 'anxiety',
+    subject: '别人',
+    trigger: '越权',
+    intensity: 0.9,
+    scope: intruder,
+  })
+  assert.equal(outcome.changed, false)
+
+  // 库里的情感字段必须原封不动。
+  const row = h.db.one<{ emo_label: string | null; emo_subject: string | null; emo_trigger: string | null }>(
+    `SELECT emo_label, emo_subject, emo_trigger FROM memory_version WHERE version_id = ?`,
+    [mine.version.version_id],
+  )
+  assert.equal(row?.emo_label ?? null, null)
+  assert.equal(row?.emo_subject ?? null, null)
+  assert.equal(row?.emo_trigger ?? null, null)
+
+  // 本人改则生效（权限正路径）。
+  const own = await h.tree.fixEmotion({
+    versionId: mine.version.version_id,
+    label: 'anxiety',
+    subject: '依赖装不上',
+    trigger: '卡了两小时',
+    intensity: 0.8,
+    scope: scopeA,
+  })
+  assert.equal(own.changed, true)
+  const after = h.db.one<{ emo_label: string | null; emo_subject: string | null }>(
+    `SELECT emo_label, emo_subject FROM memory_version WHERE version_id = ?`,
+    [mine.version.version_id],
+  )
+  assert.equal(after?.emo_label, 'anxiety')
+  assert.equal(after?.emo_subject, '依赖装不上')
+})

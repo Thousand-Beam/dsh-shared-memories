@@ -135,6 +135,9 @@ export class SessionPolicyStore {
 
   /** 关掉无痕（或清理策略行）：无痕会话结束时用。 */
   clear(sessionId: string): void {
+    // 与 purge/restore 的清理对齐：策略行删掉后，提炼水位（distill_cursor）必须
+    // 跟着走，否则留下孤儿行——会话重开时继承旧水位、销毁后残留隐私计数。
+    this.#db.run('DELETE FROM distill_cursor WHERE session_id = ?', [sessionId])
     this.#db.run('DELETE FROM session_policy WHERE session_id = ?', [sessionId])
   }
 
@@ -154,6 +157,10 @@ export class SessionPolicyStore {
       'SELECT session_id FROM session_policy WHERE workspace_id = ? AND agent_id = ?',
       [workspaceId, agentId],
     )
+    // 提炼水位一起清（与 clear 同因）：策略没了水位就是孤儿行。
+    for (const row of before) {
+      this.#db.run('DELETE FROM distill_cursor WHERE session_id = ?', [row.session_id])
+    }
     this.#db.run('DELETE FROM session_policy WHERE workspace_id = ? AND agent_id = ?', [workspaceId, agentId])
     return before.length
   }
