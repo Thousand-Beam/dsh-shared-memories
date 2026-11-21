@@ -29,6 +29,8 @@ const BASE = '/dsh/shared-memories'
 export interface ApiError {
   code: string
   message: string
+  /** 非 2xx 响应体里 `data` 字段（例如 /save 409 时带 snapshotId/pushed/pushReason）。 */
+  data?: unknown
 }
 
 /** doctor 自检报告（前端展示用，与 src/host/doctor.ts 的 DoctorReport 对齐）。 */
@@ -66,7 +68,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const text = await response.text()
   const payload = text ? (safeJson(text) as { ok?: boolean; data?: unknown; error?: ApiError }) : {}
   if (!response.ok || payload.ok === false) {
-    throw payload.error ?? { code: `http-${response.status}`, message: text.slice(0, 300) }
+    const err: ApiError = payload.error ?? { code: `http-${response.status}`, message: text.slice(0, 300) }
+    if (payload.data !== undefined) err.data = payload.data
+    throw err
   }
   return payload.data as T
 }

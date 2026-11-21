@@ -476,7 +476,23 @@ async function dispatch(
     if (method === 'POST' && path === '/save') {
       // 恢复没 ready 时不许写：否则快照会把"半恢复"的库当成真身提交上去。
       deps.barrier.assertWritable('manual-snapshot')
-      return sendJson(res, 200, ok(await deps.saveNow()))
+      const result = await deps.saveNow()
+      // P1-B/P0-③ 收尾：pushed===false 不能继续返回 200——本地快照落地了，但没推到远端，
+      // 这台机器可能已与远端分叉。HTTP 状态码本身必须诚实，别把契约留给前端去 parse body。
+      if (!result.pushed) {
+        const diverged = result.pushReason === 'diverged'
+        return sendJson(res, 409, {
+          ok: false,
+          error: {
+            code: diverged ? 'push-diverged' : 'push-failed',
+            message: diverged
+              ? '本机与远端历史分叉，快照已本地保存但未推送（同步停摆，需手动解决）'
+              : `快照已本地保存，但推送失败：${result.pushReason ?? '未知原因'}`,
+          },
+          data: { snapshotId: result.snapshotId, pushed: false, pushReason: result.pushReason },
+        })
+      }
+      return sendJson(res, 200, ok(result))
     }
     if (method === 'POST' && path === '/test-connection') {
       return sendJson(res, 200, ok(await deps.testConnection()))

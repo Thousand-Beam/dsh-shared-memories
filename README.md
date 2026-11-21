@@ -80,7 +80,7 @@ cold → pulling → verifying → replaying → ready
 # 包未发布到公共 npm registry，从 GitHub Release 下载 tgz 后本地安装：
 # 1. 打开 https://github.com/Thousand-Beam/dsh-shared-memories/releases 下载最新 dsh-shared-memories-*.tgz
 # 2. 在 tgz 所在目录执行：
-npm i ./dsh-shared-memories-0.4.2.tgz
+npm i ./dsh-shared-memories-0.4.3.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里挂上（插件自带一份可直接用的 `cordis.patch.yml`）：
@@ -209,7 +209,7 @@ B 机装好插件、填同样的 `remote` + 配好 SSH，启动时就会自动 `
 | `sync.enabled` | `true` | 同步总开关 |
 | `sync.intervalSec` | `300` | 定时快照间隔（秒） |
 | `sync.pushOnCommit` | `true` | 每次提交后立即推送 |
-| `sync.pullStrategy` | `ff-only` | 冷启动拉取策略：`ff-only` / `rebase` / `merge` |
+| `sync.pullStrategy` | `ff-only` | 冷启动拉取策略：`ff-only` / `rebase` |
 | `snapshot.keep` | `5` | 滑窗大小；Pin 过的不计入清理 |
 | `snapshot.maxBytes` | `268435456`（256MB） | 单次快照体积上限，超了拒绝提交而不是截断 |
 | `restore.offlinePolicy` | `degraded-readonly` | `degraded-readonly` / `local-only` / `block` |
@@ -466,7 +466,7 @@ npm run self-test   # 第 ⑥ 段：新建会话继承同一人格，且用解�
 - Node **≥ 22.5**（依赖内置 `node:sqlite`；更早的版本需要自行接 `node:sqlite` polyfill，走 `SqlDriver` 接口）。
 - DSH **≥ 0.2.1-rc.3**（`package.json` 的 `dsh.engines.dsh`）。宿主仍在 rc 阶段，插件贴的是 `systemPrompt.section()` / `slots` / `locale` 注入等内部 API——**升级 DSH 前先查本插件的兼容声明，别裸升**（内部 API 一改，插件可能失效或串台）。
 - 平台：Windows / macOS / Linux 均可；`core.autocrlf` 由插件在快照仓库内强制为 `false`（否则 sha256 会被 CRLF 骗过）。
-- 多设备：journal 按设备文件分片，并发写入在 git 层是「文件并集」、天然无冲突；但人格/技能/画像等 `state/*.json` 是单一共享文件，两台机器在同一个快照间隔内都改同一项设置时，后 push 的一方会覆盖（Last-Write-Wins）。建议同一时刻只让一台机器可写，其余以 `degraded-readonly` 只读，或避免同时改设置（记忆本体永不丢失，只有设置类状态有此风险）。
+- 多设备：journal 按设备文件分片，并发写入在 git 层是「文件并集」、天然无冲突；但人格/技能/画像等 `state/*.json` 是单一共享文件——两台机器产出**逐字节相同**的状态（同一逻辑状态）不会冲突；若真的各改了不同内容，git 会 add/add 冲突，进入「分叉停摆」（`push-diverged`，诚实降级、需要一次手动 `git pull` 解决），而不是静默后写覆盖。建议同一时刻只让一台机器可写，其余以 `degraded-readonly` 只读，或避免同时改设置（记忆本体永不丢失，只有设置类状态有此风险）。
 
 ---
 

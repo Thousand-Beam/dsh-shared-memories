@@ -152,7 +152,7 @@ async function serve(t: TestContext, deps: MemoriesApiDeps): Promise<string> {
 
 async function makeHarness(
   t: TestContext,
-  options: { ready?: boolean; connection?: ConnectionLike } = {},
+  options: { ready?: boolean; connection?: ConnectionLike; saveNowPushed?: boolean } = {},
 ): Promise<Harness | undefined> {
   const db = await openTestDb(t)
   if (!db) return undefined
@@ -232,7 +232,7 @@ async function makeHarness(
     connection: options.connection,
     saveNow: async () => {
       const result = await engine.snapshot('manual')
-      return { snapshotId: result.manifest.snapshotId }
+      return { snapshotId: result.manifest.snapshotId, pushed: options.saveNowPushed ?? true }
     },
     testConnection: async () => ({ mode: 'local-only' as const, ok: true }),
     setIntervalSec: () => {},
@@ -389,6 +389,16 @@ test('POST /save：ready 时出快照；cold 时 423 拒绝写入', async (t) =>
   const blocked = await call(cold.base, '/save', { method: 'POST' })
   assert.equal(blocked.status, 423, '恢复未就绪必须 423，不能放行')
   assert.equal(blocked.body.error?.code, 'restore-blocked')
+})
+
+test('POST /save：pushed=false 时 409 而非 200（API 契约诚实）', async (t) => {
+  const h = await makeHarness(t, { saveNowPushed: false })
+  if (!h) return
+
+  const saved = await call<{ snapshotId: string; pushed: boolean; pushReason?: string }>(h.base, '/save', { method: 'POST' })
+  assert.equal(saved.status, 409, '推送失败不能返回 200，HTTP 状态码本身要诚实')
+  assert.equal(saved.body.error?.code, 'push-failed')
+  assert.equal(saved.body.data?.pushed, false)
 })
 
 test('POST /sync-interval：<30 秒被拒，合法值回显', async (t) => {

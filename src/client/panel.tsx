@@ -15,7 +15,7 @@
 import { createElement, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import type { AgentSummary, UserProfileDto } from '../shared/console-api.js'
-import { api } from './api.js'
+import { api, type ApiError } from './api.js'
 import { ConsoleContext, ConsoleStore, useConsole, useStore, type ViewKey } from './state.js'
 import { installConsoleStyles } from './styles.js'
 import { phaseLabel, reasonLabel, traitLabel } from './i18n.js'
@@ -186,7 +186,14 @@ function Panel(): ReactNode {
       ])
       store.patch({ snapshots, memories })
     } catch (cause) {
-      store.toast('error', cause instanceof Error ? cause.message : '手动保存失败')
+      // /save 409：pushed===false 时后端返回非 2xx，data 里带 pushed/pushReason，
+      // 前端要区分「分叉/推送失败（黄条）」与「真保存失败（红条）」。
+      const err = cause as ApiError & { data?: { pushed?: boolean; pushReason?: string } }
+      if (err?.data?.pushed === false) {
+        store.toast('warn', `快照已本地保存，但未推送到远端：${err.data.pushReason ?? '推送失败'}`)
+      } else {
+        store.toast('error', cause instanceof Error ? cause.message : '手动保存失败')
+      }
     } finally {
       setBusy(null)
     }

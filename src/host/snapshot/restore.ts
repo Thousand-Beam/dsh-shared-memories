@@ -917,7 +917,7 @@ export class RestoreEngine {
 
       const pullArgs =
         this.#pullStrategy === 'rebase'
-          ? ['pull', '--rebase', 'origin', this.#branch]
+          ? ['pull', '--rebase', '--autostash', 'origin', this.#branch]
           : ['pull', '--ff-only', 'origin', this.#branch]
       const pull = await this.#git.run(pullArgs, { timeoutMs: this.#timeoutMs })
       if (pull.code === 0) return

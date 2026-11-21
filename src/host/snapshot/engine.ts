@@ -651,11 +651,10 @@ export class SnapshotEngine {
       `${JSON.stringify(
         {
           version: 2,
-          // 注意：不写 device 字段——两台设备在同一逻辑状态下必须产出**逐字节相同**的
-          // agents.json，否则「内容相同、只因 deviceId 不同」会在 git rebase 时制造假的
-          // add/add 冲突（评价 1 P0-1：并发快照卡 rebase 中间态）。deviceId 已由
-          // snapshotId（带 -deviceId 后缀）与 journal 记录承载，不靠这里。
-          capturedAt: this.#clock(),
+          // 注意：不写 device / capturedAt 字段——两者都是每设备可变（deviceId 不同、
+          // 墙钟毫秒不同），两台设备在同一逻辑状态下会产出**不同字节**，git rebase 时
+          // 制造假的 add/add 冲突（P0-1/P1-B：并发快照卡 rebase 中间态）。deviceId 已由
+          // snapshotId（带 -deviceId 后缀）与 journal 记录承载；快照时间由 snapshotId 承载。
           agents: state.agents.map((agent) => ({
             agentId: agent.agentId,
             workspaceIds: agent.workspaceIds ?? [],
@@ -700,9 +699,8 @@ export class SnapshotEngine {
       `${JSON.stringify(
         {
           version: 1,
-          // capturedAt 用 this.#clock() 而不是 Date.now()：否则两台设备同一秒各拍一次，
-          // 这个字段会因墙钟差异而不同，制造假的 add/add 冲突（评价 1 P0-1）。
-          capturedAt: this.#clock(),
+          // 不写 capturedAt：墙钟每设备不同，会让两台设备同一逻辑状态产出不同字节，
+          // 制造假 add/add 冲突（P0-1/P1-B）。快照时间由 snapshotId 承载。
           identities,
         },
         null,
@@ -734,7 +732,6 @@ export class SnapshotEngine {
       `${JSON.stringify(
         {
           version: 1,
-          capturedAt: this.#clock(),
           profiles,
         },
         null,
@@ -767,7 +764,7 @@ export class SnapshotEngine {
     }))
     await writeFile(
       join(stateDir, 'skills.json'),
-      `${JSON.stringify({ version: 1, capturedAt: this.#clock(), agents }, null, 2)}\n`,
+      `${JSON.stringify({ version: 1, agents }, null, 2)}\n`,
       'utf8',
     )
   }

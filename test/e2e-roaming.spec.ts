@@ -566,3 +566,48 @@ test('跨设备同秒互推：两台设备同一秒各拍一次，id 掺 deviceI
   assert.match(remoteTags, /snap\/[^-]+-devA/, '远端必须有 A 的 tag')
   assert.match(remoteTags, /snap\/[^-]+-devB/, '远端必须有 B 的 tag')
 })
+
+test('跨设备同逻辑状态、不同墙钟：状态文件确定性，不触发 diverged（P1-B）', async (t) => {
+  const bare = await makeBareRemote(t)
+  const at = NOW
+
+  // 两台设备墙钟毫秒不同（模拟真实 NTP 偏差），但同一秒、同逻辑状态。
+  // v0.4.1 的状态文件写 capturedAt 墙钟，这里就会 add/add 冲突；删掉后字节相同。
+  async function boot(t2: TestContext, deviceId: string, name: string, wallOffsetMs: number): Promise<SnapshotEngine | undefined> {
+    const root = await tempRoot(t2, `wall-${name}-`)
+    await git(root, ['init', '-b', 'main'])
+    await git(root, ['config', 'user.email', `${name}@example.test`])
+    await git(root, ['config', 'user.name', name])
+    return new SnapshotEngine({
+      root,
+      deviceId,
+      git: new ExecGitRunner({ cwd: root }),
+      remote: bare,
+      branch: 'main',
+      clock: () => at + wallOffsetMs,
+      sleep: async () => {},
+      collectState: () => ({
+        agents: [
+          { agentId: 'lead', workspaceIds: [WORKSPACE], sessions: ['sess-1'], persona: { name: '小狐', age: 20 } },
+        ],
+      }),
+    })
+  }
+
+  const engineA = await boot(t, DEVICE_A, 'dev-a', 0)
+  const engineB = await boot(t, DEVICE_B, 'dev-b', 500)
+  if (!engineA || !engineB) return
+
+  const snapA = await engineA.snapshot('shutdown')
+  const snapB = await engineB.snapshot('shutdown')
+
+  // 核心断言：两台墙钟毫秒不同（真实 NTP 场景），但状态文件（已删 capturedAt/device）
+  // 逐字节相同，所以 B 后推 pull --rebase 不再 add/add 冲突，两台都 push 成功。
+  assert.equal(snapA.pushed, true, 'A 必须推上远端')
+  assert.equal(snapB.pushed, true, 'B 必须推上远端（墙钟毫秒差异不应制造假 add/add 冲突）')
+
+  // 两个快照 tag 都在，不是互相覆盖、也没 diverged 停摆。
+  const remoteTags = await git(bare, ['tag', '--list', `snap/${snapshotIdOf(at)}-*`])
+  assert.match(remoteTags, /-devA/, '远端必须有 A 的 tag')
+  assert.match(remoteTags, /-devB/, '远端必须有 B 的 tag')
+})
