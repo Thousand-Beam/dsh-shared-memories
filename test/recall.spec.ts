@@ -192,3 +192,21 @@ test('复现确认：同一句话写第二次时 reinforce_count 加一，但不
   const versions = db.all('SELECT version_id FROM memory_version WHERE entity_id = ?', [first.entity.entity_id])
   assert.equal(versions.length, 1)
 })
+
+test('reinforce_count 封顶 64：异常循环刷不会让计数与召回展示无限膨胀（终审报告 P3）', async (t) => {
+  const db = await openTestDb(t)
+  if (db === undefined) return
+  const root = await tempRoot(t)
+  const tree = new TemporalTree(db, new Journal({ root, deviceId: DEVICE }))
+
+  const first = await tree.openVersion({ scope: SCOPE, kind: 'preference', subjectKey: 'food/likes', text: '爱吃鲈鱼。' })
+  for (let i = 0; i < 100; i++) {
+    await tree.openVersion({ scope: SCOPE, kind: 'preference', subjectKey: 'food/likes', text: '爱吃鲈鱼。' })
+  }
+
+  const row = db.one<{ reinforce_count: number }>(
+    'SELECT reinforce_count FROM memory_entity WHERE entity_id = ?',
+    [first.entity.entity_id],
+  )
+  assert.equal(row?.reinforce_count, 64, '计数封顶 64（召回权重 log2 在此已饱和，再高只是展示数字膨胀）')
+})

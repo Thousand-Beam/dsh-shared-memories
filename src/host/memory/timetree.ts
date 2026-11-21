@@ -357,11 +357,13 @@ export class TemporalTree {
   /**
    * 复现确认：同一实体又被写了一次（正文可能一致、也可能是新版本）。
    * 只动计数与 `updated_at`，不动 `created_at` —— 诞生时间是事实，不该被覆盖。
+   * 计数封顶 64：召回权重（log2 压缩）在 64 时已饱和，再高只是「说过 N 次」的
+   * 展示数字被异常循环刷爆（终审报告 P3：实测刷到 1584）。
    */
   #reinforce(entityId: string, at: number): void {
     this.#db.run(
       `UPDATE memory_entity
-          SET reinforce_count = reinforce_count + 1,
+          SET reinforce_count = MIN(reinforce_count + 1, 64),
               updated_at = CASE WHEN ? > updated_at THEN ? ELSE updated_at END
         WHERE entity_id = ?`,
       [at, at, entityId],

@@ -471,7 +471,12 @@ async function dispatch(
       const body = await readJson(req)
       const snapshotId = reqStr(body, 'snapshotId')
       const rolled = await deps.snapshots()?.rollback(snapshotId)
-      return sendJson(res, 200, ok({ snapshotId, commit: rolled?.commit ?? '' }))
+      // 诚实告知：派生库已被删（强制下次冷启动全量重放），当前进程重启前仍使用内存里的旧库。
+      return sendJson(res, 200, ok({
+        snapshotId,
+        commit: rolled?.commit ?? '',
+        note: '工作树已回退并生成 revert 提交；派生库（memory.db）已清空，重启插件后从 journal 全量重建到回退点（重启前当前进程仍展示回退前的数据）。',
+      }))
     }
     if (method === 'POST' && path === '/save') {
       // 恢复没 ready 时不许写：否则快照会把"半恢复"的库当成真身提交上去。
@@ -486,7 +491,7 @@ async function dispatch(
           error: {
             code: diverged ? 'push-diverged' : 'push-failed',
             message: diverged
-              ? '本机与远端历史分叉，快照已本地保存但未推送（同步停摆，需手动解决）'
+              ? '本机与远端历史分叉，快照已本地保存但未推送。真并发改出不同内容时 git pull --rebase 会停在冲突态：需手工解决 state 文件冲突后 git add + git rebase --continue（其间本机新记忆滞留本地，不会丢）'
               : `快照已本地保存，但推送失败：${result.pushReason ?? '未知原因'}`,
           },
           data: { snapshotId: result.snapshotId, pushed: false, pushReason: result.pushReason },
