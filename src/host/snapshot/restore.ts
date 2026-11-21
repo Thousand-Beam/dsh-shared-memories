@@ -893,7 +893,10 @@ export class RestoreEngine {
 
     let lastError = ''
     for (let attempt = 0; attempt <= this.#retries; attempt++) {
-      const fetch = await this.#git.run(['fetch', '--prune', 'origin', this.#branch], {
+      // `--tags` 是必须的：快照文件校验读的是 `snap/<id>` 指向的 git 对象，
+      // 而只写分支 refspec 的 fetch 不会把 tag 拉下来（新设备 init+fetch 后本地
+      // 没有任何 snap tag，校验一律 snapshot-file-missing）。
+      const fetch = await this.#git.run(['fetch', '--prune', '--tags', 'origin', this.#branch], {
         timeoutMs: this.#timeoutMs,
       })
       if (fetch.code !== 0) {
@@ -1058,63 +1061,56 @@ export class RestoreEngine {
     }
 
     const manifest = await readManifest(this.#root, snapshotId)
+    // 校验基准是「快照提交里的内容」，不是工作区文件。
+    //
+    // 工作区在快照之后还会继续写（journal 追加、state/*.json 重写、purge 删行），
+    // 这是正常前进；拿工作区去比 manifest 必然对不上——真机表现为「快照之后只要
+    // 写过东西，下次重启就判 snapshot-corrupt 并整机降级只读」，把正常重启误杀。
+    //
+    // 要防的威胁是「快照本身被改」：远端被投毒、历史被改写、坏提交。读 git 对象
+    // （tag `snap/<id>` 指向的快照提交）再算 sha256，能抓到篡改，又不受工作区前进影响。
+    const ref = `snap/${snapshotId}`
     let checked = 0
     for (const entry of manifest.files) {
-      const absolute = join(this.#root, entry.path)
-      let bytes: Buffer
-      try {
-        bytes = await readFile(absolute)
-      } catch {
-        throw new RestoreError('snapshot-file-missing', `快照文件缺失：${entry.path}`, entry)
+      const show = await this.#git.run(['show', `${ref}:${entry.path}`], {
+        timeoutMs: this.#timeoutMs,
+      })
+      if (show.code !== 0) {
+        throw new RestoreError(
+          'snapshot-file-missing',
+          `快照提交里缺少文件：${entry.path}（${ref}；${show.stderr.trim().slice(0, 200)}）`,
+          entry,
+        )
       }
-      const digest = createHash('sha256').update(bytes).digest('hex')
-      if (digest === entry.sha256) {
-        checked++
+      const digest = createHash('sha256').update(Buffer.from(show.stdout, 'utf8')).digest('hex')
+      if (digest !== entry.sha256) {
+        throw new RestoreError(
+          'snapshot-corrupt',
+          `快照文件校验失败：${entry.path}（期望 ${entry.sha256.slice(0, 12)}… 实际 ${digest.slice(0, 12)}…）`,
+          { path: entry.path, expected: entry.sha256, actual: digest },
+        )
+      }
+      checked++
+    }
+
+    // 工作区被截断成 0 字节仍然要救：重放读的是工作区文件，不是 git 对象。
+    // 进程被强杀 / 磁盘写一半会把文件清空，git 里还有干净副本（评价 2 实测发现）。
+    for (const entry of manifest.files) {
+      if (!entry.path.startsWith('journal/')) continue
+      const absolute = join(this.#root, entry.path)
+      let local: Buffer | undefined
+      try {
+        local = await readFile(absolute)
+      } catch {
         continue
       }
-
-      // journal 是 append-only 的：快照之后每写一条记忆，文件都会变长，
-      // 全文件 sha256 必然对不上。这不是篡改，是"快照之后又说了话"。
-      // 所以只校验**快照当时那段前缀**，再逐行验尾巴是不是合法的 journal 记录：
-      //   - 前缀变了 → 历史被改写，照样拦；
-      //   - 尾巴里混进一行不是 JSON / 没有 v/seq/at/op 的东西 → 有人往里塞垃圾，拦。
-      const grew = bytes.length > entry.bytes
-      if (grew && allowedToGrow(entry.path)) {
-        const prefix = createHash('sha256').update(bytes.subarray(0, entry.bytes)).digest('hex')
-        if (prefix === entry.sha256 && validJournalTail(bytes.subarray(entry.bytes))) {
-          checked++
-          continue
-        }
+      if (local.length > 0) continue
+      const healed = await this.#selfHealFile(entry.path)
+      if (healed) {
+        this.#onWarn(`自愈：${entry.path} 已被截断成 0 字节，已从 git HEAD 恢复`)
       }
-
-      // 自愈（P0-⑥）：只对「截断成 0 字节」这种可恢复损坏才从 git HEAD 救回——进程被
-      // 强杀 / 磁盘写一半会把文件清空，但 git HEAD（最新快照提交）里还有干净副本。非空
-      // 但内容对不上 = 真篡改（有人往里塞东西）或坏提交，必须拦下来降级，绝不能静默用
-      // git 副本盖掉，否则「篡改检测」形同虚设（评价 2 的篡改测试就是这种：文件非空但
-      // 被加了 {"tampered":true}，必须判 snapshot-corrupt 而不是自愈）。
-      if (bytes.length === 0) {
-        const healed = await this.#selfHealFile(entry.path)
-        if (healed) {
-          let healedBytes: Buffer
-          try {
-            healedBytes = await readFile(absolute)
-          } catch {
-            throw new RestoreError('snapshot-file-missing', `快照文件缺失：${entry.path}`, entry)
-          }
-          if (createHash('sha256').update(healedBytes).digest('hex') === entry.sha256) {
-            this.#onWarn(`自愈：${entry.path} 已被截断成 0 字节，已从 git HEAD 恢复并校验通过`)
-            checked++
-            continue
-          }
-        }
-      }
-
-      throw new RestoreError(
-        'snapshot-corrupt',
-        `快照文件校验失败：${entry.path}（期望 ${entry.sha256.slice(0, 12)}… 实际 ${digest.slice(0, 12)}…）`,
-        { path: entry.path, expected: entry.sha256, actual: digest },
-      )
     }
+
     return { snapshotId, files: checked }
   }
 
@@ -1170,43 +1166,6 @@ export class RestoreEngine {
 
 /** local-only 策略下的"可继续"信号：restoreOnBoot 会把它当作正常通过。 */
 class LocalOnlyFallback extends Error {}
-
-/** 只有 append-only 的 journal 允许"快照之后变长"，其余文件必须逐字节一致。 */
-function allowedToGrow(path: string): boolean {
-  return path.startsWith('journal/')
-}
-
-/**
- * 校验 journal 尾巴是不是"正常新写的记录"。
- *
- * 快照之后我们会继续写记忆，文件自然变长；但变长必须长成 journal 的样子：
- * 一行一条 JSON，且带 `v/seq/at/op` 信封。有人往里塞 `{"tampered":true}`
- * 或者把别的文件内容倒进来，这一关会拦下。
- * 唯一放过的是"最后一行没写完整"——进程崩在 write 中间会留下半行。
- */
-function validJournalTail(tail: Buffer): boolean {
-  if (tail.length === 0) return true
-  const text = tail.toString('utf8')
-  const lines = text.split('\n')
-  for (const [index, line] of lines.entries()) {
-    const trimmed = line.trim()
-    if (trimmed === '') continue
-    const isLast = index === lines.length - 1
-    try {
-      const record = JSON.parse(trimmed) as Record<string, unknown> | null
-      if (record === null || typeof record !== 'object') {
-        if (isLast && !text.endsWith('\n')) continue
-        return false
-      }
-      if (typeof record.op !== 'string' || typeof record.at !== 'number') return false
-      if (typeof record.v !== 'number' || typeof record.seq !== 'number') return false
-    } catch {
-      if (isLast && !text.endsWith('\n')) continue
-      return false
-    }
-  }
-  return true
-}
 
 function describe(error: unknown): string {
   if (error instanceof Error) return `${error.name}: ${error.message}`

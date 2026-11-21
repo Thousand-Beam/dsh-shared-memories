@@ -175,7 +175,11 @@ test('设备 A 停机 → 设备 B 冷启动：快照、拉取、重放、跨设
   const outcome = await restoreB.restoreOnBoot()
 
   // 断言 ②：真的 ready，而不是"降级了但假装成功"。
-  assert.equal(outcome.status, 'ready', `冷启动应 ready，实际 ${outcome.status} / ${outcome.code ?? ''}`)
+  assert.equal(
+    outcome.status,
+    'ready',
+    `冷启动应 ready，实际 ${outcome.status} / ${outcome.code ?? ''} / ${outcome.error instanceof Error ? outcome.error.message : ''}`,
+  )
   assert.equal(barrierB.phase, 'ready')
   assert.equal(barrierB.acceptsWrites, true)
   assert.ok(outcome.snapshotId, '恢复结果应带上快照 id')
@@ -221,13 +225,21 @@ test('快照被篡改 → 设备 B 进入 degraded 只读，错误码 snapshot-c
   const healthy = await first.restoreOnBoot()
   assert.equal(healthy.status, 'ready')
 
-  // ── 手动篡改一个被快照覆盖的文件（模拟"云端仓库被人动过"）───────────────
+  // ── 篡改快照提交本身（模拟"云端仓库被人动过"：改内容 + 重写快照 tag）───────
+  // 注意：校验基准是 git 对象（tag snap/<id> 指向的提交），不是工作区文件——
+  // 工作区在快照之后继续写是正常前进，不能因此降级（否则每次重启都误判）。
   const manifestPath = join(rootC, 'snapshots', snapshot.manifest.snapshotId, 'manifest.json')
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as SnapshotManifest
   const victim = manifest.files.find((file) => file.path.startsWith('journal/')) ?? manifest.files[0]
   assert.ok(victim, '快照清单里必须能找到可篡改的文件')
   const original = await readFile(join(rootC, victim.path), 'utf8')
   await writeFile(join(rootC, victim.path), `${original}\n{"tampered":true}\n`, 'utf8')
+  await git(rootC, ['config', 'user.email', 'tamper@example.test'])
+  await git(rootC, ['config', 'user.name', 'Tamper'])
+  await git(rootC, ['add', '-A'])
+  await git(rootC, ['commit', '--amend', '--no-edit'])
+  // 投毒者会连快照书签一起重写；否则 restore 读到的还是原始提交，篡改就藏在工作区。
+  await git(rootC, ['tag', '-f', `snap/${snapshot.manifest.snapshotId}`])
 
   // ── 再启动一次（纯本地，不 pull，避免远端把篡改盖回去）────────────────────
   const barrier2 = new RestoreBarrier()
@@ -456,7 +468,11 @@ test('A 销毁 lead → push → B 冷启动：被销毁记忆与人格都不复
     branch: 'main',
   })
   const outcome = await restoreB.restoreOnBoot()
-  assert.equal(outcome.status, 'ready', `销毁后 B 冷启动应 ready，实际 ${outcome.status} / ${outcome.code ?? ''}`)
+  assert.equal(
+    outcome.status,
+    'ready',
+    `销毁后 B 冷启动应 ready，实际 ${outcome.status} / ${outcome.code ?? ''} / ${outcome.error instanceof Error ? outcome.error.message : ''}`,
+  )
 
   // 被销毁的 lead 记忆不复活。
   const leadMemories = dbB.all<{ text: string }>(

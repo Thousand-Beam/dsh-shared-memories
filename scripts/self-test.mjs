@@ -571,6 +571,14 @@ async function main() {
     const victimPath = join(rootB, victim.path)
     const original = await readFile(victimPath, 'utf8')
     await writeFile(victimPath, `${original}{"tampered":true}\n`, 'utf8')
+    // 篡改必须落在 git 提交里：恢复时的校验基准是 `snap/<id>` 指向的 git 对象，
+    // 工作区文件在快照之后继续写属于正常前进（否则每次重启都会误判降级）。
+    const poison = new ExecGitRunner({ cwd: rootB })
+    await poison.run(['config', 'user.email', 'tamper@example.test'])
+    await poison.run(['config', 'user.name', 'Tamper'])
+    await poison.run(['add', '-A'])
+    await poison.run(['commit', '--amend', '--no-edit'])
+    await poison.run(['tag', '-f', `snap/${snapshot.manifest.snapshotId}`])
 
     const dbC = await openDb(schema)
     const barrierC = new RestoreBarrier()
