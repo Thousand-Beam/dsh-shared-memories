@@ -1050,8 +1050,17 @@ export class RestoreEngine {
     }
   }
 
-  async #verifySnapshotHashes(): Promise<{ snapshotId?: string; files: number }> {
-    const snapshotId = await this.#latestSnapshotId()
+  /** 工作区同路径文件的 sha256 是否与清单记录一致（用于「清单超前于提交」的判定）。 */
+  async #workspaceMatches(path: string, expected: string): Promise<boolean> {
+    try {
+      const bytes = await readFile(join(this.#root, path))
+      return createHash('sha256').update(bytes).digest('hex') === expected
+    } catch {
+      return false
+    }
+  }
+
+  async #verifySnapshotHashes(): Promise<{ snapshotId?: string; files: number }> {    const snapshotId = await this.#latestSnapshotId()
     if (!snapshotId) {
       if (this.#allowMissingSnapshot) {
         this.#onWarn('未发现任何快照清单，按首次启动处理')
@@ -1076,6 +1085,16 @@ export class RestoreEngine {
         timeoutMs: this.#timeoutMs,
       })
       if (show.code !== 0) {
+        // 清单超前于提交：v0.5.8 及更早的 snapshot 把「capture 之后消失 / 被 exclude
+        // 挡住」的文件也写进了清单，提交里却没有它。这种条目不该判死——工作区里同一
+        // 路径的内容如果与清单哈希一致，重放读到的数据就是完整的，只是快照副本缺这一份。
+        // 真投毒（内容被换）哈希对不上，仍走 snapshot-corrupt 降级，不会被这里放过。
+        if (await this.#workspaceMatches(entry.path, entry.sha256)) {
+          this.#onWarn(
+            `快照 ${snapshotId} 的清单多列了 ${entry.path}（提交里没有，工作区副本完好）——已跳过该条，建议保存一次新快照补齐`,
+          )
+          continue
+        }
         throw new RestoreError(
           'snapshot-file-missing',
           `快照提交里缺少文件：${entry.path}（${ref}；${show.stderr.trim().slice(0, 200)}）`,

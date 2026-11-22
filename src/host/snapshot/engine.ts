@@ -225,11 +225,43 @@ export class SnapshotEngine {
     return manifest
   }
 
-  /** 提交：`git add -A` → commit → tag。失败一律抛结构化错误。 */
-  async commit(manifest: SnapshotManifest): Promise<{ commit: string; tag: string }> {
+  /** 提交：`git add -A` → 清单收敛 → commit → tag。失败一律抛结构化错误。 */
+  async commit(
+    manifest: SnapshotManifest,
+  ): Promise<{ commit: string; tag: string; manifest: SnapshotManifest }> {
     await this.#ensureRepo()
     const add = await this.#git.run(['add', '-A'])
     assertGitOk(add, ['add', '-A'], 'git-add-failed')
+
+    // 清单收敛：capture 扫的是工作区，`git add -A` 只收「未被忽略且仍存在」的文件。
+    // 两者之间工作区还会动（journal 新建、文件被删、被 exclude 规则挡住），于是清单里
+    // 可能留下一个提交里并不存在的条目——下次启动严格校验时它就是
+    // snapshot-file-missing，整机降级只读（真机实测：QS-DT 首启后每次启动都卡在
+    // 「快照提交里缺少文件：journal/devices/QS-DT/2026-11-22.jsonl」）。
+    // 这里以索引为准回写清单，保证「清单里列的 = 提交里有的」。
+    let effective = manifest
+    const staged = await this.#git.run(['ls-files', '-z'])
+    if (staged.code === 0) {
+      const inIndex = new Set(staged.stdout.split('\u0000').filter((path) => path.length > 0))
+      const dropped = manifest.files.filter((file) => !inIndex.has(file.path))
+      if (dropped.length > 0) {
+        this.#onWarn(
+          `快照清单里 ${dropped.length} 个文件没进入提交（${dropped
+            .slice(0, 3)
+            .map((file) => file.path)
+            .join('、')}${dropped.length > 3 ? ' 等' : ''}），已从清单剔除`,
+        )
+        const kept = manifest.files.filter((file) => inIndex.has(file.path))
+        const totals = kept.reduce(
+          (acc, file) => ({ files: acc.files + 1, bytes: acc.bytes + file.bytes }),
+          { files: 0, bytes: 0 },
+        )
+        effective = { ...manifest, files: kept, totals }
+        await writeManifest(this.#root, effective)
+        const readd = await this.#git.run(['add', '-A'])
+        assertGitOk(readd, ['add', '-A'], 'git-add-failed')
+      }
+    }
 
     const message = `snapshot(${manifest.trigger}): ${manifest.snapshotId} @${this.#deviceId}`
     const commit = await this.#git.run(['commit', '--allow-empty', '-m', message], {
@@ -250,7 +282,7 @@ export class SnapshotEngine {
     })
     assertGitOk(tagged, ['tag', tag], 'git-tag-failed')
 
-    return { commit: sha, tag }
+    return { commit: sha, tag, manifest: effective }
   }
 
   /**
@@ -420,8 +452,9 @@ export class SnapshotEngine {
   /** 完整流水线：capture → commit → rotate → push。 */
   async snapshot(trigger: SnapshotTrigger): Promise<SnapshotResult> {
     const manifest = await this.capture(trigger)
-    const { commit, tag } = await this.commit(manifest)
-    const finalManifest: SnapshotManifest = { ...manifest, commit, tag }
+    // commit 可能因「清单里列了提交里没有的文件」把清单收敛过，以它返回的为准。
+    const { commit, tag, manifest: committed } = await this.commit(manifest)
+    const finalManifest: SnapshotManifest = { ...committed, commit, tag }
     await writeManifest(this.#root, finalManifest)
 
     // 注意顺序：先 rotate 再 push，这样推送的就是"已经清理干净"的状态。
