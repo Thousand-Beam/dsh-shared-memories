@@ -141,3 +141,51 @@ test('memory_remember：degraded 只读时拒写', async (t) => {
   const rows = db.all<{ entity_id: string }>(`SELECT entity_id FROM memory_entity WHERE workspace_id = ?`, [WORKSPACE])
   assert.equal(rows.length, 0, '只读降级时绝不能落库')
 })
+
+test('memory_remember：无痕会话直接拒写（终审 P1-② 闸门补丁）', async (t) => {
+  const db = await openTestDb(t)
+  if (db === undefined) return
+  const root = await tempRoot(t)
+  const journal = new Journal({ root, deviceId: 'dev-tools' })
+  await journal.open()
+  const tree = new TemporalTree(db, journal)
+  const guard = new PoisonGuard({ db, journal, trustBySource: { agent: 0.6 } })
+
+  const { defs, registry } = captureRemember()
+  registerMemoryTools(registry, {
+    workspaceId: WORKSPACE,
+    deviceId: 'dev-tools',
+    db: () => db,
+    tree: () => tree,
+    personaOf: () => PERSONA,
+    guard: () => guard,
+    assertWritable: () => {},
+    // 无痕闸门：session-incognito 名下任何记忆写入都必须被工具链自己拦下，
+    // 不能只靠 distill/agent-created 那几处上游闸门（评审实测无痕会话工具直写落库）。
+    isEphemeral: (sessionId: string) => sessionId === 'session-incognito',
+    onWarn: () => {},
+  })
+  const remember = defs[0]
+  assert.ok(remember, 'memory_remember 必须注册')
+
+  const incognito = JSON.parse(
+    await remember.execute(
+      { text: '无痕会话不该留下任何记忆', kind: 'fact' },
+      { agent: { session: { id: 'session-incognito' } } },
+    ),
+  )
+  assert.equal(incognito.ok, false, '无痕会话必须拒写')
+  assert.match(String(incognito.error ?? ''), /无痕/, '拒绝理由要点明是无痕会话')
+
+  const rows = db.all<{ entity_id: string }>(`SELECT entity_id FROM memory_entity WHERE workspace_id = ?`, [WORKSPACE])
+  assert.equal(rows.length, 0, '无痕会话绝不能落库')
+
+  // 同一工具、同一进程，普通会话照常可写——闸门只拦无痕。
+  const normal = JSON.parse(
+    await remember.execute(
+      { text: '正常会话照常记', kind: 'fact' },
+      { agent: { session: { id: 'sess-normal' } } },
+    ),
+  )
+  assert.equal(normal.ok, true, '非无痕会话不受影响')
+})
