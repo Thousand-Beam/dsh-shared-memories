@@ -230,8 +230,7 @@ export class SnapshotEngine {
     manifest: SnapshotManifest,
   ): Promise<{ commit: string; tag: string; manifest: SnapshotManifest }> {
     await this.#ensureRepo()
-    const add = await this.#git.run(['add', '-A'])
-    assertGitOk(add, ['add', '-A'], 'git-add-failed')
+    await this.#stageLocal()
 
     // 清单收敛：capture 扫的是工作区，`git add -A` 只收「未被忽略且仍存在」的文件。
     // 两者之间工作区还会动（journal 新建、文件被删、被 exclude 规则挡住），于是清单里
@@ -258,8 +257,7 @@ export class SnapshotEngine {
         )
         effective = { ...manifest, files: kept, totals }
         await writeManifest(this.#root, effective)
-        const readd = await this.#git.run(['add', '-A'])
-        assertGitOk(readd, ['add', '-A'], 'git-add-failed')
+        await this.#stageLocal()
       }
     }
 
@@ -320,16 +318,31 @@ export class SnapshotEngine {
           if (aborted.code !== 0) {
             this.#onWarn(`rebase --abort 失败：${aborted.stderr.trim() || `exit ${aborted.code}`}`)
           }
-          // 分叉且无法自动合并是「一等状态」，不是可重试的网络抖动：直接抛，交给上层
-          // 把 pushed=false / reason=diverged 冒到 API 与前端，让用户知道同步已停摆。
+          // 只有 rebase 因内容冲突失败才是「分叉停摆」的一等状态，
+          // 不是可重试的网络抖动：直接抛，交给上层把 pushed=false / reason=diverged
+          // 冒到 API 与前端，让用户知道同步已停摆。rebase 因其它原因失败（网络、
+          // 远端临时锁）则当作普通可重试失败继续走退避（终审 P2-15：stderr 含
+          // 冲突标志才停摆）。
+          // 冲突标志跨 git 版本：老版本输出「CONFLICT (content)/add-add」，
+          // 新版本（2.5x）输出「hint: Resolve all conflicts manually」与
+          // 「git rebase --continue」，经典错误是「error: could not apply」。
           // 顺手把「最近一次共同祖先的快照 id」带出去：用户据此知道从哪个快照开始分叉，
           // 手工 rebase 时也有明确的对照点（终审 P4 建议）。
-          const baseSnapshotId = await this.#findCommonAncestorSnapshot()
-          throw new SnapshotError(
-            'push-diverged',
-            `本机与远端历史分叉且自动合并失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`,
-            { stderr: pulled.stderr, baseSnapshotId },
-          )
+          if (/(?:^|\s)conflicts?\b|resolve\s+all\s+conflicts|rebase\s+--continue|could\s+not\s+apply/i.test(pulled.stderr)) {
+            const baseSnapshotId = await this.#findCommonAncestorSnapshot()
+            throw new SnapshotError(
+              'push-diverged',
+              `本机与远端历史分叉且自动合并失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`,
+              { stderr: pulled.stderr, baseSnapshotId },
+            )
+          }
+          lastError = `pull --rebase 失败：${pulled.stderr.trim() || `exit ${pulled.code}`}`
+          if (attempt < this.#retries) {
+            const delay = backoffDelay(attempt)
+            this.#onWarn(`pull --rebase 失败（第 ${attempt + 1} 次）：${String(lastError)}；${delay}ms 后重试`)
+            await this.#sleep(delay)
+          }
+          continue
         }
         if (attempt < this.#retries) {
           const delay = backoffDelay(attempt)
@@ -389,12 +402,81 @@ export class SnapshotEngine {
   }
 
   /**
+   * 暂存本机变更，同时保护外设备账本不被删除。
+   *
+   * 终审 P1-④ 的核心：`git add -A` 会把「本机磁盘上不存在」的已跟踪文件暂存为删除。
+   * 在跨设备漫游仓库里，外设备的快照簿记（snapshots/<他机id>/）与日志
+   * （journal/devices/<他机>/）在本机磁盘上经常不存在（浅克隆、他机刚 push 还没拉、
+   * 或本机从未有过那个文件）——于是每台设备拍一次快照就顺手删掉对方的账本，两台
+   * 设备互相剪除，必然分叉（评审实测：dev-A 提交 882699a 删了 dev-B 清单 42 行）。
+   *
+   * 这里 add -A 之后把外设备路径从暂存区恢复成 HEAD 状态：本机提交永远不包含
+   * 「删除他机文件」的变更。他机的删除只能由他机自己的快照提交（rotate 本机过滤）
+   * 或 purge 墓碑显式表达。
+   */
+  async #stageLocal(): Promise<void> {
+    const add = await this.#git.run(['add', '-A'])
+    assertGitOk(add, ['add', '-A'], 'git-add-failed')
+    // 被 add -A 暂存为删除的外设备路径：`git ls-files` 看不到「已从索引移除」的
+    // 条目（删除类暂存正是从索引里拿掉），必须用 diff --cached 抓「相对 HEAD
+    // 被删」的文件，再恢复成 HEAD 状态——本机提交永远不包含删除他机账本的变更。
+    const deleted = await this.#git.run(['diff', '--cached', '--name-only', '--diff-filter=D', '-z'])
+    if (deleted.code !== 0) return
+    const foreign = deleted.stdout
+      .split('\u0000')
+      .filter((path) => path.length > 0 && this.#isForeignPath(path))
+    if (foreign.length === 0) return
+    // 分批：Windows 命令行长度有限，单批 50 个路径。
+    for (let i = 0; i < foreign.length; i += 50) {
+      const batch = foreign.slice(i, i + 50)
+      const restored = await this.#git.run(['restore', '--staged', '--', ...batch])
+      if (restored.code !== 0) {
+        this.#onWarn(`恢复外设备索引条目失败：${restored.stderr.trim()}`)
+      }
+    }
+  }
+
+  /** 路径是否属于其它设备的账本（本机快照不应对其做删除类暂存）。 */
+  #isForeignPath(path: string): boolean {
+    if (path.startsWith('snapshots/')) {
+      const rest = path.slice('snapshots/'.length)
+      const id = rest.split('/')[0] ?? ''
+      return id.length > 0 && !id.endsWith(`-${this.#deviceId}`)
+    }
+    if (path.startsWith('journal/devices/')) {
+      const rest = path.slice('journal/devices/'.length)
+      const device = rest.split('/')[0] ?? ''
+      // purge 目录是全局墓碑账本，不属于任何设备，本机必须照常暂存删除。
+      return device.length > 0 && device !== this.#deviceId && device !== 'purge'
+    }
+    return false
+  }
+
+  /**
    * 滑窗清理：保留最近 `keep` 个（按 snapshotId 字典序 = 时间序），
    * Pin 过的一律跳过。删 tag 的同时删目录，并提交这次清理。
    */
   async rotate(): Promise<{ removed: string[]; kept: string[] }> {
-    const pinned = this.#pinProtected ? await readPinned(this.#root) : new Set<string>()
-    const all = (await this.#listSnapshotIds()).sort()
+    // 只 prune 本机的快照：快照 id 以 `-<deviceId>` 结尾（v0.4.1 起），他机目录与
+    // tag 属于他机的账本。若连他机的一起删，每次 snapshot 都会生成「删掉别的设备
+    // 快照」的提交，两台设备互相剪除 → 必然分叉（终审 P1-④）。他机目录保留在本机
+    // 工作区里还有第二个好处：restore 校验时不必再从远端拉他机文件，少一类不稳定。
+    const all = (await this.#listSnapshotIds())
+      .filter((id) => id.endsWith(`-${this.#deviceId}`))
+      .sort()
+    let pinned = new Set<string>()
+    if (this.#pinProtected) {
+      try {
+        pinned = await readPinned(this.#root)
+      } catch (error) {
+        // fail-closed（终审 P2-15）：pinned.json 读不出时把本机所有快照都视为已 Pin，
+        // 本轮一个都不清理。宁可少删占磁盘，不可把用户 Pin 过的快照误删。
+        this.#onWarn(
+          `Pin 清单读取失败，本轮不清理任何快照：${error instanceof Error ? error.message : String(error)}`,
+        )
+        pinned = new Set(all)
+      }
+    }
     const keep = new Set<string>(all.slice(Math.max(0, all.length - this.#keep)))
     for (const id of pinned) if (all.includes(id)) keep.add(id)
 
@@ -420,8 +502,7 @@ export class SnapshotEngine {
     }
 
     if (removed.length > 0) {
-      const add = await this.#git.run(['add', '-A'])
-      assertGitOk(add, ['add', '-A'], 'git-add-failed')
+      await this.#stageLocal()
       const commit = await this.#git.run(
         ['commit', '--allow-empty', '-m', `chore(snapshot): prune ${removed.length} old snapshot(s)`],
         { config: { 'user.name': this.#authorName, 'user.email': this.#authorEmail } },
@@ -449,6 +530,33 @@ export class SnapshotEngine {
     return { removed, kept: [...keep].sort() }
   }
 
+  /**
+   * push 出闸门：把 push() 的异常归一成结构化结果，snapshot / rollback 共用。
+   * 分叉（push-diverged）是「同步停摆」的一等状态，网络/鉴权失败是可重试的
+   * push-failed——两者都以 pushed=false 冒到上层，让 /save 与前端不再假装
+   * 「已保存」（终审 P2-15）。
+   */
+  async #pushThroughGate(): Promise<{ pushed: boolean; reason?: string; baseSnapshotId?: string }> {
+    if (!this.#pushOnCommit) return { pushed: false, reason: 'disabled' }
+    try {
+      return await this.push()
+    } catch (error) {
+      this.#onWarn(
+        `推送失败（本地快照仍有效）：${error instanceof Error ? error.message : String(error)}`,
+      )
+      const diverged = error instanceof SnapshotError && error.code === 'push-diverged'
+      const detail =
+        diverged && error.detail && typeof error.detail === 'object'
+          ? (error.detail as { baseSnapshotId?: string })
+          : undefined
+      return {
+        pushed: false,
+        reason: diverged ? 'diverged' : 'push-failed',
+        baseSnapshotId: detail?.baseSnapshotId,
+      }
+    }
+  }
+
   /** 完整流水线：capture → commit → rotate → push。 */
   async snapshot(trigger: SnapshotTrigger): Promise<SnapshotResult> {
     const manifest = await this.capture(trigger)
@@ -462,32 +570,7 @@ export class SnapshotEngine {
     // push 失败不致命：本地快照（capture + commit）已经落地有效，推送只是同步到远端。
     // 若把 push 失败抛成整个快照失败，上层 idle 防抖会因 lastSnapshotAt 未刷新而疯狂重试，
     // 每次重试又 push 失败，git 操作拖死 agent（真机事故：思考 5 分钟无响应）。
-    let push: { pushed: boolean; reason?: string; baseSnapshotId?: string }
-    if (this.#pushOnCommit) {
-      try {
-        push = await this.push()
-      } catch (error) {
-        this.#onWarn(
-          `推送失败（本地快照仍有效）：${error instanceof Error ? error.message : String(error)}`,
-        )
-        // 分叉是「同步已停摆」的一等状态，网络/鉴权失败才是可重试的 push-failed。
-        // 两者都要把 pushed=false 冒到上层，让 /save 与前端不再假装「已保存」。
-        const detail =
-          error instanceof SnapshotError &&
-          error.code === 'push-diverged' &&
-          error.detail &&
-          typeof error.detail === 'object'
-            ? (error.detail as { baseSnapshotId?: string })
-            : undefined
-        push = {
-          pushed: false,
-          reason: error instanceof SnapshotError && error.code === 'push-diverged' ? 'diverged' : 'push-failed',
-          baseSnapshotId: detail?.baseSnapshotId,
-        }
-      }
-    } else {
-      push = { pushed: false, reason: 'disabled' }
-    }
+    const push = await this.#pushThroughGate()
     return {
       manifest: finalManifest,
       commit,
@@ -501,7 +584,13 @@ export class SnapshotEngine {
 
   /** UI 时间轴数据源：按时间倒序。 */
   async history(): Promise<SnapshotSummary[]> {
-    const pinned = await readPinned(this.#root)
+    // 列表只读不删，Pin 清单读失败就按「无 Pin」展示并告警，不把列表接口打崩。
+    let pinned = new Set<string>()
+    try {
+      pinned = await readPinned(this.#root)
+    } catch (error) {
+      this.#onWarn(`Pin 清单读取失败（时间轴按未 Pin 展示）：${error instanceof Error ? error.message : String(error)}`)
+    }
     const ids = await this.#listSnapshotIds()
     const out: SnapshotSummary[] = []
     for (const id of ids) {
@@ -530,6 +619,7 @@ export class SnapshotEngine {
     // 先验存在性：Pin 一个不存在的 id 会写进 pinned.json 并永久占一个"保留位"，
     // 用户以为"钉住了某个版本"，实际钉住的是空气——这类静默比报错坏得多。
     await this.#assertSnapshotExists(snapshotId)
+    // 读失败直接抛：带着一个读不出的旧清单去写会覆盖用户已有的 Pin 列表（fail-closed）。
     const current = await readPinned(this.#root)
     if (pinned) current.add(snapshotId)
     else current.delete(snapshotId)
@@ -542,8 +632,10 @@ export class SnapshotEngine {
     const tag = `snap/${snapshotId}`
     const checkout = await this.#git.run(['checkout', tag, '--', '.'])
     assertGitOk(checkout, ['checkout', tag], 'git-checkout-failed')
-    const add = await this.#git.run(['add', '-A'])
-    assertGitOk(add, ['add', '-A'], 'git-add-failed')
+    // checkout 会把「目标快照里不存在」的外设备账本从工作区抹掉，若直接 add -A，
+    // revert 提交会顺手删除他机文件（P1-④ 同源）。用 #stageLocal：本机回退本机的，
+    // 外设备索引条目恢复原状。
+    await this.#stageLocal()
     const commit = await this.#git.run(
       ['commit', '--allow-empty', '-m', `revert: rollback to ${snapshotId}`],
       { config: { 'user.name': this.#authorName, 'user.email': this.#authorEmail } },
@@ -555,6 +647,20 @@ export class SnapshotEngine {
     await this.#dropDerivedDb()
     const head = await this.#git.run(['rev-parse', 'HEAD'])
     assertGitOk(head, ['rev-parse', 'HEAD'], 'git-rev-parse-failed')
+
+    // 把 revert 提交推给远端：不回推的话，下次冷启动 `pull --ff-only` 看到「本地领先远端」
+    // 直接 fatal → pull-conflict → 整机 degraded（终审 P1-③：一键回退 + 重启 = 只读停摆）。
+    // 走与 snapshot 相同的 push 出闸门（P2-15）：分叉/失败统一分类、告警与冒泡。
+    if (this.#remote.trim()) {
+      await this.#ensureRemote()
+      const outcome = await this.#pushThroughGate()
+      if (!outcome.pushed) {
+        this.#onWarn(
+          `回退提交未能推送到远端（${outcome.reason ?? 'push-failed'}）：` +
+            '本地回退已生效，但远端仍停留在回退前的状态；下次启动可能报分叉，请手工同步远端。',
+        )
+      }
+    }
     return { commit: head.stdout.trim() }
   }
 
@@ -702,8 +808,14 @@ export class SnapshotEngine {
     const state = await this.#collectState()
 
     const personaDir = join(this.#root, 'persona')
-    const stateDir = join(this.#root, 'state')
+    // state 按设备分目录（v0.6.0 起）：每台设备只写自己的目录，rebase 时各设备的
+    // 改动落在不同文件里自动合并，不再「同一 state/*.json 双改 → add/add 冲突 →
+    // 必然分叉」（终审 P1-④）。老格式 state/<name>.json 由读取端继续兼容。
+    const stateDir = join(this.#root, 'state', this.#deviceId)
     await mkdir(personaDir, { recursive: true })
+    // 本机目录整清重写：上次快照之后已销毁的 agent/画像不能以旧文件形式残留，
+    // 否则「对齐语义」会把已删的状态又带回来。只清本机目录，他机目录一概不碰。
+    await rm(stateDir, { recursive: true, force: true })
     await mkdir(stateDir, { recursive: true })
     for (const agent of state.agents) {
       if (!agent.persona) continue
@@ -718,10 +830,9 @@ export class SnapshotEngine {
       `${JSON.stringify(
         {
           version: 2,
-          // 注意：不写 device / capturedAt 字段——两者都是每设备可变（deviceId 不同、
-          // 墙钟毫秒不同），两台设备在同一逻辑状态下会产出**不同字节**，git rebase 时
-          // 制造假的 add/add 冲突（P0-1/P1-B：并发快照卡 rebase 中间态）。deviceId 已由
-          // snapshotId（带 -deviceId 后缀）与 journal 记录承载；快照时间由 snapshotId 承载。
+          // 注意：不写 device / capturedAt 字段——状态文件必须逐字节确定（同一逻辑状态
+          // 产出相同文件）。deviceId 已由目录名 state/<deviceId>/ 与快照 id 后缀承载；
+          // 快照时间由 snapshotId 承载。
           agents: state.agents.map((agent) => ({
             agentId: agent.agentId,
             workspaceIds: agent.workspaceIds ?? [],
@@ -847,7 +958,7 @@ export class SnapshotEngine {
       return out
     }
 
-    const walk = async (dir: string): Promise<void> => {
+    const walk = async (dir: string, rel: string): Promise<void> => {
       // 显式标注 Dirent[]：`Awaited<ReturnType<typeof readdir>>` 会命中重载里的
       // Buffer 版本，于是 entry.name 变成 Buffer，后面所有 string 操作全废。
       let entries: Dirent[]
@@ -858,9 +969,18 @@ export class SnapshotEngine {
       }
       for (const entry of entries) {
         const absolute = join(dir, entry.name)
+        const childRel = rel === '' ? entry.name : `${rel}/${entry.name}`
         if (entry.isDirectory()) {
           if (EXCLUDED_DIRS.has(entry.name)) continue
-          await walk(absolute)
+          // 簿记按设备分片（终审 P1-④ 的第二半）：本机清单只列本机快照与日志。
+          // 他机 snapshots/ 与 journal/devices/ 目录不进清单——他机文件的完整性由
+          // 他机自己的快照负责校验，本机不再替它们背书，也不会因为磁盘上缺了他机
+          // 文件而把自己判 degraded。journal/devices/purge 是全局墓碑账本，照常收。
+          if (rel === 'snapshots' && !entry.name.endsWith(`-${this.#deviceId}`)) continue
+          if (rel === 'journal/devices' && entry.name !== this.#deviceId && entry.name !== 'purge') {
+            continue
+          }
+          await walk(absolute, childRel)
           continue
         }
         if (!entry.isFile()) continue
@@ -872,7 +992,7 @@ export class SnapshotEngine {
       }
     }
 
-    await walk(root)
+    await walk(root, '')
     // 显式声明的额外文件：不在仓库根下也要纳入（内容一致才会计入）。
     for (const extra of state.extraFiles ?? []) {
       const absolute = join(root, extra)

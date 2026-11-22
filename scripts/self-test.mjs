@@ -534,8 +534,8 @@ async function main() {
     'B 机上的 coder 依旧没有技能（没有跟着 A 一起被塞进去）',
   )
   check(
-    snapshot.manifest.files.some((file) => file.path === 'state/skills.json'),
-    '快照里确实有 state/skills.json（技能是"状态"，不是内存里的临时值）',
+    snapshot.manifest.files.some((file) => file.path.startsWith('state/') && file.path.endsWith('/skills.json')),
+    '快照里确实有 state/<device>/skills.json（技能是"状态"，不是内存里的临时值）',
   )
 
   // 用户画像：换机器之后依然知道用户叫什么——"新会话失忆"就是在这里被修掉的。
@@ -547,15 +547,15 @@ async function main() {
     'B 机组出来的提示里直接带着「老张」（新会话不用再问一遍）',
   )
   check(
-    snapshot.manifest.files.some((file) => file.path === 'state/user-profile.json'),
-    '快照里有 state/user-profile.json（画像按工作区存，不属于任何 Agent）',
+    snapshot.manifest.files.some((file) => file.path.startsWith('state/') && file.path.endsWith('/user-profile.json')),
+    '快照里有 state/<device>/user-profile.json（画像按工作区存，不属于任何 Agent）',
   )
 
   // 身份绑定：换机器后"新会话仍继承同一人格"这条也必须成立，
   // 否则 B 机上点新建会话，人格又变回一张白纸。
   check(
-    snapshot.manifest.files.some((file) => file.path === 'state/persona-identity.json'),
-    '快照里有 state/persona-identity.json（会话 → 人格的映射也跟着走）',
+    snapshot.manifest.files.some((file) => file.path.startsWith('state/') && file.path.endsWith('/persona-identity.json')),
+    '快照里有 state/<device>/persona-identity.json（会话 → 人格的映射也跟着走）',
   )
   check(
     resolvePersonaId(dbB, 'session-second') === 'lead',

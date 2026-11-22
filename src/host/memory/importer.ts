@@ -91,7 +91,12 @@ export class Importer {
     /** 是否先过一遍 LLM 蒸馏再写（迁移大文件推荐 true）。 */
     distill?: boolean
   }): Promise<ImportReport> {
-    const format = input.format ?? detectFormat(input.content)
+    // BOM（\uFEFF）是 UTF-8 导出文件常见的首字符；不剥的话 JSON.parse 直接抛、
+    // detectFormat 判不成 json、Markdown 第一个标题/列表项也被污染（终审 P2-4）。
+    const content = stripBom(input.content)
+    // 'auto' 与 undefined 都走内容嗅探：此前路由层把缺省补成 'auto'，而这里
+    // 又把 'auto' 当成「已指定」，导致自动识别永远走 Markdown 分支（终审 P2-3）。
+    const format = input.format && input.format !== 'auto' ? input.format : detectFormat(content)
     const items = format === 'json' ? parseJson(input.content) : parseMarkdown(input.content)
     if (items.length === 0) {
       return { parsed: 0, written: 0, quarantined: 0, skipped: 0, distilled: false, errors: [] }
@@ -181,8 +186,13 @@ export class Importer {
 
 /** 一眼看是 JSON 还是 Markdown。 */
 export function detectFormat(content: string): ImportFormat {
-  const trimmed = content.trimStart()
+  const trimmed = stripBom(content).trimStart()
   return trimmed.startsWith('{') || trimmed.startsWith('[') ? 'json' : 'markdown'
+}
+
+/** 剥掉 UTF-8 BOM；没有 BOM 原样返回。 */
+function stripBom(content: string): string {
+  return content.charCodeAt(0) === 0xfeff ? content.slice(1) : content
 }
 
 /**
@@ -192,7 +202,7 @@ export function detectFormat(content: string): ImportFormat {
 export function parseJson(content: string): ImportItem[] {
   let data: unknown
   try {
-    data = JSON.parse(content)
+    data = JSON.parse(stripBom(content))
   } catch (error) {
     throw new ImportError('import-bad-json', error instanceof Error ? error.message : 'JSON 解析失败')
   }

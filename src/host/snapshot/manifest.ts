@@ -97,16 +97,24 @@ export async function readManifest(root: string, snapshotId: string): Promise<Sn
   return JSON.parse(raw) as SnapshotManifest
 }
 
-/** 读取 Pin 列表（不存在 = 空）。 */
+/**
+ * 读取 Pin 列表。
+ * 文件不存在 = 空（还没 Pin 过任何快照）；文件存在但读不出/解析失败 = 抛错，
+ * 让调用方 fail-closed 处理（宁可少清理，不可把用户 Pin 过的快照误删）。
+ */
 export async function readPinned(root: string): Promise<Set<string>> {
+  let raw: string
   try {
-    const raw = await readFile(pinnedIndexPath(root), 'utf8')
-    const parsed = JSON.parse(raw) as unknown
-    if (!Array.isArray(parsed)) return new Set()
-    return new Set(parsed.filter((item): item is string => typeof item === 'string'))
-  } catch {
-    return new Set()
+    raw = await readFile(pinnedIndexPath(root), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return new Set()
+    throw error
   }
+  const parsed = JSON.parse(raw) as unknown
+  if (!Array.isArray(parsed)) {
+    throw new Error('pinned.json 不是数组')
+  }
+  return new Set(parsed.filter((item): item is string => typeof item === 'string'))
 }
 
 export async function writePinned(root: string, pinned: ReadonlySet<string>): Promise<void> {

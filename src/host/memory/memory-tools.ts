@@ -43,6 +43,8 @@ export interface MemoryToolDeps {
   readonly guard?: () => PoisonGuard | undefined
   /** 恢复闸门（degraded 只读承诺）：未就绪时拒写。 */
   readonly assertWritable?: (operation: string) => void
+  /** 无痕闸门：会话为无痕时，写类工具（remember/forget）一律拒写；缺省则不拦（兼容老路径）。 */
+  readonly isEphemeral?: (sessionId: string) => boolean
   readonly onWarn: (message: string) => void
 }
 
@@ -101,6 +103,14 @@ export function registerMemoryTools(
     return { workspaceId: deps.workspaceId, agentId: deps.personaOf(sessionId), deviceId: deps.deviceId }
   }
 
+  /** 无痕会话的写类工具一律拒写：无痕的承诺是「这段对话什么都不留」，不能靠模型自觉。 */
+  const writableSession = (exec: ToolExec | undefined): string | undefined => {
+    const sessionId = exec?.agent?.session?.id
+    if (typeof sessionId !== 'string' || sessionId === '') return undefined
+    if (deps.isEphemeral?.(sessionId) === true) return undefined
+    return sessionId
+  }
+
   register('memory_search', {
     description:
       'Search long-term memory (facts, preferences, decisions, pitfalls, persona notes) for entries related to a query. ' +
@@ -151,6 +161,10 @@ export function registerMemoryTools(
       const tree = deps.tree()
       const scope = scopeOf(exec)
       if (tree === undefined || scope === undefined) return JSON.stringify({ ok: false, error: 'memory is not ready yet' })
+      // 无痕会话：拒绝写入（读类工具不受限——无痕不拦查，只拦留）。
+      if (writableSession(exec) === undefined) {
+        return JSON.stringify({ ok: false, error: '当前是无痕会话，不写入记忆' })
+      }
       const text = typeof args.text === 'string' ? args.text.trim() : ''
       if (text === '') return JSON.stringify({ ok: false, error: 'text is empty' })
       const kind = KINDS.includes(args.kind as MemoryKind) ? (args.kind as MemoryKind) : 'fact'
@@ -234,6 +248,9 @@ export function registerMemoryTools(
       const scope = scopeOf(exec)
       const entityId = typeof args.entity_id === 'string' ? args.entity_id.trim() : ''
       if (db === undefined || tree === undefined || scope === undefined) return JSON.stringify({ ok: false, error: 'memory is not ready yet' })
+      if (writableSession(exec) === undefined) {
+        return JSON.stringify({ ok: false, error: '当前是无痕会话，不写入记忆' })
+      }
       if (entityId === '') return JSON.stringify({ ok: false, error: 'entity_id is empty' })
 
       const owned = db.one<{ entity_id: string }>(

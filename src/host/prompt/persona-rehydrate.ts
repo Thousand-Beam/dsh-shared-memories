@@ -19,18 +19,24 @@
 import { readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { SqlDriver } from '../../shared/types.js'
+import { mergeByKey, readStateFiles } from './state-read.js'
 
-/** agents.json 的结构（与 SnapshotEngine 写出的格式一一对应）。 */
+/** agents.json 里单个 agent 的指针（与 SnapshotEngine 写出的格式一一对应）。 */
+export interface AgentPointerEntry {
+  agentId?: string
+  workspaceIds?: string[]
+  sessions?: string[]
+  hasPersona?: boolean
+  skillCount?: number
+  enabledSkillIds?: string[]
+}
+
+/** agents.json 的结构。 */
 export interface AgentsPointerFile {
   version: number
   device?: string
   capturedAt?: number
-  agents?: {
-    agentId?: string
-    workspaceIds?: string[]
-    sessions?: string[]
-    hasPersona?: boolean
-  }[]
+  agents?: AgentPointerEntry[]
 }
 
 export interface RehydrateResult {
@@ -54,16 +60,22 @@ export async function rehydratePersonaFromRepo(options: {
   const onWarn = options.onWarn ?? (() => {})
   const now = options.clock?.() ?? Date.now()
 
-  let pointer: AgentsPointerFile
-  try {
-    const raw = await readFile(join(options.root, 'state', 'agents.json'), 'utf8')
-    pointer = JSON.parse(raw) as AgentsPointerFile
-  } catch {
-    // 老快照 / 纯本地首次启动：没有这个文件是正常的。
-    return { agents: 0, personas: 0, failed: 0 }
+  // 多设备格式：state/<deviceId>/agents.json 每台设备一份，按 agentId LWW 合并；
+  // 老单文件格式：state/agents.json（readStateFiles 兜底读）。
+  const collection = await readStateFiles(options.root, 'agents.json', onWarn)
+  if (collection.parsed.length === 0) {
+    // 老快照 / 纯本地首次启动：没有这个文件是正常的；文件在但坏了 = 上报失败。
+    return { agents: 0, personas: 0, failed: collection.failures }
   }
-
-  const agents = Array.isArray(pointer.agents) ? pointer.agents : []
+  const merged = mergeByKey(
+    collection.parsed,
+    (chunk) => {
+      const file = chunk as unknown as AgentsPointerFile
+      return Array.isArray(file.agents) ? file.agents ?? [] : []
+    },
+    (entry) => (entry.agentId ?? '').trim(),
+  )
+  const agents = [...merged.values()]
   let personas = 0
   let failed = 0
   for (const entry of agents) {
@@ -98,7 +110,7 @@ export async function rehydratePersonaFromRepo(options: {
       }
     }
   }
-  return { agents: agents.length, personas, failed }
+  return { agents: agents.length, personas, failed: failed + collection.failures }
 }
 
 /** 读取单人份人格文件；文件名做了消毒，所以这里也要按同一规则找。 */

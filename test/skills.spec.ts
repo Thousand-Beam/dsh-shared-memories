@@ -157,7 +157,8 @@ test('快照写出 state/skills.json：每个 Agent 一条、按 id 排序、含
   })
 
   await engine.snapshot('manual')
-  const state = JSON.parse(await readFile(join(root, 'state', 'skills.json'), 'utf8')) as {
+  // v0.6.0 起状态文件按设备分目录：state/<deviceId>/skills.json。
+  const state = JSON.parse(await readFile(join(root, 'state', DEVICE, 'skills.json'), 'utf8')) as {
     version: number
     agents: { agentId: string; skills: { skillId: string; enabled: boolean }[] }[]
   }
@@ -178,7 +179,7 @@ test('快照写出 state/skills.json：每个 Agent 一条、按 id 排序、含
   assert.deepEqual(coder?.skills, [])
 
   // agents.json 是"指针"，只放数量与已启用的 id，不放 config。
-  const pointer = JSON.parse(await readFile(join(root, 'state', 'agents.json'), 'utf8')) as {
+  const pointer = JSON.parse(await readFile(join(root, 'state', DEVICE, 'agents.json'), 'utf8')) as {
     version: number
     agents: { agentId: string; skillCount: number; enabledSkillIds: string[] }[]
   }

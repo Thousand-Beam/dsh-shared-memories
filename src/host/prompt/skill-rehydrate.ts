@@ -18,13 +18,12 @@
  * 绝不清空本机已有绑定 —— "没记录"不等于"没有技能"。
  */
 
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import type { Scope } from '../../shared/scope.js'
 import type { SkillBindInput } from '../../shared/skills.js'
 import { normalizeSkillId, normalizeSkillVersion } from '../../shared/skills.js'
 import type { SqlDriver } from '../../shared/types.js'
 import { SkillRegistry } from '../memory/skill-registry.js'
+import { mergeByKey, readStateFiles } from './state-read.js'
 
 /** `state/skills.json` 的结构（与 SnapshotEngine.#writeSkillState 一一对应）。 */
 export interface SkillsStateFile {
@@ -64,23 +63,27 @@ export async function rehydrateSkillsFromRepo(options: {
   onWarn?: (message: string) => void
 }): Promise<SkillRehydrateResult> {
   const onWarn = options.onWarn ?? (() => {})
-  const empty: SkillRehydrateResult = { present: false, agents: 0, bindings: 0, failed: 0 }
 
-  let pointer: SkillsStateFile
-  try {
-    const raw = await readFile(join(options.root, 'state', 'skills.json'), 'utf8')
-    pointer = JSON.parse(raw) as SkillsStateFile
-  } catch {
-    // 老快照 / 纯本地首次启动：没有这个文件是正常的，保持本机现状。
-    return empty
+  // 多设备格式：state/<deviceId>/skills.json 按 agentId LWW 合并（readStateFiles 兜底老单文件）。
+  const collection = await readStateFiles(options.root, 'skills.json', onWarn)
+  if (collection.parsed.length === 0) {
+    // 老快照 / 纯本地首次启动：没有这个文件是正常的，保持本机现状；文件在但坏了 = 上报失败。
+    return { present: collection.present, agents: 0, bindings: 0, failed: collection.failures }
   }
-
+  const merged = mergeByKey(
+    collection.parsed,
+    (chunk) => {
+      const file = chunk as unknown as SkillsStateFile
+      return Array.isArray(file.agents) ? file.agents ?? [] : []
+    },
+    (entry) => (entry.agentId ?? '').trim(),
+  )
+  const agents = [...merged.values()]
   const registry = new SkillRegistry({
     db: options.db,
     clock: options.clock,
     onWarn,
   })
-  const agents = Array.isArray(pointer.agents) ? pointer.agents : []
   let bindings = 0
   let failed = 0
   for (const entry of agents) {
@@ -105,7 +108,7 @@ export async function rehydrateSkillsFromRepo(options: {
       }
     }
   }
-  return { present: true, agents: agents.length, bindings, failed }
+  return { present: true, agents: agents.length, bindings, failed: failed + collection.failures }
 }
 
 function describe(error: unknown): string {

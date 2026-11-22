@@ -104,6 +104,8 @@ function Panel(): ReactNode {
   }, [state.phase])
 
   // 切 Agent：三份数据一起拉，避免出现"卡片是 A 的、时间轴是 B 的"。
+  // 切 Agent 时 state.ts 把 status 置成 loading；无论成败都必须在这里复位回 ready，
+  // 否则骨架屏永远挂着（P1：status:'loading' 无复位路径，只能刷新）。
   useEffect(() => {
     const agentId = state.activeAgentId
     if (agentId === '') return
@@ -115,9 +117,13 @@ function Panel(): ReactNode {
           api.snapshots(agentId),
           api.quarantine(agentId),
         ])
-        if (!cancelled) store.patch({ memories, snapshots, quarantine })
+        if (!cancelled) store.patch({ memories, snapshots, quarantine, status: 'ready' })
       } catch (cause) {
-        if (!cancelled) store.toast('error', cause instanceof Error ? cause.message : '载入该 Agent 的数据失败')
+        if (!cancelled) {
+          // 数据没拉到也要退出骨架屏：宁可显示空列表 + 红条，也不能永久 loading。
+          store.patch({ status: 'ready' })
+          store.toast('error', cause instanceof Error ? cause.message : '载入该 Agent 的数据失败')
+        }
       }
     })()
     return () => {

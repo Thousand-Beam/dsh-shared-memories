@@ -1155,6 +1155,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           pitfalls: () => runtime.pitfalls,
           guard: () => runtime.guard,
           assertWritable: (operation: string) => barrier.assertWritable(operation),
+          isEphemeral: (sessionId: string) => runtime.policies?.isEphemeral(sessionId) === true,
           onWarn: warn,
         },
       )

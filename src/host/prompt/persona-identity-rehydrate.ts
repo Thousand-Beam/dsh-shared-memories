@@ -8,11 +8,10 @@
  * 语义同技能/画像：文件不存在就**一条都不动**。老快照（v0.2.1 之前）没有这个文件，
  * 若把"没有文件"当成"没有任何绑定"，升级后第一次冷启动就会把本机的继承关系清空。
  */
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import type { SqlDriver } from '../../shared/types.js'
 import type { PersonaIdentity } from '../../shared/persona-identity.js'
 import { PersonaIdentityStore } from '../memory/persona-identity.js'
+import { mergeByKey, readStateFiles } from './state-read.js'
 
 export interface PersonaIdentityStateFile {
   readonly version?: number
@@ -41,29 +40,31 @@ export async function rehydratePersonaIdentitiesFromRepo(options: {
   readonly onWarn?: (message: string) => void
 }): Promise<PersonaIdentityRehydrateResult> {
   const warn = options.onWarn ?? (() => {})
-  const path = join(options.root, 'state', 'persona-identity.json')
 
-  let raw: string
-  try {
-    raw = await readFile(path, 'utf8')
-  } catch {
-    // 没有文件 = 老快照，绝不动本机已有的绑定。
-    return { present: false, identities: 0, failed: 0 }
+  // 多设备格式：state/<deviceId>/persona-identity.json 按 agentId|workspaceId LWW 合并。
+  const collection = await readStateFiles(options.root, 'persona-identity.json', warn)
+  if (collection.parsed.length === 0) {
+    // 没有文件 = 老快照，绝不动本机已有的绑定；文件在但坏了 = 上报失败。
+    return { present: collection.present, identities: 0, failed: collection.failures }
   }
-
-  let parsed: PersonaIdentityStateFile
-  try {
-    parsed = JSON.parse(raw) as PersonaIdentityStateFile
-  } catch {
-    warn('身份绑定回灌：state/persona-identity.json 解析失败，保留本机现状')
-    return { present: true, identities: 0, failed: 1 }
-  }
+  const merged = mergeByKey(
+    collection.parsed,
+    (chunk) => {
+      const file = chunk as unknown as PersonaIdentityStateFile
+      return Array.isArray(file.identities) ? file.identities ?? [] : []
+    },
+    (item) => {
+      const agentId = typeof item.agentId === 'string' ? item.agentId : ''
+      const workspaceId = typeof item.workspaceId === 'string' ? item.workspaceId : ''
+      return agentId === '' || workspaceId === '' ? '' : `${agentId}\u0000${workspaceId}`
+    },
+  )
 
   const store = new PersonaIdentityStore({ db: options.db, clock: options.clock })
   const now = options.clock?.() ?? Date.now()
   let identities = 0
   let failed = 0
-  for (const item of parsed.identities ?? []) {
+  for (const item of merged.values()) {
     const agentId = typeof item.agentId === 'string' ? item.agentId : ''
     const workspaceId = typeof item.workspaceId === 'string' ? item.workspaceId : ''
     const personaId = typeof item.personaId === 'string' ? item.personaId : ''
@@ -82,5 +83,5 @@ export async function rehydratePersonaIdentitiesFromRepo(options: {
       failed++
     }
   }
-  return { present: true, identities, failed }
+  return { present: true, identities, failed: failed + collection.failures }
 }

@@ -67,11 +67,13 @@ const DEFAULT_TRUST: Record<TrustSource, number> = {
 /** ① 底线突破：命中即 0.95 偏离，不再叠加。 */
 const BASELINE_BREACH: readonly RegExp[] = [
   // 「的」可以出现在「所有/全部」前后：既拦「忽略你的所有规则」，也拦「忽略你所有的规则」。
-  // 同义词（无视/别管/不用遵守/disregard/disobey/forget）也必须拦，否则换个说法就漏（终审 P3 语序与同义词盲区）。英文还要覆盖 your 变体（forget your rules / ignore your instructions）。
-  /(?:忽略|无视|别管|不用管|不必遵守|不用遵守|不要遵守)(?:你)?(?:的)?(?:全部|所有)?(?:的)?(?:规则|底线|设定|限制|指令)/,
+  // 同义词必须拦，否则换个说法就漏（终审 P3 语序与同义词盲区；P2-2 补「忘记/忘掉」）。
+  // 动词与目标词之间允许一层常见插入（掉/了/之前/以上/那些），拦「忽略掉你的规则」「忘记所有的之前规则」这类修饰词变体（P2-2）。
+  /(?:忽略|无视|别管|不用管|不必遵守|不用遵守|不要遵守|忘记|忘掉)(?:掉|了)?(?:你)?(?:的)?(?:全部|所有)?(?:的)?(?:之前|以前|上述|以上|这些|那些)?(?:的)?(?:规则|底线|设定|限制|指令)/,
   /解除(?:你)?(?:的)?(?:所有|全部)?(?:的)?(?:限制|约束|审查)/,
   /(?:你|现在)(?:已经)?没有(?:任何|所有)?(?:的)?(?:限制|约束|规则)/,
-  /(?:ignore|disregard|disobey|forget)\s+(?:all\s+)?(?:your\s+)?(?:previous\s+|prior\s+)?(?:instructions?|rules?|guidelines?)/i,
+  // 英文同样允许修饰词循环（all of your / every single one of your …），拦 P2-2 的 modifier 变体。
+  /(?:ignore|disregard|disobey|forget)\s+(?:(?:all|every|the|any|these|those|of|such|single|one)\s+)*(?:your\s+)?(?:previous\s+|prior\s+)?(?:instructions?|rules?|guidelines?)/i,
   /(?:you\s+have\s+)?no\s+(?:restrictions?|limits?|rules?)\s+(?:now|anymore)/i,
   /jailbreak|developer\s+mode\s+enabled/i,
   /(?:制造|合成)(?:炸弹|爆炸物|毒品)/,
@@ -114,12 +116,17 @@ export class PoisonGuard {
     const reasons: string[] = []
     let deviation = 0
 
-    const hitBaseline = BASELINE_BREACH.find((pattern) => pattern.test(input.text))
+    // 全角英文等 Unicode 变体先做 NFKC 归一化再匹配（P2-2 全角绕过样本：
+    // 「ｉｇｎｏｒｅ ｙｏｕｒ ｒｕｌｅｓ」归一化后与半角正则同形）。只影响匹配，
+    // 不影响写库的原文。
+    const scanText = input.text.normalize('NFKC')
+
+    const hitBaseline = BASELINE_BREACH.find((pattern) => pattern.test(scanText))
     if (hitBaseline) {
       deviation = 0.95
       reasons.push('baseline-breach')
     } else {
-      const hitIdentity = IDENTITY_OVERRIDE.find((pattern) => pattern.test(input.text))
+      const hitIdentity = IDENTITY_OVERRIDE.find((pattern) => pattern.test(scanText))
       if (hitIdentity) {
         deviation += 0.5
         reasons.push('identity-override')

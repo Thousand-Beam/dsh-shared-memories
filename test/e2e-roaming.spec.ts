@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 import { promisify } from 'node:util'
@@ -661,12 +661,16 @@ test('真分叉（两台设备各改不同人格）→ diverged 且 pushBaseSnap
     return { engine, root, warnings }
   }
 
-  // A 连拍两次：远端从 A1 前进到 A2。
+  // A 连拍两次：远端从 A1 前进到 A2。第二拍必须换人格（大肥鱼→大鲨鱼）——
+  // 若两次快照状态完全相同，A2 相对 A1 只多快照归档目录，B 的改动与 A2 没有
+  // 共同文件冲突，rebase 会干净合并，push 成功，造不出真分叉（v0.5.9 发布时
+  // CI 163/164 唯一失败用例就是栽在这里：assert pushed===false 实际为 true）。
   const a = await mkEngine(DEVICE_A, 'dev-a', '大肥鱼')
   const snapA1 = await a.engine.snapshot('shutdown')
   assert.equal(snapA1.pushed, true, `A1 必须推上远端；${a.warnings.join(' | ')}`)
-  const snapA2 = await a.engine.snapshot('shutdown')
-  assert.equal(snapA2.pushed, true, `A2 必须推上远端；${a.warnings.join(' | ')}`)
+  const a2 = await mkEngine(DEVICE_A, 'dev-a', '大鲨鱼', a.root)
+  const snapA2 = await a2.engine.snapshot('shutdown')
+  assert.equal(snapA2.pushed, true, `A2 必须推上远端；${a2.warnings.join(' | ')}`)
   assert.notEqual(snapA1.manifest.snapshotId, snapA2.manifest.snapshotId)
 
   // B 从远端 clone 后回到 A1 的位置，再改成人格「小狐狸」提交——
@@ -686,4 +690,80 @@ test('真分叉（两台设备各改不同人格）→ diverged 且 pushBaseSnap
     snapA1.manifest.snapshotId,
     '分叉时必须给出最近一次共同祖先的快照 id',
   )
+})
+
+test('簿记按设备分片：本机快照不删外设备账本，清单不含外设备条目（终审 P1-④）', async (t) => {
+  const bare = await makeBareRemote(t)
+  const at = NOW
+
+  const mkEngine = async (
+    deviceId: string,
+    tag: string,
+    name: string,
+    existingRoot?: string,
+  ): Promise<{ engine: SnapshotEngine; root: string; warnings: string[] }> => {
+    const root = existingRoot ?? (await tempRoot(t, `shard-${tag}-`))
+    if (!existingRoot) await git(root, ['init', '-b', 'main'])
+    await git(root, ['config', 'user.email', `${tag}@example.test`])
+    await git(root, ['config', 'user.name', tag])
+    const warnings: string[] = []
+    const engine = new SnapshotEngine({
+      root,
+      deviceId,
+      git: new ExecGitRunner({ cwd: root }),
+      remote: bare,
+      branch: 'main',
+      clock: () => at,
+      sleep: async () => {},
+      onWarn: (message) => warnings.push(message),
+      collectState: () => ({
+        agents: [
+          { agentId: 'lead', workspaceIds: [WORKSPACE], sessions: ['sess-1'], persona: { name, age: 20 } },
+        ],
+      }),
+    })
+    return { engine, root, warnings }
+  }
+
+  // A 拍一次推远端，远端从此带着 A 的簿记。
+  const a = await mkEngine(DEVICE_A, 'dev-a', '大肥鱼')
+  const snapA = await a.engine.snapshot('shutdown')
+  assert.equal(snapA.pushed, true, `A 必须推上远端；${a.warnings.join(' | ')}`)
+
+  // B clone 后把 A 的快照目录整个从磁盘抹掉——模拟「本机磁盘上不存在外设备簿记」。
+  // 旧行为：B 下一次快照的 git add -A 会把 A 的清单文件暂存为删除并推上去，
+  // 两台设备互相剪除对方账本，必然分叉（评审实测 dev-A 提交删了 dev-B 清单 42 行）。
+  const rootB = await tempRoot(t, 'shard-dev-b-')
+  await execFileAsync('git', ['clone', bare, rootB], { windowsHide: true })
+  await git(rootB, ['config', 'user.email', 'dev-b@example.test'])
+  await git(rootB, ['config', 'user.name', 'dev-b'])
+  await rm(join(rootB, 'snapshots'), { recursive: true, force: true })
+
+  const b = await mkEngine(DEVICE_B, 'dev-b', '小狐狸', rootB)
+  const snapB = await b.engine.snapshot('shutdown')
+
+  // ① B 的清单只列本机条目：外设备快照目录与日志一概不背。
+  // （本机本次的 manifest.json 是 commit 之后才写盘、下次快照才进清单，属已知行为。）
+  const paths = snapB.manifest.files.map((file) => file.path)
+  for (const path of paths) {
+    assert.ok(
+      !path.startsWith('snapshots/') || path.includes(`-${DEVICE_B}`),
+      `清单不应包含外设备快照目录条目，实际有 ${path}`,
+    )
+    assert.ok(
+      !path.startsWith('journal/devices/') || path.includes(`/${DEVICE_B}/`) || path.includes('/purge/'),
+      `清单不应包含外设备 journal 条目，实际有 ${path}`,
+    )
+  }
+
+  // ② B 的提交没有删除 A 的清单文件——它还在 B 的提交树里。
+  const tree = await git(rootB, ['ls-tree', '-r', 'HEAD', '--name-only'])
+  const aManifestPath = `snapshots/${snapA.manifest.snapshotId}/manifest.json`
+  assert.ok(
+    tree.split('\n').includes(aManifestPath),
+    `A 的清单文件 ${aManifestPath} 必须在 B 的提交树里保留`,
+  )
+
+  // ③ 没有互相剪除，B 顺利推上远端。
+  assert.equal(snapB.pushed, true, `B 必须推上远端；${b.warnings.join(' | ')}`)
 })

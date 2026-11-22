@@ -9,10 +9,9 @@
  * 升级后的第一次冷启动就会把用户辛苦填的名字清掉——而这件事**不报错**，
  * 用户只会觉得"它又开始乱叫人了"。
  */
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import type { SqlDriver } from '../../shared/types.js'
 import { UserProfileStore } from '../memory/user-profile.js'
+import { mergeByKey, readStateFiles } from './state-read.js'
 
 export interface UserProfilesStateFile {
   readonly version?: number
@@ -40,28 +39,26 @@ export async function rehydrateUserProfilesFromRepo(options: {
   readonly onWarn?: (message: string) => void
 }): Promise<UserProfileRehydrateResult> {
   const warn = options.onWarn ?? (() => {})
-  const path = join(options.root, 'state', 'user-profile.json')
 
-  let raw: string
-  try {
-    raw = await readFile(path, 'utf8')
-  } catch {
-    // 没有文件 = 老快照，绝不动本机已有的画像。
-    return { present: false, profiles: 0, failed: 0 }
+  // 多设备格式：state/<deviceId>/user-profile.json 按 workspaceId LWW 合并。
+  const collection = await readStateFiles(options.root, 'user-profile.json', warn)
+  if (collection.parsed.length === 0) {
+    // 没有文件 = 老快照，绝不动本机已有的画像；文件在但坏了 = 上报失败。
+    return { present: collection.present, profiles: 0, failed: collection.failures }
   }
-
-  let parsed: UserProfilesStateFile
-  try {
-    parsed = JSON.parse(raw) as UserProfilesStateFile
-  } catch {
-    warn('用户画像回灌：state/user-profile.json 解析失败，保留本机现状')
-    return { present: true, profiles: 0, failed: 1 }
-  }
+  const merged = mergeByKey(
+    collection.parsed,
+    (chunk) => {
+      const file = chunk as unknown as UserProfilesStateFile
+      return Array.isArray(file.profiles) ? file.profiles ?? [] : []
+    },
+    (item) => (typeof item.workspaceId === 'string' ? item.workspaceId : ''),
+  )
 
   const store = new UserProfileStore({ db: options.db, clock: options.clock })
   let profiles = 0
   let failed = 0
-  for (const item of parsed.profiles ?? []) {
+  for (const item of merged.values()) {
     const workspaceId = typeof item.workspaceId === 'string' ? item.workspaceId : ''
     if (workspaceId === '') {
       failed++
@@ -82,5 +79,5 @@ export async function rehydrateUserProfilesFromRepo(options: {
       failed++
     }
   }
-  return { present: true, profiles, failed }
+  return { present: true, profiles, failed: failed + collection.failures }
 }

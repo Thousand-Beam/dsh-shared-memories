@@ -539,7 +539,8 @@ test('快照链路：保存 → 列表 → 钉住 → 回退并产生新 commit'
   assert.equal(relisted.body.data?.[0]?.pinned, true, 'Pin 之后列表要能看出来')
 
   // 先弄脏工作区，否则"回退"没有任何东西可提交，测试会假绿。
-  const agentsFile = join(h.root, 'state', 'agents.json')
+  // v0.6.0 起状态文件按设备分目录：state/<deviceId>/agents.json。
+  const agentsFile = join(h.root, 'state', 'dev-routes', 'agents.json')
   const before = await readFile(agentsFile, 'utf8')
   await writeFile(agentsFile, `${before}\n`, 'utf8')
 
