@@ -1009,6 +1009,7 @@ export class RestoreEngine {
       db: this.#db,
       root: this.#root,
       onWarn: this.#onWarn,
+      capturedAt: verified.createdAt,
     })
     if (profiles.present) {
       this.#onWarn(`用户画像回灌：${profiles.profiles} 个工作区`)
@@ -1268,11 +1269,12 @@ export class RestoreEngine {
     }
   }
 
-  async #verifySnapshotHashes(): Promise<{ snapshotId?: string; files: number }> {    const snapshotId = await this.#latestSnapshotId()
+  async #verifySnapshotHashes(): Promise<{ snapshotId?: string; files: number; createdAt?: number }> {
+    const snapshotId = await this.#latestSnapshotId()
     if (!snapshotId) {
       if (this.#allowMissingSnapshot) {
         this.#onWarn('未发现任何快照清单，按首次启动处理')
-        return { files: 0 }
+        return { files: 0, createdAt: undefined }
       }
       throw new RestoreError('snapshot-missing', '仓库里没有任何快照清单')
     }
@@ -1344,7 +1346,7 @@ export class RestoreEngine {
       }
     }
 
-    return { snapshotId, files: checked }
+    return { snapshotId, files: checked, createdAt: manifest.createdAt }
   }
 
   async #latestSnapshotId(): Promise<string | undefined> {

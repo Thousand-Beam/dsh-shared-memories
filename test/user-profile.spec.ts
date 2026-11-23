@@ -201,3 +201,71 @@ test('回灌后字段原样保留（不偷偷丢 notes/updatedBy）', async (t) 
   const raw = await readFile(join(stateDir, 'user-profile.json'), 'utf8')
   assert.match(raw, /夜猫子/)
 })
+
+test('T1：回灌旧快照不覆盖 journal 重放的新画像（时间守卫）', async (t) => {
+  const fixture = await openStore(t)
+  if (!fixture) return
+  const { store } = fixture
+
+  // journal 全量重放已经写出 updatedAt=2000 的新画像（晚于旧快照）。
+  store.replace(WORKSPACE, { displayName: '新画像', preferredAddress: '新哥', notes: '新备注' }, 'journal', 2000)
+  // 旧快照回灌：capturedAt=1000，比 journal 重放还早，不该覆盖。
+  store.replace(WORKSPACE, { displayName: '旧画像', preferredAddress: '旧哥', notes: '旧备注' }, 'snapshot', 1000)
+
+  assert.equal(store.get(WORKSPACE).displayName, '新画像', '旧快照不该覆盖 journal 重放的新画像')
+  assert.equal(profileAddress(store.get(WORKSPACE)), '新哥')
+  assert.equal(store.get(WORKSPACE).notes, '新备注')
+})
+
+test('T1：rehydrate 回灌用 capturedAt 时间守卫，旧快照不覆盖新画像', async (t) => {
+  const root = await tempRoot(t, 'profile-t1-rehydrate-')
+  const fixture = await openStore(t)
+  if (!fixture) return
+  const { db, store } = fixture
+
+  // journal 全量重放已经写出 updatedAt=2000 的新画像。
+  store.replace(WORKSPACE, { displayName: '新画像', preferredAddress: '新哥', notes: '新备注' }, 'journal', 2000)
+
+  // 旧快照（capturedAt=1000 < 2000）回灌。
+  const stateDir = join(root, 'state')
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(
+    join(stateDir, 'user-profile.json'),
+    JSON.stringify({
+      version: 1,
+      profiles: [{ workspaceId: WORKSPACE, displayName: '旧画像', preferredAddress: '旧哥', notes: '旧备注' }],
+    }),
+    'utf8',
+  )
+  await rehydrateUserProfilesFromRepo({ db, root, clock: () => NOW, capturedAt: 1000 })
+
+  assert.equal(store.get(WORKSPACE).displayName, '新画像', '旧快照（capturedAt 更小）不该覆盖新画像')
+  assert.equal(profileAddress(store.get(WORKSPACE)), '新哥')
+  assert.equal(store.get(WORKSPACE).notes, '新备注')
+})
+
+test('T1：快照更新（capturedAt 更大）时回灌必须生效', async (t) => {
+  const root = await tempRoot(t, 'profile-t1-fresh-')
+  const fixture = await openStore(t)
+  if (!fixture) return
+  const { db, store } = fixture
+
+  // journal 重放产出 updatedAt=1000 的旧画像。
+  store.replace(WORKSPACE, { displayName: '旧画像', preferredAddress: '旧哥', notes: '旧备注' }, 'journal', 1000)
+
+  // 新快照（capturedAt=2000 > 1000）回灌。
+  const stateDir = join(root, 'state')
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(
+    join(stateDir, 'user-profile.json'),
+    JSON.stringify({
+      version: 1,
+      profiles: [{ workspaceId: WORKSPACE, displayName: '新画像', preferredAddress: '新哥', notes: '新备注' }],
+    }),
+    'utf8',
+  )
+  await rehydrateUserProfilesFromRepo({ db, root, clock: () => NOW, capturedAt: 2000 })
+
+  assert.equal(store.get(WORKSPACE).displayName, '新画像', '快照确实更新时回灌必须生效')
+  assert.equal(profileAddress(store.get(WORKSPACE)), '新哥')
+})

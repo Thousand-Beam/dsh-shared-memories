@@ -37,6 +37,8 @@ export async function rehydrateUserProfilesFromRepo(options: {
   readonly root: string
   readonly clock?: () => number
   readonly onWarn?: (message: string) => void
+  /** 快照捕获时刻（manifest.createdAt）。回灌的时间守卫用它，不是恢复时刻。 */
+  readonly capturedAt?: number
 }): Promise<UserProfileRehydrateResult> {
   const warn = options.onWarn ?? (() => {})
 
@@ -54,12 +56,11 @@ export async function rehydrateUserProfilesFromRepo(options: {
     },
     (item) => (typeof item.workspaceId === 'string' ? item.workspaceId : ''),
   )
-  // V62-07：回灌的 updated_at 必须用快照 capturedAt（而非"恢复时刻"），否则
+  // V62-07/T1：回灌的 updated_at 必须用快照 capturedAt（而非"恢复时刻"），否则
   // journal 全量重放后跑回灌，MAX 比较总判"回灌更新"，旧快照画像覆盖新画像。
-  const capturedAt = collection.parsed.reduce<number>((max, chunk) => {
-    const file = chunk as unknown as UserProfilesStateFile
-    return typeof file.capturedAt === 'number' && file.capturedAt > max ? file.capturedAt : max
-  }, 0)
+  // capturedAt 的真相在 manifest.createdAt（engine 刻意不写 state 文件的 capturedAt
+  // 字段，为保逐字节确定），所以由调用方（restore.ts）显式传入，不从这里读文件。
+  const capturedAt = options.capturedAt
 
   const store = new UserProfileStore({ db: options.db, clock: options.clock })
   let profiles = 0
@@ -79,7 +80,7 @@ export async function rehydrateUserProfilesFromRepo(options: {
           notes: item.notes ?? '',
         },
         'snapshot',
-        capturedAt > 0 ? capturedAt : undefined,
+        capturedAt,
       )
       profiles++
     } catch {

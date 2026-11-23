@@ -100,7 +100,8 @@ export async function rehydratePersonaFromRepo(options: {
              age = excluded.age,
              traits = excluded.traits,
              baseline_hash = excluded.baseline_hash,
-             updated_at = MAX(persona_state.updated_at, excluded.updated_at)`,
+             updated_at = MAX(persona_state.updated_at, excluded.updated_at)
+           WHERE excluded.updated_at >= persona_state.updated_at`,
           [agentId, workspaceId, name, age, traits, baselineHash, num(persona?.updatedAt) ?? now],
         )
         personas++

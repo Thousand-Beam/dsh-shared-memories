@@ -150,7 +150,8 @@ export class UserProfileStore {
          preferred_address = excluded.preferred_address,
          notes = excluded.notes,
          updated_at = MAX(user_profile.updated_at, excluded.updated_at),
-         updated_by = excluded.updated_by`,
+         updated_by = excluded.updated_by
+       WHERE excluded.updated_at >= user_profile.updated_at`,
       [workspaceId, clean.displayName ?? '', clean.preferredAddress ?? '', clean.notes ?? '', updatedAt ?? this.#clock(), by],
     )
   }
