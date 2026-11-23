@@ -491,6 +491,11 @@ export class ReplayApplier {
           case 'pitfall.record': {
             // V62-04：新建坑跨设备漫游。只带「创建字段」，occurrences 是本地统计，
             // stage/lesson/pattern/rule 由 pitfall.promote 事件升格，这里不碰。
+            // 墓碑优先：销毁之后残留的并发坑跳过，否则已销毁 agent 的坑复活（T6）。
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             const pitfallId = str(record.pitfallId)
             const workspaceId = str(record.workspaceId)
             const agentId = str(record.agentId)
@@ -526,6 +531,11 @@ export class ReplayApplier {
             // V62-04：升格跨设备漫游。promote 只升不降（STAGE_ORDER），跨设备并发
             // confirm 同一个坑时，重放按 lc 顺序，后到但 stage 更低的 promote 不能
             // 倒退已确认的 rule/pattern——否则 rule 会退出 System Prompt。
+            // 墓碑优先：销毁之后的残留升格跳过，与 pitfall.record 对齐（T6）。
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
             const pitfallId = str(record.pitfallId)
             const workspaceId = str(record.workspaceId)
             const agentId = str(record.agentId)

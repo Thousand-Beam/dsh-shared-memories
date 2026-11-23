@@ -715,3 +715,46 @@ test('V62-04 pitfall promote 不倒退：低 stage 的 promote 不能覆盖已�
   assert.equal(stats.pitfalls, 3, 'record + 两次 promote 都算数')
 })
 
+test('T6：pitfall.record 重放有墓碑守卫，purge 之后不复活', async (t) => {
+  const db = await openTestDb(t)
+  if (!db) return
+
+  // 时间线：A 机记录新坑(lc=1) → A 机销毁(lc=2) → B 机在销毁前发出的并发残留坑(lc=3)。
+  // 按 lc 顺序重放，lc=3 的 pitfall.record 会在 DELETE pitfall 之后把坑又插回来（复活）。
+  // 修复后：lc > 墓碑 lc 的 pitfall 事件被跳过，坑保持销毁态。
+  const records: JournalRecord[] = [
+    record({
+      op: 'pitfall.record',
+      lc: 1,
+      at: 1000,
+      device: 'devA',
+      pitfallId: 'pf-t6',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      observation: '销毁前的坑',
+    }),
+    record({ op: 'agent.purge', lc: 2, at: 2000, device: 'devA', workspaceId: WORKSPACE, agentId: LEAD }),
+    record({
+      op: 'pitfall.record',
+      lc: 3,
+      at: 1500,
+      device: 'devB',
+      pitfallId: 'pf-t6-residual',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      observation: '销毁前并发残留坑',
+    }),
+  ]
+
+  const applier = new ReplayApplier(db)
+  const stats = applier.apply(records)
+
+  const rows = db.all<{ pitfall_id: string }>(
+    'SELECT pitfall_id FROM pitfall WHERE workspace_id = ? AND agent_id = ?',
+    [WORKSPACE, LEAD],
+  )
+  assert.equal(rows.length, 0, '销毁后 lc>墓碑的 pitfall 残留写必须被跳过，坑不得复活')
+  assert.equal(stats.skipped, 1, 'lc=3 那条残留写应计入 skipped')
+  assert.equal(stats.purged, 1, '墓碑本身必须执行')
+})
+
