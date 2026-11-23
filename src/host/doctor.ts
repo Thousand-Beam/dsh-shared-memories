@@ -74,6 +74,8 @@ export interface DoctorOptions {
   /** 配置的 commit 署名（引擎 commit/tag 用）。 */
   readonly authorName?: string
   readonly authorEmail?: string
+  /** 本机设备 id（V62-09：快照目录计数只数本机，避免把他机快照误报成堆积）。 */
+  readonly deviceId?: string
   /** 单次 git 操作超时，默认 30s。 */
   readonly timeoutMs?: number
 }
@@ -148,6 +150,7 @@ async function pathExists(path: string): Promise<boolean> {
 export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
   const root = options.root
   const keep = options.keep ?? 5
+  const deviceId = options.deviceId ?? ''
   const timeoutMs = options.timeoutMs ?? 30_000
   const findings: DoctorFinding[] = []
   const runner: GitRunner = new ExecGitRunner({ cwd: root, timeoutMs })
@@ -180,14 +183,16 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
     }
   })) ?? false
 
-  // 快照目录数（只数目录，跳过 pinned.json 等文件）。
+  // 快照目录数（V62-09：只数本机——快照 id 以 `-<deviceId>` 结尾，与引擎 prune 语义
+  // 一致；他机目录混进来会把多设备仓库误报成「堆积」。deviceId 缺省时数全部，兼容纯本地）。
   let snapshotCount = 0
   if (repoExists) {
     snapshotCount =
       (await attempt(findings, 'snapshot-scan', '快照目录扫描', async () => {
         try {
           const entries = await readdir(join(root, 'snapshots'), { withFileTypes: true })
-          return entries.filter((e) => e.isDirectory()).length
+          const suffix = deviceId ? `-${deviceId}` : ''
+          return entries.filter((e) => e.isDirectory() && (suffix === '' || e.name.endsWith(suffix))).length
         } catch {
           return 0
         }

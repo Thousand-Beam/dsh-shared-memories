@@ -51,6 +51,7 @@ import { RestoreEngine } from './host/snapshot/restore.js'
 import { PoisonGuard } from './host/memory/poison.js'
 import { Importer } from './host/memory/importer.js'
 import { PitfallStore } from './host/memory/pitfall.js'
+import { Consolidator } from './host/memory/consolidate.js'
 import { registerRoutes, type ConnectionLike, type MemoriesApiDeps, type WebServerLike } from './host/http/routes.js'
 import { SessionPolicyStore, ephemeralLeaks } from './host/memory/session-policy.js'
 import { PurgeError, purgeAgent, type PurgeResult } from './host/memory/purge.js'
@@ -216,6 +217,8 @@ interface Runtime {
   guard?: PoisonGuard
   importer?: Importer
   pitfalls?: PitfallStore
+  /** 夜间整理器（V62-03 装配）：全库去重/近似合并/修剪，低频定时触发。 */
+  consolidator?: Consolidator
   skills?: SkillRegistry
   /**
    * 用户画像仓库（带 journal）。
@@ -441,10 +444,36 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
     return syncInFlight
   }
 
+  let lastConsolidateAt = 0
+
+  /**
+   * V62-03：夜间整理节流调用。24 小时最多跑一次——consolidator.run() 是全库
+   * Jaccard 比较（O(n²)），每个 interval 周期（默认 5 分钟）都跑会把机器拖垮。
+   * 失败只告警不降级：整理是「优化」，不是「正确性」，正确性由 journal 保证。
+   */
+  const maybeConsolidate = (): void => {
+    const consolidator = runtime.consolidator
+    if (!consolidator || !config.memory.consolidate.enabled) return
+    const now = Date.now()
+    if (now - lastConsolidateAt < 86_400_000) return
+    lastConsolidateAt = now
+    try {
+      const report = consolidator.run()
+      if (report.deduped + report.merged + report.pruned > 0) {
+        warn(
+          `夜间整理：扫描 ${report.scanned} 条，去重 ${report.deduped}，合并 ${report.merged}，修剪 ${report.pruned}`,
+        )
+      }
+    } catch (cause) {
+      warn(`夜间整理失败（下次重试）：${cause instanceof Error ? cause.message : String(cause)}`)
+    }
+  }
+
   const startIntervalTimer = (): void => {
     if (intervalTimer) return
     intervalTimer = setInterval(() => {
       void syncThenSnapshot()
+      maybeConsolidate()
     }, Math.max(30, runtime.intervalSec) * 1000)
     if (typeof intervalTimer === 'object' && 'unref' in intervalTimer) intervalTimer.unref()
   }
@@ -523,11 +552,31 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         db,
         journal,
         onWarn: warn,
+        // V62-10：kind=pitfall 的导入项同时落 pitfall 表。回调延迟引用 runtime.pitfalls——
+        // PitfallStore 在本构造之后才赋值（见下方 :559），但回调只在 import() 运行时触发。
+        recordPitfall: async (input) => {
+          await runtime.pitfalls?.record({
+            scope: input.scope,
+            observation: input.observation,
+            author: input.author,
+          })
+        },
       })
 
       // 踩坑链（observation → lesson → pattern → rule）。升格请求带 TTL 存在内存里，
       // 过期即作废——这是"改 System Prompt 必须当下确认"的实现约束。
       runtime.pitfalls = new PitfallStore({ db, journal, onWarn: warn })
+
+      // V62-03：夜间整理器装配。之前 Consolidator 是死代码——config 里有 consolidate.*
+      // 配置，但没有任何地方 new 它、也没有定时任务调 run()，所以「去重/合并/修剪」从未执行。
+      // 阈值来自 config.memory.consolidate.mergeSimilarity 与 config.memory.forgetting.pruneBelow。
+      runtime.consolidator = new Consolidator({
+        db,
+        journal,
+        pruneBelow: config.memory.forgetting.pruneBelow,
+        similarityGate: config.memory.consolidate.mergeSimilarity,
+        onWarn: warn,
+      })
 
       // 技能注册表带 journal：控制台上的挂载/卸载/开关都会写 `skill.*` 事件，
       // 这样"没来得及打快照就换机"也不会丢技能。
@@ -710,6 +759,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           branch: config.repo.branch,
           authorName: config.repo.authorName,
           authorEmail: config.repo.authorEmail,
+          deviceId: runtime.deviceId,
           timeoutMs: config.sync.timeoutMs,
         }),
       pitfalls: () => runtime.pitfalls,

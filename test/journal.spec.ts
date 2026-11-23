@@ -216,3 +216,26 @@ test('realignClock：pull 到远端后重新对齐 Lamport 水位', async (t) =>
   const rec = await devB.append({ op: 'version.open', versionId: 'b6', at: DAY + 400 })
   assert.equal(rec.lc, 6, `realignClock 后新事件 lc 应为 6，实际 ${rec.lc}`)
 })
+
+test('V62-01：墓碑过滤窗口语义——回退点后丢弃、墓碑后新写保留', async (t) => {
+  const root = await tempRoot(t)
+  const journal = new Journal({ root, deviceId: 'devA', durable: false, clock: () => DAY })
+  await journal.open()
+
+  // 快照内的记录（seq 1-3，≤ floor=3，保留）。
+  await journal.append({ op: 'entity.upsert', entityId: 'e1', at: DAY })
+  await journal.append({ op: 'entity.upsert', entityId: 'e2', at: DAY + 1 })
+  await journal.append({ op: 'entity.upsert', entityId: 'e3', at: DAY + 2 })
+  // 回退点之后、墓碑写入之前（seq 4-5，窗口 floor < seq ≤ 墓碑 seq，丢弃）。
+  await journal.append({ op: 'entity.upsert', entityId: 'late1', at: DAY + 3 })
+  await journal.append({ op: 'entity.upsert', entityId: 'late2', at: DAY + 4 })
+  // 墓碑：floor=3，自身 seq=6。
+  await journal.append({ op: 'journal.truncate', truncateSeq: 3, truncateAt: DAY + 5, snapshotId: 'snap_x' })
+  // 回退后新写（seq 7-8，> 墓碑 seq=6，必须保留，否则本机变成永久写黑洞）。
+  await journal.append({ op: 'entity.upsert', entityId: 'after1', at: DAY + 6 })
+  await journal.append({ op: 'entity.upsert', entityId: 'after2', at: DAY + 7 })
+
+  const merged = await journal.readMerged()
+  const ids = merged.filter((record) => record.op === 'entity.upsert').map((record) => record.entityId)
+  assert.deepEqual(ids, ['e1', 'e2', 'e3', 'after1', 'after2'], 'late1/late2 应被墓碑丢弃，after1/after2 应保留')
+})

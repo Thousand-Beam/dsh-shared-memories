@@ -22,6 +22,7 @@ import { rehydratePersonaFromRepo } from '../prompt/persona-rehydrate.js'
 import { rehydrateSkillsFromRepo } from '../prompt/skill-rehydrate.js'
 import { rehydrateUserProfilesFromRepo } from '../prompt/user-profile-rehydrate.js'
 import { rehydratePersonaIdentitiesFromRepo } from '../prompt/persona-identity-rehydrate.js'
+import { STAGE_ORDER, type PitfallStage } from '../memory/pitfall.js'
 import { createHash } from 'node:crypto'
 
 /** 结构化恢复错误：`code` 直接映射成 UI 上的原因。 */
@@ -77,6 +78,7 @@ interface ReplayStats {
   userProfiles: number
   personaIdentities: number
   personas: number
+  pitfalls: number
   purged: number
   deferred: number
   skipped: number
@@ -122,6 +124,7 @@ export class ReplayApplier {
       userProfiles: 0,
       personaIdentities: 0,
       personas: 0,
+      pitfalls: 0,
       purged: 0,
       deferred: 0,
       skipped: 0,
@@ -483,6 +486,81 @@ export class ReplayApplier {
               ],
             )
             stats.userProfiles++
+            break
+          }
+          case 'pitfall.record': {
+            // V62-04：新建坑跨设备漫游。只带「创建字段」，occurrences 是本地统计，
+            // stage/lesson/pattern/rule 由 pitfall.promote 事件升格，这里不碰。
+            const pitfallId = str(record.pitfallId)
+            const workspaceId = str(record.workspaceId)
+            const agentId = str(record.agentId)
+            if (!pitfallId || !workspaceId || !agentId) {
+              stats.skipped++
+              break
+            }
+            const at = num(record.at) ?? Date.now()
+            this.#run(
+              `INSERT INTO pitfall (pitfall_id, workspace_id, agent_id, observation, lesson, pattern, rule,
+                                    stage, confirmed, occurrences, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(pitfall_id) DO NOTHING`,
+              [
+                pitfallId,
+                workspaceId,
+                agentId,
+                str(record.observation) ?? '',
+                '',
+                '',
+                '',
+                'observation',
+                0,
+                1,
+                at,
+                at,
+              ],
+            )
+            stats.pitfalls++
+            break
+          }
+          case 'pitfall.promote': {
+            // V62-04：升格跨设备漫游。promote 只升不降（STAGE_ORDER），跨设备并发
+            // confirm 同一个坑时，重放按 lc 顺序，后到但 stage 更低的 promote 不能
+            // 倒退已确认的 rule/pattern——否则 rule 会退出 System Prompt。
+            const pitfallId = str(record.pitfallId)
+            const workspaceId = str(record.workspaceId)
+            const agentId = str(record.agentId)
+            if (!pitfallId || !workspaceId || !agentId) {
+              stats.skipped++
+              break
+            }
+            const at = num(record.at) ?? Date.now()
+            const current = this.#db.one<{ stage: string }>('SELECT stage FROM pitfall WHERE pitfall_id = ?', [pitfallId])
+            if (!current) {
+              // 行还不存在（record 事件尚未重放到，或孤儿 promote）——不创建半行。
+              stats.skipped++
+              break
+            }
+            const incoming = (str(record.stage) ?? 'observation') as PitfallStage
+            const incomingOrder = STAGE_ORDER.indexOf(incoming)
+            const currentOrder = STAGE_ORDER.indexOf(current.stage as PitfallStage)
+            if (incomingOrder > currentOrder) {
+              const confirmed = incoming === 'rule' || incoming === 'pattern' ? 1 : 0
+              this.#run(
+                `UPDATE pitfall SET stage = ?, lesson = ?, pattern = ?, rule = ?, confirmed = ?,
+                                    updated_at = MAX(updated_at, ?)
+                 WHERE pitfall_id = ?`,
+                [
+                  incoming,
+                  str(record.lesson) ?? '',
+                  str(record.pattern) ?? '',
+                  str(record.rule) ?? '',
+                  confirmed,
+                  at,
+                  pitfallId,
+                ],
+              )
+            }
+            stats.pitfalls++
             break
           }
           case 'agent.purge': {

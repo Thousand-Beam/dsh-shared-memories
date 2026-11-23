@@ -71,6 +71,24 @@ test('A→B：写入新版本会关闭旧版本，且只留一个活跃版本', 
   assert.equal(active[0]?.version_id, second.version.version_id)
 })
 
+test('V62-24：text 超过 8000 字符上限抛错', async (t) => {
+  const h = await harness(t)
+  if (!h) return
+  const long = 'x'.repeat(8001)
+  await assert.rejects(
+    () =>
+      h.tree.openVersion({
+        scope: scopeA,
+        kind: 'fact',
+        subjectKey: 'huge.text',
+        text: long,
+        validFrom: T1,
+        author: 'user',
+      }),
+    /8000 字符上限/,
+  )
+})
+
 test('历史补录：validFrom 落在旧区间内时必须切分，且不碰之后的版本', async (t) => {
   const h = await harness(t)
   if (!h) return

@@ -5,8 +5,8 @@
  *
  * 迁移过来的一律当**低信任外部数据**处理，顺序是硬性的：
  *
- *   解析（JSON / Markdown）→ 污染评估（PoisonGuard）→ 蒸馏（可选，Distiller）
- *     → 写入当前工作区时间树（author='importer'，trust 来自来源）
+ *   解析（JSON / Markdown）→ 污染评估（PoisonGuard）→ 写入当前工作区时间树
+ *     （author='importer'，trust 来自来源；LLM 提炼由 host/distill 统一负责）
  *
  * 三个刻意的设计取舍：
  *   1. 迁移**永远只写当前 scope**，不允许指定别的 workspace——否则一个导入包就能
@@ -21,7 +21,6 @@ import type { EmotionAttribution, MemoryKind } from '../../shared/types.js'
 import { sha256Hex } from '../../shared/ids.js'
 import type { Scope } from '../../shared/scope.js'
 import type { SqlDriver } from '../../shared/types.js'
-import type { Distiller } from './distill.js'
 import type { PoisonGuard, TrustSource } from './poison.js'
 import type { TemporalTree } from './timetree.js'
 
@@ -40,7 +39,7 @@ export interface ImportReport {
   readonly written: number
   readonly quarantined: number
   readonly skipped: number
-  /** 是否走了 LLM 蒸馏（`distill: true` 且模型可用）。 */
+  /** 是否走了 LLM 蒸馏。V62-05：归档蒸馏（memory/distill.ts）已删，本字段恒为 false，仅保留 API 兼容。 */
   readonly distilled: boolean
   readonly errors: readonly string[]
 }
@@ -48,11 +47,12 @@ export interface ImportReport {
 export interface ImporterOptions {
   readonly tree: TemporalTree
   readonly guard: PoisonGuard
-  readonly distiller?: Distiller
   readonly db: SqlDriver
   readonly journal: Journal
   readonly clock?: () => number
   readonly onWarn?: (message: string) => void
+  /** V62-10：kind=pitfall 的导入项同时落 pitfall 表（否则坑不进踩坑链也不跨设备漫游）。 */
+  readonly recordPitfall?: (input: { scope: Scope; observation: string; author: 'user' | 'agent' }) => Promise<void>
 }
 
 const KIND_HINTS: readonly { readonly pattern: RegExp; readonly kind: MemoryKind }[] = [
@@ -66,20 +66,20 @@ const KIND_HINTS: readonly { readonly pattern: RegExp; readonly kind: MemoryKind
 export class Importer {
   readonly #tree: TemporalTree
   readonly #guard: PoisonGuard
-  readonly #distiller: Distiller | undefined
   readonly #db: SqlDriver
   readonly #journal: Journal
   readonly #clock: () => number
   readonly #onWarn: (message: string) => void
+  readonly #recordPitfall: ((input: { scope: Scope; observation: string; author: 'user' | 'agent' }) => Promise<void>) | undefined
 
   constructor(options: ImporterOptions) {
     this.#tree = options.tree
     this.#guard = options.guard
-    this.#distiller = options.distiller
     this.#db = options.db
     this.#journal = options.journal
     this.#clock = options.clock ?? Date.now
     this.#onWarn = options.onWarn ?? (() => {})
+    this.#recordPitfall = options.recordPitfall
   }
 
   async import(input: {
@@ -88,7 +88,7 @@ export class Importer {
     format?: ImportFormat
     /** 来源标签：external（默认）/ import。决定基础信任度。 */
     source?: Extract<TrustSource, 'import' | 'external'>
-    /** 是否先过一遍 LLM 蒸馏再写（迁移大文件推荐 true）。 */
+    /** 已废弃（V62-05）：归档蒸馏管线已删除，导入不再内联蒸馏；生产提炼走 host/distill 的 DistillService。 */
     distill?: boolean
   }): Promise<ImportReport> {
     // BOM（\uFEFF）是 UTF-8 导出文件常见的首字符；不剥的话 JSON.parse 直接抛、
@@ -108,9 +108,6 @@ export class Importer {
     let quarantined = 0
     let skipped = 0
     let distilled = false
-    // 放行的条目单独收集：distill 分支的 transcript 只能用它们拼，
-    // 否则被 quarantine 的内容会通过蒸馏管线回流成新记忆（终审 P2-8）。
-    const accepted: typeof items = []
 
     for (const item of items) {
       const guarded = await this.#guard.guard({
@@ -143,37 +140,30 @@ export class Importer {
           distillStatus: 'raw',
         })
         written++
-        accepted.push(item)
+        // V62-10：kind=pitfall 的导入项同时落 pitfall 表，否则坑不进踩坑链、也不随 journal 跨设备漫游。
+        if (item.kind === 'pitfall' && this.#recordPitfall) {
+          try {
+            await this.#recordPitfall({ scope: input.scope, observation: item.text, author: 'user' })
+          } catch (error) {
+            errors.push(error instanceof Error ? error.message : String(error))
+          }
+        }
       } catch (error) {
         skipped++
         errors.push(error instanceof Error ? error.message : String(error))
       }
     }
 
-    if (input.distill && this.#distiller) {
-      try {
-        const result = await this.#distiller.distill({
-          scope: input.scope,
-          // 只用放行的条目拼 transcript：已隔离内容绝不能进蒸馏管线回流（终审 P2-8）。
-          transcript: accepted.map((item) => `- ${item.text}`).join('\n'),
-          archive: false,
-        })
-        if (result.error) errors.push(`distill:${result.error}`)
-        else {
-          written += result.written
-          quarantined += result.quarantined
-          distilled = true
-        }
-      } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error))
-      }
-    }
+    // V62-05：归档蒸馏分支已删除。导入只做「解析 → 污染评估 → 写时间树」，
+    // LLM 提炼由 host/distill 的 DistillService（会话蒸馏管线）统一负责。
 
     this.#db.run(
       `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
        VALUES (?,?,?,?,?,?)`,
       [
-        `aud_${sha256Hex(`${input.scope.agentId}:${this.#clock()}`).slice(0, 16)}`,
+        // V62-25：audit_id 不能只由 agentId+clock 的确定性哈希构成——同一毫秒内
+        // 重复导入同一 agentId 会撞主键；追加随机段消除并发碰撞。
+        `aud_${sha256Hex(`${input.scope.agentId}:${this.#clock()}`).slice(0, 16)}_${Math.random().toString(36).slice(2, 10)}`,
         input.scope.workspaceId,
         input.scope.agentId,
         'importer.import',

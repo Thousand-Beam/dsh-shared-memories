@@ -38,6 +38,7 @@ export type JournalOp =
   | 'version.open'
   | 'version.close'
   | 'version.emotion'
+  | 'pitfall.record'
   | 'pitfall.promote'
   | 'persona.shift'
   | 'quarantine.add'
@@ -280,11 +281,13 @@ export class Journal {
     }
 
     // D-03：rollback 截断墓碑。`journal.truncate`（rollback 时本机追加）标记「该设备
-    // 在回退点的 seq 高水位」，之后（seq 更大）的记录是回退点之后写的，重放时必须丢弃，
-    // 否则 rollback 后重启这些记录又被全量重放「复活」。journal 按 UTC 日期分片，回退点
-    // 之后跨天写出的新分片是 untracked 文件，`git checkout <tag> -- .` 不会删它，只能靠
-    // 墓碑在重放层截断。按 device 维度生效（本机回退本机的）；多次回退取「seq 最大（即
-    // 最后写入）的那条墓碑」的水位，语义上「回退到更早快照」覆盖「回退到更晚快照」。
+    // 在回退点的 seq 高水位（floor）」。真正要丢弃的只有「回退点之后、墓碑写入之前」
+    // 这一窗口（floor < seq ≤ 墓碑自身 seq）；墓碑之后（seq > 墓碑 seq）是本机在回退后
+    // 新写的记录，必须保留，否则 rollback 会成为该设备的永久写黑洞。journal 按 UTC 日期
+    // 分片，回退点之后跨天写出的新分片是 untracked 文件，`git checkout <tag> -- .` 不会删
+    // 它，只能靠墓碑在重放层截断。按 device 维度生效（本机回退本机的）；多次回退取
+    // 「seq 最大（即最后写入）的那条墓碑」的水位，语义上「回退到更早快照」覆盖「回退到
+    // 更晚快照」。
     const truncateFloor = new Map<string, { seq: number; floor: number }>()
     for (const record of out) {
       if (record.op !== 'journal.truncate') continue
@@ -301,7 +304,8 @@ export class Journal {
           if (record.op === 'journal.truncate') return true // 墓碑保留，apply 层走 default 只统计
           const device = typeof record.device === 'string' ? record.device : ''
           const cut = truncateFloor.get(device)
-          return cut === undefined || record.seq <= cut.floor
+          // 保留快照水位（≤ floor）与墓碑之后的新写（> 墓碑 seq），只滤掉中间的窗口。
+          return cut === undefined || record.seq <= cut.floor || record.seq > cut.seq
         })
       : out
 

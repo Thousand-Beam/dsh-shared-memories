@@ -277,7 +277,21 @@ export class SnapshotEngine {
 
     const head = await this.#git.run(['rev-parse', 'HEAD'])
     assertGitOk(head, ['rev-parse', 'HEAD'], 'git-rev-parse-failed')
-    const sha = head.stdout.trim()
+    let sha = head.stdout.trim()
+
+    // V62-26（D-19）：manifest 要带 commit hash（追溯用），但 hash 只有 commit 之后
+    // 才知道。先提交拿 sha → 回写 manifest.commit → amend 进同一提交，保证提交里的
+    // manifest 就是最终版本（否则工作区留下脏 manifest，下次快照又混进去）。
+    const finalManifest: SnapshotManifest = { ...effective, commit: sha, tag: `snap/${manifest.snapshotId}` }
+    await writeManifest(this.#root, finalManifest)
+    await this.#stageLocal()
+    const amended = await this.#git.run(['commit', '--amend', '--no-edit'], {
+      config: { 'user.name': this.#authorName, 'user.email': this.#authorEmail },
+    })
+    assertGitOk(amended, ['commit', '--amend'], 'git-commit-amend-failed')
+    const amendedHead = await this.#git.run(['rev-parse', 'HEAD'])
+    assertGitOk(amendedHead, ['rev-parse', 'HEAD'], 'git-rev-parse-failed')
+    sha = amendedHead.stdout.trim()
 
     const tag = `snap/${manifest.snapshotId}`
     // annotated tag 同样需要 committer 身份：commit 传了 -c 而这里漏掉时，
@@ -288,7 +302,7 @@ export class SnapshotEngine {
     })
     assertGitOk(tagged, ['tag', tag], 'git-tag-failed')
 
-    return { commit: sha, tag, manifest: effective }
+    return { commit: sha, tag, manifest: finalManifest }
   }
 
   /**
@@ -568,10 +582,9 @@ export class SnapshotEngine {
   /** 完整流水线：capture → commit → rotate → push。 */
   async snapshot(trigger: SnapshotTrigger): Promise<SnapshotResult> {
     const manifest = await this.capture(trigger)
-    // commit 可能因「清单里列了提交里没有的文件」把清单收敛过，以它返回的为准。
-    const { commit, tag, manifest: committed } = await this.commit(manifest)
-    const finalManifest: SnapshotManifest = { ...committed, commit, tag }
-    await writeManifest(this.#root, finalManifest)
+    // V62-26：commit() 里已经把带 commit hash 的 manifest amend 进同一提交，
+    // 它返回的 manifest 就是最终版本（提交里的那份），这里无需再写工作区。
+    const { commit, tag, manifest: finalManifest } = await this.commit(manifest)
 
     // 注意顺序：先 rotate 再 push，这样推送的就是"已经清理干净"的状态。
     const { removed } = await this.rotate()

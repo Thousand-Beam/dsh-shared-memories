@@ -54,6 +54,12 @@ export async function rehydrateUserProfilesFromRepo(options: {
     },
     (item) => (typeof item.workspaceId === 'string' ? item.workspaceId : ''),
   )
+  // V62-07：回灌的 updated_at 必须用快照 capturedAt（而非"恢复时刻"），否则
+  // journal 全量重放后跑回灌，MAX 比较总判"回灌更新"，旧快照画像覆盖新画像。
+  const capturedAt = collection.parsed.reduce<number>((max, chunk) => {
+    const file = chunk as unknown as UserProfilesStateFile
+    return typeof file.capturedAt === 'number' && file.capturedAt > max ? file.capturedAt : max
+  }, 0)
 
   const store = new UserProfileStore({ db: options.db, clock: options.clock })
   let profiles = 0
@@ -73,6 +79,7 @@ export async function rehydrateUserProfilesFromRepo(options: {
           notes: item.notes ?? '',
         },
         'snapshot',
+        capturedAt > 0 ? capturedAt : undefined,
       )
       profiles++
     } catch {

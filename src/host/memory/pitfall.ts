@@ -142,6 +142,17 @@ export class PitfallStore {
         row.updated_at,
       ],
     )
+    // V62-04：新建坑必须写 journal，否则换机后这条坑完全消失。
+    // 只带「创建字段」——occurrences 是本地统计（同一现象重复犯的次数），
+    // stage/lesson/pattern 由 pitfall.promote 事件负责升格，避免重放时倒退。
+    await this.#journal.append({
+      op: 'pitfall.record',
+      pitfallId: row.pitfall_id,
+      workspaceId: row.workspace_id,
+      agentId: row.agent_id,
+      observation: row.observation,
+      at: now,
+    })
     return row
   }
 
@@ -237,6 +248,8 @@ export class PitfallStore {
       op: 'pitfall.promote',
       pitfallId: request.pitfallId,
       stage: request.to,
+      lesson: request.preview.lesson,
+      pattern: request.preview.pattern,
       rule: request.preview.rule,
       workspaceId: scope.workspaceId,
       agentId: scope.agentId,

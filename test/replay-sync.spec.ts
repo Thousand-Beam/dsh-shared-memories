@@ -609,3 +609,109 @@ test('D-18 reinforceCount 随 journal 漫游：重放恢复计数，跨设备合
   assert.equal(row?.reinforce_count, 3, '合并后复现计数必须保留较大值 3，而不是被另一设备的 1 覆盖')
   assert.equal(stats.entities, 2, '两条 entity.upsert 都算数')
 })
+
+test('V62-04 pitfall 漫游：record 新建坑 + promote 升格重放', async (t) => {
+  const db = await openTestDb(t)
+  if (!db) return
+
+  // devA 记录新坑，devB 把同一个坑升到 rule。修复前 record 不写 journal、promote 走 default
+  // 只统计不重放，换机后这条坑（连同已确认的 rule）完全消失。
+  const records: JournalRecord[] = [
+    record({
+      op: 'pitfall.record',
+      lc: 1,
+      at: 1000,
+      device: 'devA',
+      pitfallId: 'pf-1',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      observation: 'tsc 报 nodenext 解析失败',
+    }),
+    record({
+      op: 'pitfall.promote',
+      lc: 2,
+      at: 2000,
+      device: 'devB',
+      pitfallId: 'pf-1',
+      stage: 'rule',
+      lesson: '要开 nodenext',
+      pattern: 'ESM 解析失败',
+      rule: 'tsconfig 必须开 nodenext',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      by: 'user',
+    }),
+  ]
+
+  const applier = new ReplayApplier(db)
+  const stats = applier.apply(records)
+
+  const row = db.one<{ stage: string; rule: string; confirmed: number; occurrences: number }>(
+    `SELECT stage, rule, confirmed, occurrences FROM pitfall WHERE pitfall_id = 'pf-1'`,
+  )
+  assert.equal(row?.stage, 'rule', 'promote 必须把 stage 升到 rule')
+  assert.equal(row?.rule, 'tsconfig 必须开 nodenext', 'rule 内容必须随 promote 漫游')
+  assert.equal(row?.confirmed, 1, 'rule 升格必须确认')
+  assert.equal(row?.occurrences, 1, 'record 新建坑 occurrences 从 1 起')
+  assert.equal(stats.pitfalls, 2, 'record + promote 都算数')
+})
+
+test('V62-04 pitfall promote 不倒退：低 stage 的 promote 不能覆盖已确认的 rule', async (t) => {
+  const db = await openTestDb(t)
+  if (!db) return
+
+  // 跨设备并发 confirm 同一个坑：devB 升到 rule（lc=2），devC 后到但只升到 lesson（lc=3）。
+  // 重放按 lc 顺序 lesson 会覆盖 rule → rule 退出 System Prompt。修复后只升不降。
+  const records: JournalRecord[] = [
+    record({
+      op: 'pitfall.record',
+      lc: 1,
+      at: 1000,
+      device: 'devA',
+      pitfallId: 'pf-2',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      observation: '某个坑',
+    }),
+    record({
+      op: 'pitfall.promote',
+      lc: 2,
+      at: 2000,
+      device: 'devB',
+      pitfallId: 'pf-2',
+      stage: 'rule',
+      lesson: 'L',
+      pattern: 'P',
+      rule: 'R',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      by: 'user',
+    }),
+    record({
+      op: 'pitfall.promote',
+      lc: 3,
+      at: 3000,
+      device: 'devC',
+      pitfallId: 'pf-2',
+      stage: 'lesson',
+      lesson: 'L2',
+      pattern: '',
+      rule: '',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      by: 'user',
+    }),
+  ]
+
+  const applier = new ReplayApplier(db)
+  const stats = applier.apply(records)
+
+  const row = db.one<{ stage: string; rule: string; confirmed: number }>(
+    `SELECT stage, rule, confirmed FROM pitfall WHERE pitfall_id = 'pf-2'`,
+  )
+  assert.equal(row?.stage, 'rule', '低 stage 的 promote 不能倒退已确认的 rule')
+  assert.equal(row?.rule, 'R', 'rule 内容保持不变')
+  assert.equal(row?.confirmed, 1, 'confirmed 保持 1')
+  assert.equal(stats.pitfalls, 3, 'record + 两次 promote 都算数')
+})
+

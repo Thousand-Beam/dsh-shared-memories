@@ -28,6 +28,7 @@ import {
   type WebServerLike,
 } from '../src/host/http/routes.js'
 import { PitfallStore } from '../src/host/memory/pitfall.js'
+import { SessionPolicyStore } from '../src/host/memory/session-policy.js'
 import { TemporalTree } from '../src/host/memory/timetree.js'
 import { RestoreBarrier } from '../src/host/snapshot/barrier.js'
 import { SnapshotEngine } from '../src/host/snapshot/engine.js'
@@ -277,6 +278,7 @@ async function makeHarness(
       )
     },
     pitfalls: () => pitfalls,
+    policies: () => new SessionPolicyStore({ db }),
     // 三个「干涉」端点：删记忆 / 改记忆 / 删踩坑。实现对齐 index.ts 里真实闭包的语义。
     forgetMemory: async (input: { entityId: string; agentId: string }) => {
       const agentId = input.agentId || AGENT
@@ -460,7 +462,7 @@ test('POST /sync-interval：<30 秒被拒，合法值回显', async (t) => {
   assert.equal(over.body.error?.code, 'bad-interval')
 })
 
-test('POST /skills：非法 action 400，合法 action 走绑定（D-16）', async (t) => {
+test('POST /skills：非法 action 400，脏 agentId 400，合法绑定 await 后 items 含新绑定（D-16/V62-02）', async (t) => {
   const h = await makeHarness(t)
   if (!h) return
 
@@ -471,11 +473,25 @@ test('POST /skills：非法 action 400，合法 action 走绑定（D-16）', asy
   assert.equal(bad.status, 400)
   assert.equal(bad.body.error?.code, 'bad-skill-action')
 
-  const good = await call(h.base, '/skills', {
+  // V62-02：脏 agentId 此前流进 async bind 的 assertScope → floating promise
+  // → unhandled rejection → DSH 宿主进程 fatal。现在入口同步 400，宿主存活。
+  const dirty = await call(h.base, '/skills', {
+    method: 'POST',
+    body: { agentId: '../../bin/sh', action: 'bind', skillId: 'foo.bar' },
+  })
+  assert.equal(dirty.status, 400)
+  assert.equal(dirty.body.error?.code, 'invalid-agent-id')
+
+  const good = await call<{ items: Array<{ skillId: string }> }>(h.base, '/skills', {
     method: 'POST',
     body: { agentId: AGENT, action: 'bind', skillId: 'foo.bar' },
   })
   assert.equal(good.status, 200)
+  // V62-02：await 之后 items 才是 bind 完成后的真实状态（此前 200 返回陈旧空列表）。
+  assert.ok(
+    (good.body.data?.items ?? []).some((item) => item.skillId === 'foo.bar'),
+    'bind 后 items 应含新绑定',
+  )
 })
 
 test('POST /import：空内容 400，有内容走导入器', async (t) => {
@@ -486,12 +502,47 @@ test('POST /import：空内容 400，有内容走导入器', async (t) => {
   assert.equal(empty.status, 400)
   assert.equal(empty.body.error?.code, 'empty-content')
 
+  // V62-22：脏 agentId 此前被 importMemories 静默丢弃成 0 条，用户以为导入了其实没有。
+  const dirtyImport = await call(h.base, '/import', {
+    method: 'POST',
+    body: { agentId: '../../etc/passwd', content: '["一条"]' },
+  })
+  assert.equal(dirtyImport.status, 400)
+  assert.equal(dirtyImport.body.error?.code, 'invalid-agent-id')
+
   const filled = await call<{ parsed: number }>(h.base, '/import', {
     method: 'POST',
     body: { agentId: AGENT, format: 'json', content: '[{"text":"一条外部记忆"}]' },
   })
   assert.equal(filled.status, 200)
   assert.equal(filled.body.data?.parsed, 1)
+})
+
+test('POST /identity、/session-policy：脏 agentId 400（V62-21）', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  // 脏 agentId 此前写进 persona_identity 绑定表，重启时 ScopedQuery 断言炸宿主。
+  const dirtyIdentity = await call(h.base, '/identity', {
+    method: 'POST',
+    body: { agentId: '../../etc/passwd', action: 'bind' },
+  })
+  assert.equal(dirtyIdentity.status, 400)
+  assert.equal(dirtyIdentity.body.error?.code, 'invalid-agent-id')
+
+  // 会话策略的 agentId 缺省 '' 合法（跨 agent），非空脏值拒绝。
+  const dirtyPolicy = await call(h.base, '/session-policy', {
+    method: 'POST',
+    body: { sessionId: 'sess-v62-21', agentId: '../../etc/passwd', ephemeral: false },
+  })
+  assert.equal(dirtyPolicy.status, 400)
+  assert.equal(dirtyPolicy.body.error?.code, 'invalid-agent-id')
+
+  const okPolicy = await call(h.base, '/session-policy', {
+    method: 'POST',
+    body: { sessionId: 'sess-v62-21', agentId: AGENT, ephemeral: false },
+  })
+  assert.equal(okPolicy.status, 200)
 })
 
 test('GET/POST /quarantine：列表用 score 不用 risk，洗白必须重开版本', async (t) => {
@@ -653,6 +704,15 @@ test('GET/POST /persona、GET /rules、未知路径 404', async (t) => {
   })
   assert.equal(badTraits.status, 400)
   assert.equal(badTraits.body.error?.code, 'bad-traits')
+
+  // V62-14（D-13）：缺 name 时保留库里已有的名字，不能重置回 agentId（全量 PUT 语义）。
+  const patchAge = await call<PersonaDoc>(h.base, '/persona', {
+    method: 'POST',
+    body: { agentId: AGENT, age: 14, traits: { curiosity: 0.8 } },
+  })
+  assert.equal(patchAge.status, 200)
+  assert.equal(patchAge.body.data?.name, '小狐狸', '只改 age 不能把名字抹回 agentId')
+  assert.equal(patchAge.body.data?.age, 14)
 
   const rules = await call<RulesBundle>(h.base, `/rules?agentId=${AGENT}`)
   assert.equal(rules.status, 200)

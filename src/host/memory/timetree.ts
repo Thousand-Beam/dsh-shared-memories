@@ -29,6 +29,9 @@ import type {
 } from '../../shared/types.js'
 import { EMOTION_LABELS } from '../../shared/types.js'
 
+/** V62-24：单条记忆正文的长度上限。超长正文会挤占提示词窗口，一条记忆不该是一篇文章。 */
+export const MAX_TEXT_CHARS = 8000
+
 /** 打开（或新建）一个版本时的输入。 */
 export interface OpenVersionInput {
   /** 作用域：写入侧同样强制，防止"写进别人的工作区"。 */
@@ -122,6 +125,10 @@ export class TemporalTree {
     assertScope(input.scope, 'TemporalTree.openVersion')
     const text = normalizeText(input.text)
     if (!text) throw new Error('TemporalTree.openVersion: text 不能为空')
+    // V62-24：单条记忆正文必须有上限，否则超长正文会挤占召回注入的提示词窗口。
+    if (text.length > MAX_TEXT_CHARS) {
+      throw new Error(`TemporalTree.openVersion: text 超过 ${MAX_TEXT_CHARS} 字符上限`)
+    }
     const at = input.validFrom ?? this.#clock()
     if (!Number.isFinite(at) || at <= 0) throw new Error('TemporalTree.openVersion: validFrom 非法')
 

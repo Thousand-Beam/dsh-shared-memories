@@ -331,7 +331,7 @@ async function dispatch(
     if (method === 'POST' && path === '/skills') {
       const body = await readJson(req)
       deps.barrier.assertWritable('skill-edit')
-      return sendJson(res, 200, ok(writeSkills(deps, body)))
+      return sendJson(res, 200, ok(await writeSkills(deps, body)))
     }
     if (method === 'GET' && path === '/user-profile') {
       return sendJson(res, 200, ok(readUserProfile(deps)))
@@ -368,7 +368,12 @@ async function dispatch(
         ephemeral: body.ephemeral === true ? true : body.ephemeral === false ? false : undefined,
         ...(isArchiveMode(body.archiveMode) ? { archiveMode: body.archiveMode as ArchiveMode } : {}),
       })
-      const policy = store.set(sessionId, deps.workspaceId, input, str(body.agentId) ?? '')
+      const policyAgentId = str(body.agentId) ?? ''
+      // V62-21：脏 agentId 与 /persona /skills /identity 同规则；缺省 '' 表示跨 agent，合法。
+      if (policyAgentId !== '' && !isSafeScopeToken(policyAgentId)) {
+        throw new ApiError('invalid-agent-id', 'agentId 含非法字符，拒绝写入', 400)
+      }
+      const policy = store.set(sessionId, deps.workspaceId, input, policyAgentId)
       // 无痕是"创建时就定"的，而宿主先发 agent/created、后把 sessionId 交回客户端，
       // 中间那一瞬已经登记过人格。这里补删，让"无痕"在库里真的是零痕迹。
       if (policy.ephemeral) {
@@ -545,6 +550,10 @@ async function dispatch(
     if (method === 'POST' && path === '/import') {
       const body = await readJson(req)
       const agentId = reqStr(body, 'agentId')
+      // V62-22：脏 agentId 此前被 importMemories 静默丢弃，用户以为导入了其实没有——直接 400。
+      if (!isSafeScopeToken(agentId)) {
+        throw new ApiError('invalid-agent-id', 'agentId 含非法字符，拒绝导入', 400)
+      }
       const format = (str(body.format) ?? 'auto') as 'auto' | 'json' | 'markdown'
       const content = str(body.content) ?? ''
       if (!content.trim()) throw new ApiError('empty-content', '导入内容为空')
@@ -701,7 +710,9 @@ function listMemories(deps: MemoriesApiDeps, url: URL): MemoryCard[] {
 
   const rows = queryMemories(db, {
     workspaceId: deps.workspaceId,
-    agentId,
+    // V62-06：全局检索签发成功后查询不再按 agent 过滤——否则"全局"只是写一条
+    // 永远没人看的审计，UI 上看起来跨 Agent 检索了、实际只返回当前会话的记忆。
+    agentId: global ? '' : agentId,
     text: query,
     kinds,
     limit: Number.isFinite(limit) ? limit : 60,
@@ -1114,6 +1125,10 @@ async function writeIdentity(deps: MemoriesApiDeps, body: Record<string, unknown
   if (!db) throw new ApiError('db-unavailable', '记忆库尚未就绪', 503)
   const store = deps.identity?.() ?? new PersonaIdentityStore({ db })
   const agentId = reqStr(body, 'agentId')
+  // V62-21：脏 agentId（路径穿越）入库后重启时炸宿主，与 /persona /skills 同规则。
+  if (!isSafeScopeToken(agentId)) {
+    throw new ApiError('invalid-agent-id', 'agentId 含非法字符，拒绝写入', 400)
+  }
   const action = str(body.action) ?? 'bind'
   if (action === 'split') {
     await store.bindTo(agentId, deps.workspaceId, agentId, 'user')
@@ -1212,10 +1227,16 @@ function toSkillDtos(bindings: readonly SkillBinding[]): SkillBindingDto[] {
  * `assertWritable`（恢复中禁止写）。skillId 在入口就规范化，非法 id 直接 400 ——
  * 技能名是要进 System Prompt 的，不能让它变成提示词注入的入口。
  */
-function writeSkills(deps: MemoriesApiDeps, body: Record<string, unknown>): SkillsBundle {
+async function writeSkills(deps: MemoriesApiDeps, body: Record<string, unknown>): Promise<SkillsBundle> {
   const db = deps.db()
   if (!db) throw new ApiError('db-unavailable', '记忆库尚未就绪', 503)
   const agentId = str(body.agentId) ?? 'default'
+  // V62-02：agentId 入口校验。此前脏 id（../../bin/sh）会流进 registry.bind 的
+  // assertScope，而 bind 是 async 未 await 的 floating promise → unhandled rejection
+  // → DSH 宿主进程级 fatal。这里在同步入口先拦住，400 而非进程退出。
+  if (!isSafeScopeToken(agentId)) {
+    throw new ApiError('invalid-agent-id', '会话 id 只能是字母、数字与 ._:- 组合', 400)
+  }
   const scope = scopeOf(deps, agentId)
   const registry =
     deps.skills?.() ??
@@ -1235,12 +1256,12 @@ function writeSkills(deps: MemoriesApiDeps, body: Record<string, unknown>): Skil
     throw new ApiError('bad-skill-id', '技能 id 只能是 1-64 位的字母、数字、点、下划线或连字符', 400)
   }
   if (action === 'unbind') {
-    registry.unbind(scope, skillId)
+    await registry.unbind(scope, skillId)
   } else if (action === 'toggle') {
     const enabled = body.enabled !== false
-    registry.setEnabled(scope, skillId, enabled)
+    await registry.setEnabled(scope, skillId, enabled)
   } else {
-    registry.bind(scope, {
+    await registry.bind(scope, {
       skillId,
       version: normalizeSkillVersion(str(body.version)),
       enabled: body.enabled !== false,
@@ -1250,6 +1271,7 @@ function writeSkills(deps: MemoriesApiDeps, body: Record<string, unknown>): Skil
   return {
     agentId,
     workspaceId: deps.workspaceId,
+    // V62-02：await 之后再读，items 才是 bind 完成后的真实状态（此前 200 返回陈旧空列表）。
     items: toSkillDtos(readSkillBindings(db, scope)),
   }
 }
@@ -1328,12 +1350,23 @@ async function writePersona(deps: MemoriesApiDeps, body: Record<string, unknown>
   if (!isSafeScopeToken(agentId)) {
     throw new ApiError('invalid-agent-id', '解析后的人格 id 含非法字符，拒绝写入', 400)
   }
-  const name = (str(body.name) ?? agentId).slice(0, 40)
+  // V62-14（D-13）：POST /persona 不是「全量 PUT」。缺 name 时保留库里已有的名字，
+  // 只有首次创建（库里还没有）才用 agentId 兜底——否则只改 traits/age 会把名字抹回 agentId。
+  const name = (str(body.name) ?? readExistingPersonaName(db, agentId, deps.workspaceId) ?? agentId).slice(0, 40)
   const age = Math.min(999, Math.max(1, Math.round(num(body.age) ?? 10)))
   // D-14：traits 必须是「纯对象」。数组此前被误当 {0:x,1:y} 处理、字符串被静默丢弃成 {}，
   // 用户以为写进去了其实没有——这里直接 400，坏数据不落库也不装成功。
   if (body.traits !== undefined && body.traits !== null && (typeof body.traits !== 'object' || Array.isArray(body.traits))) {
     throw new ApiError('bad-traits', 'traits 必须是对象，形如 {"好奇心": 0.8}', 400)
+  }
+  // V62-20：traits 的值必须是有限数值。字符串/null 此前被 parseTraitsInput 静默丢弃成空，
+  // 用户以为写进去了其实没有——这里逐键 400，坏值不落库也不装成功。
+  if (body.traits && typeof body.traits === 'object' && !Array.isArray(body.traits)) {
+    for (const [key, value] of Object.entries(body.traits as Record<string, unknown>)) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new ApiError('bad-traits', `traits.${key} 必须是有限数值`, 400)
+      }
+    }
   }
   const traits: Record<string, number> = {}
   for (const [key, value] of Object.entries(parseTraitsInput(body.traits))) {
@@ -1379,6 +1412,15 @@ function parseTraitsInput(value: unknown): Record<string, number> {
     if (typeof raw === 'number' && Number.isFinite(raw)) out[key] = raw
   }
   return out
+}
+
+/** V62-14：读库里已有的人格名字；没有返回 undefined（首次创建走 agentId 兜底）。 */
+function readExistingPersonaName(db: SqlDriver, agentId: string, workspaceId: string): string | undefined {
+  const row = db.one<{ name: string | null }>(
+    `SELECT name FROM persona_state WHERE agent_id = ? AND workspace_id = ?`,
+    [agentId, workspaceId],
+  )
+  return row?.name ?? undefined
 }
 
 /** 规则视图：已收敛的踩坑链 + 待人工确认的升格请求（转成前端 DTO）。 */

@@ -132,8 +132,15 @@ export class UserProfileStore {
     return profile
   }
 
-  /** 恢复时用：直接落库，**不写 journal**（重放自己不能再产生新事件）。 */
-  replace(workspaceId: string, input: UserProfileInput, by = 'snapshot'): void {
+  /**
+   * 恢复时用：直接落库，**不写 journal**（重放自己不能再产生新事件）。
+   *
+   * `updatedAt` 缺省用 clock()，但回灌必须传快照的 capturedAt：回灌发生在
+   * journal 全量重放**之后**，若用"恢复时刻"作 updated_at，MAX 比较永远判
+   * "回灌更新"，快照里的旧画像反而覆盖 journal 重放出的新画像（V62-07）。
+   * 只有用 capturedAt + MAX 才能实现"回灌不回退更新"。
+   */
+  replace(workspaceId: string, input: UserProfileInput, by = 'snapshot', updatedAt?: number): void {
     const clean = normalizeProfileInput(input)
     this.#db.run(
       `INSERT INTO user_profile (workspace_id, display_name, preferred_address, notes, updated_at, updated_by)
@@ -142,9 +149,9 @@ export class UserProfileStore {
          display_name = excluded.display_name,
          preferred_address = excluded.preferred_address,
          notes = excluded.notes,
-         updated_at = excluded.updated_at,
+         updated_at = MAX(user_profile.updated_at, excluded.updated_at),
          updated_by = excluded.updated_by`,
-      [workspaceId, clean.displayName ?? '', clean.preferredAddress ?? '', clean.notes ?? '', this.#clock(), by],
+      [workspaceId, clean.displayName ?? '', clean.preferredAddress ?? '', clean.notes ?? '', updatedAt ?? this.#clock(), by],
     )
   }
 }
