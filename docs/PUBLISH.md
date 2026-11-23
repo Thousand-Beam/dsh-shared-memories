@@ -1,4 +1,4 @@
-﻿# 发布指南 · dsh-shared-memories
+# 发布指南 · dsh-shared-memories
 
 > 目标：仓库从零到 `v0.1.0` tag 推到 GitHub，并准备向 `awesome-dsh-plugin` 提交条目。
 
@@ -136,7 +136,7 @@ npm pack --dry-run        # 看 files 白名单打进去什么，别把 src/ 打
 npm publish --access public
 ```
 
-`files` 已限定为 `lib/**/*`、`scripts/wrap-client.mjs`、`cordis.patch.yml`、`README.md`、`LICENSE`。
+`files` 已限定为 `lib/**/*`、`scripts/wrap-client.mjs`、`scripts/self-test.mjs`、`scripts/doctor.mjs`、`cordis.patch.yml`、`README.md`、`CHANGELOG.md`、`KNOWN-ISSUES.md`、`LICENSE`。
 
 ---
 

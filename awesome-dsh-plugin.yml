@@ -1,4 +1,4 @@
-﻿# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # awesome-dsh-plugin 收录条目 · dsh-shared-memories
 # ---------------------------------------------------------------------------
 # 提交方式（二选一，按仓库当时的规范）：
@@ -21,7 +21,7 @@ plugins:
     repo: https://github.com/Thousand-Beam/dsh-shared-memories
     homepage: https://github.com/Thousand-Beam/dsh-shared-memories#readme
     license: MIT
-    version: 0.6.3
+    version: 0.6.4
     status: beta
 
     summary: >-
