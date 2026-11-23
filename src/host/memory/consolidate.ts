@@ -196,14 +196,20 @@ export class Consolidator {
     })
     // 合并判决必须写 journal 才能跨设备漫游：否则 B 机冷启动重放时 loser 仍是
     // active，时间树与幸存版本的 supersedes 都对不上（终审 P2-9）。
-    void this.#journal.append({
-      op: 'entity.merge',
-      entityId: loser.entity_id,
-      mergedInto: keeper.entity_id,
-      workspaceId: loser.workspace_id,
-      agentId: loser.agent_id,
-      at: now,
-    })
+    void this.#journal
+      .append({
+        op: 'entity.merge',
+        entityId: loser.entity_id,
+        mergedInto: keeper.entity_id,
+        workspaceId: loser.workspace_id,
+        agentId: loser.agent_id,
+        at: now,
+      })
+      .catch((error: unknown) => {
+        // T5：写 journal 失败不能 unhandledRejection 终止宿主。合并判决已落 DB，
+        // journal 只是漫游用途，失败只上报 onWarn，正确性不受影响。
+        this.#onWarn(`合并判决写 journal 失败：${error instanceof Error ? error.message : String(error)}`)
+      })
   }
 
   /** ③：挑出可以修剪的实体 id。 */
@@ -231,7 +237,12 @@ export class Consolidator {
       }
     })
     for (const entityId of entityIds) {
-      void this.#journal.append({ op: 'memory.forget', entityId, reason: 'consolidate-prune', at: now })
+      void this.#journal
+        .append({ op: 'memory.forget', entityId, reason: 'consolidate-prune', at: now })
+        .catch((error: unknown) => {
+          // T5：写 journal 失败不能 unhandledRejection 终止宿主，上报 onWarn 即可。
+          this.#onWarn(`修剪写 journal 失败：${error instanceof Error ? error.message : String(error)}`)
+        })
     }
   }
 }

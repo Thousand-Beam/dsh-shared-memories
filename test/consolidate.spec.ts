@@ -173,3 +173,41 @@ test('P2-9：合并判决写 entity.merge journal 记录', async (t) => {
   assert.equal(merge.workspaceId, WS)
   assert.equal(merge.agentId, AGENT)
 })
+
+test('T5：Consolidator journal.append 失败上报 onWarn，不产生 unhandledRejection', async (t) => {
+  const db = await openTestDb(t)
+  if (!db) return
+
+  await seed(db, [
+    { id: 't5a', kind: 'fact', subject: 'p.t5a', text: '完全相同的句子。', trust: 0.9 },
+    { id: 't5b', kind: 'fact', subject: 'p.t5b', text: '完全相同的句子。', trust: 0.5 },
+  ])
+
+  // mock：append 总是 reject（模拟磁盘满 / IO 错误）。
+  const failingJournal = {
+    append: async () => {
+      throw new Error('disk full')
+    },
+  } as unknown as Journal
+
+  const warns: string[] = []
+  const consolidator = new Consolidator({ db, journal: failingJournal, onWarn: (m) => warns.push(m) })
+
+  // 监听 unhandledRejection：修复前 void journal.append() 丢弃 reject 会触发这里，
+  // 修复后 .catch 处理掉就不会触发。
+  let unhandled: unknown = null
+  const handler = (reason: unknown) => {
+    unhandled = reason
+  }
+  process.on('unhandledRejection', handler)
+  try {
+    const report = consolidator.run({ workspaceId: WS, agentId: AGENT })
+    assert.equal(report.deduped + report.merged, 1, '同文必须触发一次合并')
+    // 等一个宏任务让 unhandledRejection（若有）有机会触发。
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(unhandled, null, 'journal.append 失败不应产生 unhandledRejection')
+    assert.ok(warns.length > 0, 'journal.append 失败应上报 onWarn')
+  } finally {
+    process.off('unhandledRejection', handler)
+  }
+})
