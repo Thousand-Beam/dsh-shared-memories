@@ -596,8 +596,15 @@ async function applyClean(db, root, options, report, tombstones) {
     }
   }
 
+  // T8-3：与 inspect() 对齐——entityIds 收集必须带 workspace 过滤。之前这里只按
+  // agent_id 过滤，清理单个 workspace 的 ghost 时会把同名 agent 在**其它 workspace**
+  // 的活跃实体也删掉（体检和清理不一致的误删）。
   const entityIds = new Set(
-    all(db, 'SELECT entity_id FROM memory_entity WHERE agent_id = ?', [agentId]).map((row) => String(row.entity_id)),
+    all(
+      db,
+      'SELECT entity_id FROM memory_entity WHERE agent_id = ? AND (? = \'\' OR workspace_id = ?)',
+      [agentId, workspaceId, workspaceId],
+    ).map((row) => String(row.entity_id)),
   )
 
   db.exec('BEGIN IMMEDIATE')

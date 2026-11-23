@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 # DSH-Shared-Memories
 
@@ -206,18 +206,33 @@ B 机装好插件、填同样的 `remote` + 配好 SSH，启动时就会自动 `
 | `repo.branch` | `main` | 推送分支 |
 | `repo.authMode` | `ssh-agent` | `ssh-agent` / `credential-helper` / `token-ref` |
 | `repo.credentialRef` | `shared-memories/git-token` | **只存引用名**，凭据本体在系统钥匙串 |
+| `repo.authorName` | `dsh-shared-memories` | commit 署名 |
+| `repo.authorEmail` | `shared-memories@localhost` | commit 邮箱 |
+| `repo.deviceId` | `''` | 设备标识；留空用主机名，多端共存必须唯一 |
+| `repo.workspaceRoot` | `''` | 工作区根目录；留空用进程 cwd |
 | `sync.enabled` | `true` | 同步总开关 |
 | `sync.intervalSec` | `300` | 定时快照间隔（秒） |
+| `sync.idleDebounceSec` | `30` | 空闲防抖（秒） |
 | `sync.pushOnCommit` | `true` | 每次提交后立即推送 |
+| `sync.retries` | `3` | 网络操作重试次数 |
+| `sync.timeoutMs` | `30000` | 单次 Git 操作超时（毫秒） |
 | `sync.pullStrategy` | `ff-only` | 冷启动拉取策略：`ff-only` / `rebase` |
 | `snapshot.keep` | `5` | 滑窗大小；Pin 过的不计入清理 |
+| `snapshot.pinProtected` | `true` | Pin 的版本免于自动清理 |
 | `snapshot.maxBytes` | `268435456`（256MB） | 单次快照体积上限，超了拒绝提交而不是截断 |
+| `restore.blockUntilReady` | `true` | 恢复完成前拒绝新对话（强一致性） |
+| `restore.timeoutMs` | `30000` | 恢复超时（毫秒） |
 | `restore.offlinePolicy` | `degraded-readonly` | `degraded-readonly` / `local-only` / `block` |
+| `restore.verifyHashes` | `true` | 恢复前校验 manifest 中每个文件的 sha256 |
 | `isolation.strict` | `true` | 关掉它需要改代码，不是改配置 |
+| `isolation.allowGlobalSearch` | `false` | 是否允许 UI 开启全局检索 |
+| `isolation.globalSearchTtlMs` | `600000` | 全局令牌有效期（毫秒） |
 | `persona.traitShiftMax` | `0.05` | 单次对话允许的性格漂移上限 |
-| `distill.minEmotionConfidence` | `0.6` | 低于这条线的情感标签整条丢弃，不留「大概」 |
-| `consolidate.nearDuplicateJaccard` | `0.85` | 近似合并阈值 |
-| `consolidate.pruneSalience` | `0.15` | 低于此值且 90 天未召回的条目降级为 `forgotten` |
+| `memory.distill.emotionConfidenceGate` | `0.6` | 低于这条线的情感标签整条丢弃，不留「大概」 |
+| `memory.consolidate.mergeSimilarity` | `0.85` | 近似合并阈值 |
+| `memory.forgetting.pruneBelow` | `0.15` | 低于此值且 90 天未召回的条目降级为 `forgotten` |
+
+其余字段（检索 / 蒸馏 / 遗忘 / 污染防御 / 冲突等，多为「暂未生效」）见 `src/config.ts` Schema。
 
 **没有任何一个默认值是凭据。** `credentialRef` 存的是钥匙串里的键名；明文 token 不会进配置文件，更不会进 Git。
 

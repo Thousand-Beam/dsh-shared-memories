@@ -341,6 +341,9 @@ export class PoisonGuard {
     const known = new Set(wordSet(traits))
     if (known.size === 0) return 1
     const incoming = wordSet(text)
+    // T8-2：text 无任何词时 incoming 是空集，hit / incoming.size = 0 / 0 = NaN。
+    // 与 known 空集对称：无词文本没有漂移信号，返回 1（不判漂移）。
+    if (incoming.size === 0) return 1
     let hit = 0
     for (const word of incoming) if (known.has(word)) hit++
     return hit / incoming.size

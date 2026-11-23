@@ -236,3 +236,23 @@ test('T3：身份覆盖类注入必须进隔离区（威胁不随来源可信度
   assert.equal(user.action, 'accept')
   assert.equal(user.risk, 0)
 })
+
+test('T8-2：无词 persona 文本不产生 NaN 风险（回归保护）', async (t) => {
+  const ctx = await makeGuard(t)
+  if (!ctx) return
+
+  // 写一个非空 traits 的 persona，让 #personaOverlap 走到词重叠计算分支。
+  ctx.db.run(
+    `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
+     VALUES (?,?,?,?,?,?,?)`,
+    [SCOPE.agentId, SCOPE.workspaceId, 'lead', 10, '{"curiosity":0.8}', '', Date.now()],
+  )
+
+  // text 无任何词（省略号既不是字母数字也不在 CJK 范围），wordSet 返回空集。
+  // 旧代码 #personaOverlap 里 hit / incoming.size = 0 / 0 = NaN——虽然调用方
+  // `NaN < 0.05` 恒 false 暂时吞掉了它，但这是脆弱代码。修复后空集守卫返回 1。
+  // 此断言是回归保护：确保无词文本的 assess 永远返回有限风险，不给未来泄漏机会。
+  const r = ctx.guard.assess({ scope: SCOPE, kind: 'persona', text: '……', source: 'external' })
+  assert.ok(Number.isFinite(r.risk), `risk 必须是有限值，实际 ${r.risk}`)
+  assert.equal(r.action, 'accept', '无词文本不该被误判为漂移')
+})
