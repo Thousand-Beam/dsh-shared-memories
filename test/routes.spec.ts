@@ -252,6 +252,30 @@ async function makeHarness(
     reopenQuarantine: async (input: { quarantineId: string; text: string }) => {
       reopened.push({ quarantineId: input.quarantineId, text: input.text })
     },
+    // P2-7 后裁决走 PoisonGuard（唯一真相源）。测试 harness 里用最小 stub 模拟其行为：
+    // 归属校验 + 状态更新 + audit_log 落账，与 poison.ts approve/destroy 保持一致。
+    approveQuarantine: async (input: { quarantineId: string; agentId: string; by: string }) => {
+      db.run(
+        `UPDATE quarantine SET status = 'approved' WHERE quarantine_id = ? AND workspace_id = ? AND agent_id = ?`,
+        [input.quarantineId, WORKSPACE, input.agentId],
+      )
+      db.run(
+        `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
+         VALUES (?,?,?,?,?,?)`,
+        ['aud-approve', WORKSPACE, input.agentId, 'quarantine.approve', JSON.stringify({ quarantineId: input.quarantineId, by: input.by }), NOW],
+      )
+    },
+    destroyQuarantine: async (input: { quarantineId: string; agentId: string; by: string }) => {
+      db.run(
+        `UPDATE quarantine SET status = 'destroyed' WHERE quarantine_id = ? AND workspace_id = ? AND agent_id = ?`,
+        [input.quarantineId, WORKSPACE, input.agentId],
+      )
+      db.run(
+        `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
+         VALUES (?,?,?,?,?,?)`,
+        ['aud-destroy', WORKSPACE, input.agentId, 'quarantine.destroy', JSON.stringify({ quarantineId: input.quarantineId, by: input.by }), NOW],
+      )
+    },
     pitfalls: () => pitfalls,
     // 三个「干涉」端点：删记忆 / 改记忆 / 删踩坑。实现对齐 index.ts 里真实闭包的语义。
     forgetMemory: async (input: { entityId: string; agentId: string }) => {
@@ -491,7 +515,7 @@ test('POST /quarantine/destroy：销毁只改状态、不重开版本、幂等�
 
   const audit = h.db.one<{ action: string }>(
     'SELECT action FROM audit_log WHERE detail LIKE ? ORDER BY created_at DESC LIMIT 1',
-    ['q_1 by me%'],
+    ['%q_1%me%'],
   )
   assert.equal(audit?.action, 'quarantine.destroy')
 

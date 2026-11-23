@@ -34,12 +34,15 @@ export const JOURNAL_VERSION = 1
 /** 已知操作类型；字符串留口子，方便后续插件扩展自定义 op。 */
 export type JournalOp =
   | 'entity.upsert'
+  | 'entity.merge'
   | 'version.open'
   | 'version.close'
   | 'version.emotion'
   | 'pitfall.promote'
   | 'persona.shift'
   | 'quarantine.add'
+  | 'quarantine.approve'
+  | 'quarantine.destroy'
   | 'memory.forget'
   | 'skill.bind'
   | 'skill.unbind'

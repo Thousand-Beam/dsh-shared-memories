@@ -18,20 +18,13 @@ import type { Journal } from '../../shared/journal.js'
 import type { SqlDriver } from '../../shared/types.js'
 import type { Scope } from '../../shared/scope.js'
 import type { EmotionLabel, MemoryKind } from '../../shared/types.js'
+import { EMOTION_LABELS } from '../../shared/types.js'
 import { newId } from '../../shared/ids.js'
 import type { TemporalTree } from './timetree.js'
+import type { PoisonGuard } from './poison.js'
 
 export const KINDS = ['fact', 'preference', 'decision', 'pitfall', 'persona', 'episode'] as const
-export const EMOTIONS = [
-  'joy',
-  'anxiety',
-  'frustration',
-  'pride',
-  'curiosity',
-  'anger',
-  'sadness',
-  'neutral',
-] as const
+export const EMOTIONS = EMOTION_LABELS
 
 /** 情感归因：四个字段一个都不能少，缺一个整块丢弃。 */
 export const EmotionSchema = z.object({
@@ -81,6 +74,8 @@ export interface DistillerOptions {
   readonly db: SqlDriver
   readonly journal: Journal
   readonly model: DistillModelPort
+  /** 防投毒闸门：蒸馏结果也是"外部输入"，写库前过一遍（终审 P2-8）。缺省不拦截。 */
+  readonly guard?: PoisonGuard
   /** 事实置信度闸门，默认 0.7。 */
   readonly confidenceGate?: number
   /** 情感置信度闸门，默认 0.6（与 TemporalTree 内部一致）。 */
@@ -149,6 +144,7 @@ export class Distiller {
   readonly #db: SqlDriver
   readonly #journal: Journal
   readonly #model: DistillModelPort
+  readonly #guard: PoisonGuard | undefined
   readonly #confidenceGate: number
   readonly #emotionConfidenceGate: number
   readonly #policy: LowConfidencePolicy
@@ -160,6 +156,7 @@ export class Distiller {
     this.#db = options.db
     this.#journal = options.journal
     this.#model = options.model
+    this.#guard = options.guard
     this.#confidenceGate = options.confidenceGate ?? 0.7
     this.#emotionConfidenceGate = options.emotionConfidenceGate ?? 0.6
     this.#policy = options.lowConfidencePolicy ?? 'raw'
@@ -241,6 +238,23 @@ export class Distiller {
         return 'quarantined'
       }
       // raw：照样写，但 distill_status 标 raw，UI 上会显示"未提炼/低置信"。
+    }
+
+    // 蒸馏事实也必须过 PoisonGuard：模型可能把 transcript 里的危险内容
+    // 提炼成"看似正常"的事实，绕过导入时的隔离（终审 P2-8）。
+    if (this.#guard) {
+      try {
+        const guarded = await this.#guard.guard({
+          scope: input.scope,
+          text: fact.text,
+          kind: fact.kind,
+          source: 'agent',
+          subjectKey: fact.subjectKey,
+        })
+        if (guarded.quarantineId) return 'quarantined'
+      } catch (error) {
+        this.#onWarn(`防投毒检查失败，放行：${error instanceof Error ? error.message : String(error)}`)
+      }
     }
 
     const emotion =

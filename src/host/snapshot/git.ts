@@ -19,6 +19,17 @@ export interface GitResult {
   readonly stderr: string
 }
 
+/**
+ * 原始字节结果：校验通道（restore 的 sha256 比对）要用它，不能用 `GitResult`——
+ * 后者把 stdout 用 `String()` 转成 utf8，二进制/大文件会被 utf8 往返破坏，导致
+ * 「快照本身完好但校验算出的哈希对不上」→ 误判 snapshot-corrupt（终审 P1-7）。
+ */
+export interface GitRawResult {
+  readonly code: number
+  readonly stdout: Buffer
+  readonly stderr: string
+}
+
 export interface GitRunOptions {
   /** 工作目录；缺省用 runner 自己的。 */
   readonly cwd?: string
@@ -30,6 +41,8 @@ export interface GitRunOptions {
 
 export interface GitRunner {
   run(args: readonly string[], options?: GitRunOptions): Promise<GitResult>
+  /** 原始字节返回（不转 utf8）；用于 sha256 校验二进制/大文件。测试 runner 可不实现。 */
+  runRaw?(args: readonly string[], options?: GitRunOptions): Promise<GitRawResult>
 }
 
 /** 结构化 Git 错误：调用方可以按 `code` 做分支（`git-push-failed` 等）。 */
@@ -91,6 +104,49 @@ export class ExecGitRunner implements GitRunner {
               ? ((error as { code: number }).code as number)
               : 1
           resolve({ code, stdout: String(stdout ?? ''), stderr: String(stderr ?? error.message) })
+        },
+      )
+    })
+  }
+
+  /**
+   * 原始字节返回。`run()` 会把 stdout 用 `String()` 转成 utf8，二进制/大文件会被
+   * utf8 往返破坏（P1-7：校验通道算 sha256 时对不上 → 误判 snapshot-corrupt）。
+   * 这里用 `encoding: 'buffer'` 拿原始字节，并把 maxBuffer 对齐快照预算 256MB。
+   */
+  runRaw(args: readonly string[], options: GitRunOptions = {}): Promise<GitRawResult> {
+    const configArgs: string[] = []
+    for (const [key, value] of Object.entries(options.config ?? {})) {
+      configArgs.push('-c', `${key}=${value}`)
+    }
+    const argv = [...configArgs, ...args]
+    return new Promise<GitRawResult>((resolve) => {
+      execFile(
+        'git',
+        argv,
+        {
+          cwd: options.cwd ?? this.#cwd,
+          timeout: options.timeoutMs ?? this.#timeoutMs,
+          windowsHide: true,
+          // 快照预算 256MB（engine.ts maxBytes 268_435_456），校验通道不能比它还小。
+          maxBuffer: 268_435_456,
+          encoding: 'buffer',
+          env: { ...process.env, ...options.env, GIT_TERMINAL_PROMPT: '0' },
+        },
+        (error, stdout, stderr) => {
+          const out = Buffer.isBuffer(stdout) ? stdout : Buffer.from(String(stdout ?? ''))
+          const errText = Buffer.isBuffer(stderr)
+            ? stderr.toString('utf8')
+            : String(stderr ?? error?.message ?? '')
+          if (!error) {
+            resolve({ code: 0, stdout: out, stderr: errText })
+            return
+          }
+          const code =
+            typeof (error as { code?: unknown }).code === 'number'
+              ? ((error as { code: number }).code as number)
+              : 1
+          resolve({ code, stdout: out, stderr: errText })
         },
       )
     })

@@ -158,3 +158,25 @@ test('不记录情感时不写空字段（null 就是 null，便于 UI 区分"�
   assert.equal(opened.version.emo_label, null)
   assert.equal(opened.version.emo_intensity, null)
 })
+
+test('P2-5：十二种情绪标签全部可落库，不再静默丢失 fear/surprise/gratitude/loneliness', async (t) => {
+  const h = await harness(t)
+  if (!h) return
+
+  const labels: EmotionLabel[] = [
+    'joy', 'anxiety', 'frustration', 'pride', 'curiosity', 'anger',
+    'sadness', 'neutral', 'fear', 'surprise', 'gratitude', 'loneliness',
+  ]
+  for (const label of labels) {
+    const opened = await h.tree.openVersion({
+      scope,
+      kind: 'episode',
+      subjectKey: `incident:label-${label}`,
+      text: `用户当时是 ${label} 的`,
+      validFrom: NOW,
+      emotion: { ...valid, label },
+      author: 'agent',
+    })
+    assert.equal(opened.version.emo_label, label, `标签 ${label} 必须原样落库，不能静默置 null`)
+  }
+})

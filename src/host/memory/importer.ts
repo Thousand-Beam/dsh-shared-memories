@@ -108,6 +108,9 @@ export class Importer {
     let quarantined = 0
     let skipped = 0
     let distilled = false
+    // 放行的条目单独收集：distill 分支的 transcript 只能用它们拼，
+    // 否则被 quarantine 的内容会通过蒸馏管线回流成新记忆（终审 P2-8）。
+    const accepted: typeof items = []
 
     for (const item of items) {
       const guarded = await this.#guard.guard({
@@ -140,6 +143,7 @@ export class Importer {
           distillStatus: 'raw',
         })
         written++
+        accepted.push(item)
       } catch (error) {
         skipped++
         errors.push(error instanceof Error ? error.message : String(error))
@@ -150,7 +154,8 @@ export class Importer {
       try {
         const result = await this.#distiller.distill({
           scope: input.scope,
-          transcript: items.map((item) => `- ${item.text}`).join('\n'),
+          // 只用放行的条目拼 transcript：已隔离内容绝不能进蒸馏管线回流（终审 P2-8）。
+          transcript: accepted.map((item) => `- ${item.text}`).join('\n'),
           archive: false,
         })
         if (result.error) errors.push(`distill:${result.error}`)

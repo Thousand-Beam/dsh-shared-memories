@@ -128,6 +128,10 @@ export interface MemoriesApiDeps {
     subjectKey: string
     emotion: EmotionAttribution | null
   }): Promise<void>
+  /** 隔离区「批准放行」：改状态 + 写 journal（跨设备漫游）。归属校验在 PoisonGuard 内做。 */
+  approveQuarantine?(input: { quarantineId: string; agentId: string; by: string }): Promise<void>
+  /** 隔离区「彻底销毁」：改状态 + 写 journal（跨设备漫游）。归属校验在 PoisonGuard 内做。 */
+  destroyQuarantine?(input: { quarantineId: string; agentId: string; by: string }): Promise<void>
   /** 忘记一条记忆：关闭活跃版本并置 status='forgotten'（写 journal，可跨设备漫游）。 */
   forgetMemory?(input: { entityId: string; agentId: string }): Promise<{ forgotten: boolean; exists: boolean }>
   /** 修改一条记忆的正文：开新版本，旧版本进时间树（写 journal）。 */
@@ -840,14 +844,13 @@ async function resolveQuarantine(
   const db = deps.db()
   if (!db) throw new ApiError('not-ready', '记忆库尚未就绪', 503)
   const row = db.one<{ payload: string; agent_id: string }>(
-    `SELECT payload, agent_id FROM quarantine WHERE quarantine_id = ?`,
-    [quarantineId],
+    `SELECT payload, agent_id FROM quarantine WHERE quarantine_id = ? AND workspace_id = ?`,
+    [quarantineId, deps.workspaceId],
   )
   if (!row) throw new ApiError('not-found', `隔离条目不存在：${quarantineId}`, 404)
 
   const payload = parseQuarantinePayload(row.payload)
   const reopen = deps.reopenQuarantine
-  const now = Date.now()
 
   // 先校验、后改状态：否则洗白失败会留下一条"已批准但没进记忆"的幽灵记录。
   if (approve) {
@@ -859,22 +862,10 @@ async function resolveQuarantine(
     }
   }
 
-  db.run(`UPDATE quarantine SET status = ? WHERE quarantine_id = ?`, [
-    approve ? 'approved' : 'destroyed',
-    quarantineId,
-  ])
-  db.run(
-    `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
-     VALUES (?,?,?,?,?,?)`,
-    [
-      `aud_${now.toString(36)}`,
-      deps.workspaceId,
-      row.agent_id,
-      approve ? 'quarantine.approve' : 'quarantine.destroy',
-      `${quarantineId} by ${by}`,
-      now,
-    ],
-  )
+  // 改状态（audit + journal 落账）统一走 PoisonGuard，归属校验在 guard 内做。
+  const verdict = approve ? deps.approveQuarantine : deps.destroyQuarantine
+  if (!verdict) throw new ApiError('verdict-unavailable', '当前装配未提供隔离区裁决能力', 503)
+  await verdict({ quarantineId, agentId: row.agent_id, by })
 
   if (!approve || !reopen) return
   await reopen({

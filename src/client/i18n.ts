@@ -27,7 +27,7 @@ export const KIND_LABEL: Record<string, string> = {
   relation: '关系',
 }
 
-/** 情感标签：八种基础情绪 + 兜底。 */
+/** 情感标签：十二种基础情绪。 */
 export const EMOTION_LABEL: Record<string, string> = {
   joy: '喜悦',
   anxiety: '焦虑',
@@ -120,6 +120,10 @@ export const EMOTION_ORDER = [
   'anger',
   'sadness',
   'neutral',
+  'fear',
+  'surprise',
+  'gratitude',
+  'loneliness',
 ] as const
 
 function pick(dictionary: Record<string, string>, key: string | null | undefined, fallback: string): string {

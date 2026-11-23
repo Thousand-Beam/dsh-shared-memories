@@ -333,6 +333,9 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
   /** 关机/退出前的强制快照；多次触发由 `snapshotInFlight` 合并成一次。 */
   const snapshotNow = (trigger: SnapshotTrigger): Promise<unknown> => {
     if (!runtime.snapshots) return Promise.resolve(undefined)
+    // 触发开关（终审 P2-11）：shutdown/manual 是可关闭的触发源，配置里关了就不落盘。
+    if (trigger === 'shutdown' && !config.snapshot.triggers.shutdown) return Promise.resolve(undefined)
+    if (trigger === 'manual' && !config.snapshot.triggers.manual) return Promise.resolve(undefined)
     if (barrier.phase !== 'ready') {
       warn(`恢复未就绪（${barrier.phase}），跳过 ${trigger} 快照`)
       return Promise.resolve(undefined)
@@ -632,7 +635,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           | undefined
         const snapshotId = result?.manifest?.snapshotId
         if (!snapshotId) {
-          throw new SnapshotError('snapshot-failed', '手动保存未生成快照（恢复未就绪、无痕巡检跳过或引擎失败）')
+          throw new SnapshotError('snapshot-failed', '手动保存未生成快照（manual 触发开关已关闭、恢复未就绪、无痕巡检跳过或引擎失败）')
         }
         // P0-③：把推送结果冒到 API/前端。本机 commit 成功后，若 push 分叉/失败，必须诚实
         // 暴露（pushed=false + pushReason），否则前端一直弹绿「已保存」，用户以为漫游已落地，
@@ -796,6 +799,25 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           author: 'user',
         })
         if (opened.deduped) warn(`洗白内容与现有记忆一致，未新增版本：${opened.entity.entity_id}`)
+      },
+      // 隔离区裁决（批准/销毁）：改状态 + 写 journal，归属校验在 PoisonGuard 内做。
+      // 注意 agentId 不做 identity.resolve——它来自 quarantine 表里写入时记录的 agent_id，
+      // resolve 会改写成当前 persona id，反而让 guard 的 WHERE agent_id 匹配不到原记录。
+      approveQuarantine: async (input) => {
+        if (!runtime.guard) throw new Error('记忆库尚未就绪')
+        await runtime.guard.approve(input.quarantineId, input.by, {
+          workspaceId,
+          agentId: input.agentId,
+          deviceId,
+        })
+      },
+      destroyQuarantine: async (input) => {
+        if (!runtime.guard) throw new Error('记忆库尚未就绪')
+        await runtime.guard.destroy(input.quarantineId, input.by, {
+          workspaceId,
+          agentId: input.agentId,
+          deviceId,
+        })
       },
       // 忘记一条记忆：关活跃版本 + status='forgotten'。closeAt 会写 version.close
       // journal，所以这条删除能跨设备漫游（不会在冷启动时被 journal 回放复活）。

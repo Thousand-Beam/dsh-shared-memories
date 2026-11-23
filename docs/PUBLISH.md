@@ -11,7 +11,7 @@ cd dsh-shared-memories
 
 npm ci                  # 干净装依赖
 npm run typecheck       # 两份 tsconfig 都要干净
-npm test                # 175/175
+npm test                # 184/184
 npm run build           # 产出 lib/client.js（单文件 bundle）
 npm run check:client    # 校验 __ModuleLoader__ 外壳
 
@@ -51,7 +51,7 @@ git commit -m "feat: initial release v0.1.0 — Git-native external brain for DS
 - quarantine defence against memory poisoning
 - web console: native CSS (zero CDN), fully localized zh-CN
 
-175/175 tests passing."
+184/184 tests passing."
 ```
 
 若仓库之前已有历史（本次是首次发布可跳过）：

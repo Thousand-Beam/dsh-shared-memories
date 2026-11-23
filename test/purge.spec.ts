@@ -226,3 +226,36 @@ test('P0-1 回归：真实落盘墓碑（seq=1）能进重放流并删掉另一�
   assert.ok(stats.purged >= 1, 'agent.purge 重放应执行')
   assert.equal(new ScopedQuery(dbB, { ...scope, deviceId: 'dev-b' }).stats().entities, 0, '墓碑重放后 B 的记忆应被删掉')
 })
+
+test('P1-8：withGate 包裹 purge 改写期间，并发 append 不丢记录', async (t) => {
+  const db = await openTestDb(t)
+  if (db === undefined) return
+  const root = await tempRoot(t, 'purge-gate-')
+  const journal = new Journal({ root, deviceId: 'dev-a' })
+  await journal.open()
+  const tree = new TemporalTree(db, journal)
+  const scopeA = { workspaceId: WORKSPACE, agentId: 'session-a', deviceId: 'dev-a' }
+  const scopeB = { workspaceId: WORKSPACE, agentId: 'session-b', deviceId: 'dev-a' }
+  await tree.openVersion({ scope: scopeA, kind: 'fact', subjectKey: 'a', text: 'A 的秘密', author: 'user', trust: 1 })
+  await tree.openVersion({ scope: scopeB, kind: 'fact', subjectKey: 'b', text: 'B 的真相', author: 'user', trust: 1 })
+
+  // 模拟 index.ts purge 闭包：flush → withGate(purgeAgent)，期间并发 append。
+  await journal.flush()
+  let pending: Promise<unknown> | undefined
+  await journal.withGate(async () => {
+    // purge 改写前先发起一条「其它 agent」的并发 append，它会挂在 gate 上等释放。
+    pending = tree.openVersion({ scope: scopeB, kind: 'fact', subjectKey: 'b2', text: 'B 在 purge 期间的真相', author: 'user', trust: 1 })
+    // 让 append 真正进入 #appendOne 的 gate 等待（而非仍停在 append() 的队列链上）。
+    await new Promise((r) => setTimeout(r, 10))
+    return purgeAgent({ db, root, workspaceId: WORKSPACE, agentId: 'session-a' })
+  })
+  await pending
+
+  // purge 物理抹除的是 A 的记录；B 的原有记录与「purge 期间并发 append」的那条都不能丢——
+  // 若 rename 静默覆盖了并发 append，这里 B 的真相就会消失。
+  const file = join(root, 'journal', 'devices', 'dev-a', `${new Date().toISOString().slice(0, 10)}.jsonl`)
+  const text = await readFile(file, 'utf8')
+  assert.equal(text.includes('A 的秘密'), false, 'A 的记录应被抹除')
+  assert.ok(text.includes('B 的真相'), 'B 原有记录保留')
+  assert.ok(text.includes('B 在 purge 期间的真相'), 'purge 期间并发 append 的记录不能被 rename 覆盖')
+})

@@ -251,7 +251,11 @@ export class PoisonGuard {
   async approve(quarantineId: string, by: string, scope: Scope): Promise<void> {
     const now = this.#clock()
     this.#db.transaction(() => {
-      this.#db.run(`UPDATE quarantine SET status = 'approved' WHERE quarantine_id = ?`, [quarantineId])
+      // 归属校验：只允许裁决属于自己 workspace+agent 的隔离条目，防止跨会话越权改状态。
+      this.#db.run(
+        `UPDATE quarantine SET status = 'approved' WHERE quarantine_id = ? AND workspace_id = ? AND agent_id = ?`,
+        [quarantineId, scope.workspaceId, scope.agentId],
+      )
       this.#db.run(
         `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
          VALUES (?,?,?,?,?,?)`,
@@ -265,15 +269,25 @@ export class PoisonGuard {
         ],
       )
     })
+    // 落账：approve 状态变更进 journal，才能跨设备漫游（否则重放后隔离区停在 pending）。
+    await this.#journal.append({
+      op: 'quarantine.approve',
+      quarantineId,
+      workspaceId: scope.workspaceId,
+      agentId: scope.agentId,
+      by,
+      at: now,
+    })
   }
 
   /** 彻底销毁：内容保留在表里（status=destroyed），只是永不注入。 */
   async destroy(quarantineId: string, by: string, scope: Scope): Promise<void> {
     const now = this.#clock()
     this.#db.transaction(() => {
-      this.#db.run(`UPDATE quarantine SET status = 'destroyed' WHERE quarantine_id = ?`, [
-        quarantineId,
-      ])
+      this.#db.run(
+        `UPDATE quarantine SET status = 'destroyed' WHERE quarantine_id = ? AND workspace_id = ? AND agent_id = ?`,
+        [quarantineId, scope.workspaceId, scope.agentId],
+      )
       this.#db.run(
         `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
          VALUES (?,?,?,?,?,?)`,
@@ -286,6 +300,14 @@ export class PoisonGuard {
           now,
         ],
       )
+    })
+    await this.#journal.append({
+      op: 'quarantine.destroy',
+      quarantineId,
+      workspaceId: scope.workspaceId,
+      agentId: scope.agentId,
+      by,
+      at: now,
     })
   }
 

@@ -160,7 +160,7 @@ export interface Config {
     allowGlobalSearch: boolean
     /** 全局令牌有效期，毫秒。 */
     globalSearchTtlMs: number
-    /** 全局检索必须落审计。 */
+    /** 全局检索必须落审计（暂未生效）。 */
     requireAudit: boolean
   }
 
@@ -234,12 +234,12 @@ export const Config: Schema<Config> = Schema.object({
       Schema.const('token-ref').description('从 DSH credentials 取引用令牌'),
     ])
       .default('ssh-agent')
-      .description('Git 认证方式。'),
+      .description('Git 认证方式（暂未生效）。'),
     credentialRef: Schema.string()
       .default('shared-memories/git-token')
       .role('secret-ref')
-      .description('凭据引用名（不是令牌本身），由 DSH credentials 服务解析。'),
-    autoInit: Schema.boolean().default(true).description('目录为空时自动 git init。'),
+      .description('凭据引用名（不是令牌本身），由 DSH credentials 服务解析（暂未生效）。'),
+    autoInit: Schema.boolean().default(true).description('目录为空时自动 git init（暂未生效）。'),
     authorName: Schema.string().default('dsh-shared-memories').description('commit 署名。'),
     authorEmail: Schema.string()
       .default('shared-memories@localhost')
@@ -273,7 +273,7 @@ export const Config: Schema<Config> = Schema.object({
       shutdown: Schema.boolean().default(true).description('退出/关机触发。'),
       manual: Schema.boolean().default(true).description('手动按钮触发。'),
     }).description('触发开关'),
-    includeSessionLogs: Schema.boolean().default(true).description('快照是否包含工作区会话上下文。'),
+    includeSessionLogs: Schema.boolean().default(true).description('快照是否包含工作区会话上下文（暂未生效）。'),
     maxBytes: Schema.natural()
       .min(1_048_576)
       .max(2_147_483_648)
@@ -296,50 +296,50 @@ export const Config: Schema<Config> = Schema.object({
 
   memory: Schema.object({
     retrieval: Schema.object({
-      keywordWeight: Schema.number().min(0).max(1).default(0.45).description('关键词召回权重。'),
-      vectorWeight: Schema.number().min(0).max(1).default(0.4).description('向量召回权重。'),
-      recencyWeight: Schema.number().min(0).max(1).default(0.15).description('新鲜度权重。'),
-      topK: Schema.natural().min(1).max(100).default(8).description('最终返回条数。'),
-      candidatePool: Schema.natural().min(8).max(1_000).default(64).description('rerank 候选池大小。'),
-      rerank: Schema.boolean().default(true).description('是否做精排。'),
-      rerankModel: Schema.string().default('').description('精排模型；留空复用当前会话模型。'),
+      keywordWeight: Schema.number().min(0).max(1).default(0.45).description('关键词召回权重（暂未生效）。'),
+      vectorWeight: Schema.number().min(0).max(1).default(0.4).description('向量召回权重（暂未生效）。'),
+      recencyWeight: Schema.number().min(0).max(1).default(0.15).description('新鲜度权重（暂未生效）。'),
+      topK: Schema.natural().min(1).max(100).default(8).description('最终返回条数（暂未生效）。'),
+      candidatePool: Schema.natural().min(8).max(1_000).default(64).description('rerank 候选池大小（暂未生效）。'),
+      rerank: Schema.boolean().default(true).description('是否做精排（暂未生效）。'),
+      rerankModel: Schema.string().default('').description('精排模型；留空复用当前会话模型（暂未生效）。'),
       injectTopK: Schema.natural().min(0).max(20).default(6)
         .description('每轮按当前消息召回并注入提示词的条数；0 = 关闭逐轮召回。'),
       injectChars: Schema.natural().min(200).max(8_000).default(900)
         .description('逐轮召回段的总字符预算；超预算的条目直接丢弃。'),
     }).description('混合召回'),
     forgetting: Schema.object({
-      requestRetention: Schema.number().min(0.5).max(0.99).default(0.9).description('目标留存率。'),
-      maxIntervalDays: Schema.natural().min(30).max(36_500).default(365).description('最大复习间隔。'),
-      fsrsWeights: Schema.array(Schema.number()).default(FSRS5_DEFAULT).description('FSRS-5 权重（19 项）。'),
-      pruneBelow: Schema.number().min(0).max(1).default(0.15).description('夜间整理修剪阈值。'),
-      stalePenalty: Schema.number().min(0).max(1).default(0.5).description('长期未召回的记忆衰减倍率。'),
+      requestRetention: Schema.number().min(0.5).max(0.99).default(0.9).description('目标留存率（暂未生效）。'),
+      maxIntervalDays: Schema.natural().min(30).max(36_500).default(365).description('最大复习间隔（暂未生效）。'),
+      fsrsWeights: Schema.array(Schema.number()).default(FSRS5_DEFAULT).description('FSRS-5 权重（19 项）（暂未生效）。'),
+      pruneBelow: Schema.number().min(0).max(1).default(0.15).description('夜间整理修剪阈值（暂未生效）。'),
+      stalePenalty: Schema.number().min(0).max(1).default(0.5).description('长期未召回的记忆衰减倍率（暂未生效）。'),
     }).description('遗忘曲线'),
     distill: Schema.object({
-      enabled: Schema.boolean().default(true).description('归档时是否允许深度提炼。'),
-      model: Schema.string().default('').description('蒸馏模型；留空复用当前会话模型。'),
-      confidenceGate: Schema.number().min(0).max(1).default(0.7).description('记忆置信度闸门。'),
+      enabled: Schema.boolean().default(true).description('归档时是否允许深度提炼（暂未生效）。'),
+      model: Schema.string().default('').description('蒸馏模型；留空复用当前会话模型（暂未生效）。'),
+      confidenceGate: Schema.number().min(0).max(1).default(0.7).description('记忆置信度闸门（暂未生效）。'),
       emotionConfidenceGate: Schema.number().min(0).max(1).default(0.6).description('情感标签置信度闸门。'),
-      maxInputChars: Schema.natural().min(1_000).max(200_000).default(24_000).description('单次蒸馏输入上限。'),
-      temperature: Schema.number().min(0).max(1).default(0).description('蒸馏温度，建议 0。'),
+      maxInputChars: Schema.natural().min(1_000).max(200_000).default(24_000).description('单次蒸馏输入上限（暂未生效）。'),
+      temperature: Schema.number().min(0).max(1).default(0).description('蒸馏温度，建议 0（暂未生效）。'),
     }).description('归档蒸馏'),
     consolidate: Schema.object({
-      enabled: Schema.boolean().default(true).description('夜间整理总开关。'),
-      cron: Schema.string().default('0 3 * * *').description('整理任务 cron。'),
-      mergeSimilarity: Schema.number().min(0.5).max(1).default(0.92).description('判定重复的相似度阈值。'),
-      maxOpsPerRun: Schema.natural().min(1).max(5_000).default(200).description('单次整理最大操作数。'),
+      enabled: Schema.boolean().default(true).description('夜间整理总开关（暂未生效）。'),
+      cron: Schema.string().default('0 3 * * *').description('整理任务 cron（暂未生效）。'),
+      mergeSimilarity: Schema.number().min(0.5).max(1).default(0.92).description('判定重复的相似度阈值（暂未生效）。'),
+      maxOpsPerRun: Schema.natural().min(1).max(5_000).default(200).description('单次整理最大操作数（暂未生效）。'),
     }).description('夜间整理'),
   }).description('记忆引擎'),
 
   isolation: Schema.object({
-    strict: Schema.boolean().default(true).description('强制注入 workspace 过滤；仅测试可关。'),
+    strict: Schema.boolean().default(true).description('强制注入 workspace 过滤；仅测试可关（暂未生效）。'),
     allowGlobalSearch: Schema.boolean().default(false).description('是否允许手动开启全局检索。'),
     globalSearchTtlMs: Schema.natural()
       .min(30_000)
       .max(86_400_000)
       .default(600_000)
       .description('全局检索令牌有效期。'),
-    requireAudit: Schema.boolean().default(true).description('全局检索必须落审计。'),
+    requireAudit: Schema.boolean().default(true).description('全局检索必须落审计（暂未生效）。'),
   }).description('工作区隔离'),
 
   identity: Schema.object({
@@ -356,26 +356,26 @@ export const Config: Schema<Config> = Schema.object({
   }).description('会话身份与人格身份'),
 
   persona: Schema.object({
-    enabled: Schema.boolean().default(true).description('是否启用涌现式人格。'),    startAge: Schema.natural().min(1).max(100).default(10).description(
-      '内部字段 age 的初值：只存库、随快照漫游，不参与提示渲染（人格由 traits 驱动）。',
+    enabled: Schema.boolean().default(true).description('是否启用涌现式人格（暂未生效）。'),    startAge: Schema.natural().min(1).max(100).default(10).description(
+      '内部字段 age 的初值：只存库、随快照漫游，不参与提示渲染（人格由 traits 驱动）。暂未生效。',
     ),
-    traitShiftMax: Schema.number().min(0).max(0.2).default(0.05).description('单次特质最大位移。'),
+    traitShiftMax: Schema.number().min(0).max(0.2).default(0.05).description('单次特质最大位移（暂未生效）。'),
     baselineNotice: Schema.string()
       .default('不做危害性行为；不提供外挂/绕过类帮助；不伪造身份与凭据。')
       .description('底层底线声明，注入 System Prompt 末尾。'),
-    requireRuleConfirmation: Schema.boolean().default(true).description('踩坑升格为规则需用户确认。'),
+    requireRuleConfirmation: Schema.boolean().default(true).description('踩坑升格为规则需用户确认（暂未生效）。'),
   }).description('人格'),
 
   poison: Schema.object({
-    enabled: Schema.boolean().default(true).description('是否启用污染防御。'),
+    enabled: Schema.boolean().default(true).description('是否启用污染防御（暂未生效）。'),
     trustBySource: Schema.object({
       user: Schema.number().min(0).max(1).default(1).description('用户显式输入。'),
       agent: Schema.number().min(0).max(1).default(0.6).description('代理推断。'),
       import: Schema.number().min(0).max(1).default(0.4).description('外部导入。'),
       external: Schema.number().min(0).max(1).default(0.25).description('网页/工具抓取。'),
     }).description('来源信任度'),
-    divergenceThreshold: Schema.number().min(0).max(1).default(0.35).description('人格偏离阈值。'),
-    autoQuarantine: Schema.boolean().default(true).description('超阈值自动进隔离区。'),
+    divergenceThreshold: Schema.number().min(0).max(1).default(0.35).description('人格偏离阈值（暂未生效）。'),
+    autoQuarantine: Schema.boolean().default(true).description('超阈值自动进隔离区（暂未生效）。'),
   }).description('污染防御'),
 
   conflict: Schema.object({
@@ -385,8 +385,8 @@ export const Config: Schema<Config> = Schema.object({
       Schema.const('manual').description('全部挂起等用户决定'),
     ])
       .default('keep-both')
-      .description('多端冲突解决策略。'),
-    maxBranches: Schema.natural().min(2).max(32).default(8).description('单实体允许的冲突分支上限。'),
+      .description('多端冲突解决策略（暂未生效）。'),
+    maxBranches: Schema.natural().min(2).max(32).default(8).description('单实体允许的冲突分支上限（暂未生效）。'),
   }).description('冲突解决'),
 })
 

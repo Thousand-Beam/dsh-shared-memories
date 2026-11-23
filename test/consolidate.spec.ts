@@ -148,3 +148,28 @@ test('dryRun 只出报告，一行都不改', async (t) => {
     'dryRun 动数据就等于"预览"变成了"执行"',
   )
 })
+
+test('P2-9：合并判决写 entity.merge journal 记录', async (t) => {
+  const db = await openTestDb(t)
+  if (!db) return
+  const root = await tempRoot(t)
+  const journal = new Journal({ root, deviceId: 'dev-a' })
+  await journal.open()
+
+  await seed(db, [
+    { id: 'm1', kind: 'fact', subject: 'p.a', text: '重复的事实内容', trust: 0.9 },
+    { id: 'm2', kind: 'fact', subject: 'p.b', text: '重复的事实内容', trust: 0.5 },
+  ])
+
+  const report = new Consolidator({ db, journal }).run({ workspaceId: WS, agentId: AGENT })
+  assert.ok(report.deduped + report.merged >= 1, '同文必须触发一次合并')
+
+  await journal.flush()
+  const records = await journal.readMerged()
+  const merge = records.find((record) => record.op === 'entity.merge')
+  assert.ok(merge, '合并必须写 entity.merge 记录，否则换机后 loser 又活回来')
+  assert.equal(merge.entityId, 'm2', 'loser 是 trust 低的那条')
+  assert.equal(merge.mergedInto, 'm1', 'keeper 是 trust 高的那条')
+  assert.equal(merge.workspaceId, WS)
+  assert.equal(merge.agentId, AGENT)
+})

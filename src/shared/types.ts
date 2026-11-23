@@ -34,6 +34,10 @@ export type EmotionLabel =
   | 'anger'
   | 'sadness'
   | 'neutral'
+  | 'fear'
+  | 'surprise'
+  | 'gratitude'
+  | 'loneliness'
 
 /**
  * 同一份枚举的运行时副本。
@@ -51,6 +55,10 @@ export const EMOTION_LABELS = [
   'anger',
   'sadness',
   'neutral',
+  'fear',
+  'surprise',
+  'gratitude',
+  'loneliness',
 ] as const
 
 export function isEmotionLabel(value: unknown): value is EmotionLabel {

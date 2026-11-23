@@ -69,6 +69,7 @@ interface ReplayStats {
   entities: number
   versions: number
   closed: number
+  merged: number
   forgotten: number
   emotions: number
   quarantined: number
@@ -90,8 +91,21 @@ interface ReplayStats {
 export class ReplayApplier {
   readonly #db: SqlDriver
 
+  /**
+   * 跨设备同 subject 双建实体的别名映射：两台设备各自为同一
+   * (workspace, agent, content_hash) 生成不同的 entityId（uuid），重放时第二条
+   * entity.upsert 会撞 uq_entity_identity 唯一索引。这里把「后到的 entityId」映射到
+   * 「先落库的规范化 entityId」，后续 version.* 记录引用它时解析回同一个实体，
+   * 两条设备线在重放后合并，而不是让重放事务回滚 → 双机 degraded（终审 P1-6）。
+   */
+  readonly #entityAlias = new Map<string, string>()
+
   constructor(db: SqlDriver) {
     this.#db = db
+  }
+
+  #resolveEntity(entityId: string): string {
+    return this.#entityAlias.get(entityId) ?? entityId
   }
 
   apply(records: readonly JournalRecord[]): ReplayStats {
@@ -100,6 +114,7 @@ export class ReplayApplier {
       entities: 0,
       versions: 0,
       closed: 0,
+      merged: 0,
       forgotten: 0,
       emotions: 0,
       quarantined: 0,
@@ -143,6 +158,36 @@ export class ReplayApplier {
             }
             this.#upsertEntity(record)
             stats.entities++
+            break
+          }
+          case 'entity.merge': {
+            // 夜间整理把 loser 并入 keeper：这条判决必须跟着漫游，否则换机后
+            // 被合并的实体又"活"回来，时间树与幸存版本都对不上（终审 P2-9）。
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
+            const entityId = str(record.entityId)
+            const mergedInto = str(record.mergedInto)
+            if (!entityId || !mergedInto) {
+              stats.skipped++
+              break
+            }
+            const loserId = this.#resolveEntity(entityId)
+            const keeperId = this.#resolveEntity(mergedInto)
+            this.#run(`UPDATE memory_entity SET status = 'merged', updated_at = ? WHERE entity_id = ?`, [
+              record.at,
+              loserId,
+            ])
+            this.#run(`UPDATE memory_version SET valid_until = ? WHERE entity_id = ? AND valid_until IS NULL`, [
+              record.at,
+              loserId,
+            ])
+            this.#run(
+              `UPDATE memory_version SET supersedes = COALESCE(supersedes, ?) WHERE entity_id = ? AND valid_until IS NULL`,
+              [loserId, keeperId],
+            )
+            stats.merged++
             break
           }
           case 'version.open': {
@@ -211,11 +256,12 @@ export class ReplayApplier {
             break
           }
           case 'memory.forget': {
-            const entityId = str(record.entityId)
-            if (!entityId) {
+            const rawEntityId = str(record.entityId)
+            if (!rawEntityId) {
               stats.skipped++
               break
             }
+            const entityId = this.#resolveEntity(rawEntityId)
             this.#run(`UPDATE memory_entity SET status = 'forgotten', updated_at = ? WHERE entity_id = ?`, [
               record.at,
               entityId,
@@ -260,6 +306,26 @@ export class ReplayApplier {
               ],
             )
             stats.quarantined++
+            break
+          }
+          case 'quarantine.approve':
+          case 'quarantine.destroy': {
+            if (isPurged(str(record.workspaceId), str(record.agentId), num(record.lc) ?? 0)) {
+              stats.skipped++
+              break
+            }
+            // 裁决结果必须跨设备漫游：A 机洗白/销毁了某条隔离记录，B 机重放后不能还停在 pending。
+            const quarantineId = str(record.quarantineId)
+            const workspaceId = str(record.workspaceId)
+            const agentId = str(record.agentId)
+            if (!quarantineId || !workspaceId || !agentId) {
+              stats.skipped++
+              break
+            }
+            this.#run(
+              `UPDATE quarantine SET status = ? WHERE quarantine_id = ? AND workspace_id = ? AND agent_id = ?`,
+              [record.op === 'quarantine.approve' ? 'approved' : 'destroyed', quarantineId, workspaceId, agentId],
+            )
             break
           }
           case 'skill.bind': {
@@ -489,12 +555,47 @@ export class ReplayApplier {
   #upsertEntity(record: JournalRecord): void {
     const entityId = str(record.entityId)
     if (!entityId) return
+    const workspaceId = str(record.workspaceId) ?? ''
+    const agentId = str(record.agentId) ?? ''
+    const kind = str(record.kind) ?? 'fact'
+    const subjectKey = str(record.subjectKey) ?? ''
+    const canonical = str(record.canonical) ?? ''
+    const salience = num(record.salience) ?? 0.5
+    const trust = num(record.trust) ?? 0.6
+    const status = str(record.status) ?? 'active'
+    // 指纹在写入侧算好；这里用 entityId 兜底，保证 NOT NULL 约束不炸。
+    const contentHash = str(record.contentHash) ?? entityId
+    const device = str(record.deviceId) ?? record.device
+
+    // P1-6：跨设备同 subject 双建实体。两台设备各自为同一 (workspace, agent, content_hash)
+    // 生成不同的 entityId（uuid），第二条 INSERT 若只写 `ON CONFLICT(entity_id)` 会撞
+    // uq_entity_identity 唯一索引（冲突目标是三元组，不是主键 entity_id）→ 约束冲突异常 →
+    // 整个重放事务回滚 → 双机 degraded，且每次重试再炸。这里先查规范化实体：已存在则把
+    // 当前 entityId 记入别名映射，后续 version.* 记录引用它时解析回先落库的实体，
+    // 两条设备线在重放后合并到同一个实体，而不是互相撞索引。
+    const existing = this.#db.one<{ entity_id: string }>(
+      `SELECT entity_id FROM memory_entity WHERE workspace_id = ? AND agent_id = ? AND content_hash = ?`,
+      [workspaceId, agentId, contentHash],
+    )
+
+    if (existing && existing.entity_id !== entityId) {
+      this.#entityAlias.set(entityId, existing.entity_id)
+      // 合并到已有实体：内容取后写的（重放按 lc 因果序，后到的是更新）。
+      this.#run(
+        `UPDATE memory_entity SET
+           canonical = ?, salience = ?, trust = ?, status = ?, updated_at = ?
+         WHERE entity_id = ?`,
+        [canonical, salience, trust, status, record.at, existing.entity_id],
+      )
+      return
+    }
+
     this.#run(
       `INSERT INTO memory_entity (
          entity_id, workspace_id, agent_id, kind, subject_key, canonical,
          salience, trust, status, content_hash, created_at, updated_at, device_id
        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(entity_id) DO UPDATE SET
+       ON CONFLICT(workspace_id, agent_id, content_hash) DO UPDATE SET
          canonical = excluded.canonical,
          salience  = excluded.salience,
          trust     = excluded.trust,
@@ -502,27 +603,29 @@ export class ReplayApplier {
          updated_at = excluded.updated_at`,
       [
         entityId,
-        str(record.workspaceId) ?? '',
-        str(record.agentId) ?? '',
-        str(record.kind) ?? 'fact',
-        str(record.subjectKey) ?? '',
-        str(record.canonical) ?? '',
-        num(record.salience) ?? 0.5,
-        num(record.trust) ?? 0.6,
-        str(record.status) ?? 'active',
-        // 指纹在写入侧算好；这里用 entityId 兜底，保证 NOT NULL 约束不炸。
-        str(record.contentHash) ?? entityId,
+        workspaceId,
+        agentId,
+        kind,
+        subjectKey,
+        canonical,
+        salience,
+        trust,
+        status,
+        contentHash,
         record.at,
         record.at,
-        str(record.deviceId) ?? record.device,
+        device,
       ],
     )
   }
 
   #openVersion(record: JournalRecord): void {
     const versionId = str(record.versionId)
-    const entityId = str(record.entityId)
-    if (!versionId || !entityId) return
+    const rawEntityId = str(record.entityId)
+    if (!versionId || !rawEntityId) return
+    // P1-6：entity.upsert 已把「跨设备同 subject 双建」的 entityId 记入别名映射，
+    // 这里解析回先落库的规范化实体，version 挂在合并后的实体下，不炸外键。
+    const entityId = this.#resolveEntity(rawEntityId)
     const emotion = record.emotion as
       | { subject?: unknown; trigger?: unknown; label?: unknown; intensity?: unknown; confidence?: unknown }
       | null
@@ -605,6 +708,7 @@ export function detectConcurrentWrites(
   const targetKey = (record: JournalRecord): string | null => {
     switch (record.op) {
       case 'entity.upsert':
+      case 'entity.merge':
       case 'version.open':
       case 'version.close':
       case 'version.emotion':
@@ -1081,9 +1185,14 @@ export class RestoreEngine {
     const ref = `snap/${snapshotId}`
     let checked = 0
     for (const entry of manifest.files) {
-      const show = await this.#git.run(['show', `${ref}:${entry.path}`], {
-        timeoutMs: this.#timeoutMs,
-      })
+      // P1-7：用 runRaw 拿原始字节再算 sha256。旧代码走 run()（stdout 被 String() 转成
+      // utf8）+ Buffer.from(stdout,'utf8') 二次往返，二进制文件（被快照进去的附件、压缩
+      // 文件）会算错哈希 → 误判 snapshot-corrupt 整机降级；超过 8MB 更会 maxBuffer 超限。
+      // runRaw 用 encoding:buffer + 256MB 上限，字节不丢。测试 runner 没实现 runRaw 时
+      // 回退到 run()，行为与旧版一致。
+      const show = this.#git.runRaw
+        ? await this.#git.runRaw(['show', `${ref}:${entry.path}`], { timeoutMs: this.#timeoutMs })
+        : await this.#git.run(['show', `${ref}:${entry.path}`], { timeoutMs: this.#timeoutMs })
       if (show.code !== 0) {
         // 清单超前于提交：v0.5.8 及更早的 snapshot 把「capture 之后消失 / 被 exclude
         // 挡住」的文件也写进了清单，提交里却没有它。这种条目不该判死——工作区里同一
@@ -1101,7 +1210,8 @@ export class RestoreEngine {
           entry,
         )
       }
-      const digest = createHash('sha256').update(Buffer.from(show.stdout, 'utf8')).digest('hex')
+      const bytes = Buffer.isBuffer(show.stdout) ? show.stdout : Buffer.from(show.stdout, 'utf8')
+      const digest = createHash('sha256').update(bytes).digest('hex')
       if (digest !== entry.sha256) {
         throw new RestoreError(
           'snapshot-corrupt',

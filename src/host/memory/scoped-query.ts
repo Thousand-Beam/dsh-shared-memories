@@ -31,6 +31,7 @@ import type {
   MemoryKind,
   SqlDriver,
 } from '../../shared/types.js'
+import { EMOTION_LABELS } from '../../shared/types.js'
 
 /** 三路召回权重；总和会被归一化，因此不必手动凑成 1。 */
 export interface RetrievalWeights {
@@ -423,17 +424,6 @@ function keywordScore(seed: MemoryHitSeed, terms: readonly string[]): number {
   }
   return clamp01(hits / terms.length)
 }
-
-const EMOTION_LABELS: readonly EmotionLabel[] = [
-  'joy',
-  'anxiety',
-  'frustration',
-  'pride',
-  'curiosity',
-  'anger',
-  'sadness',
-  'neutral',
-]
 
 /** 数据库的平铺情感列还原成结构化对象；任一字段缺失即整体为 null。 */
 function toEmotion(row: Row): EmotionAttribution | null {

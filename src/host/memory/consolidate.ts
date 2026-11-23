@@ -194,6 +194,16 @@ export class Consolidator {
         [loser.entity_id, keeper.entity_id],
       )
     })
+    // 合并判决必须写 journal 才能跨设备漫游：否则 B 机冷启动重放时 loser 仍是
+    // active，时间树与幸存版本的 supersedes 都对不上（终审 P2-9）。
+    void this.#journal.append({
+      op: 'entity.merge',
+      entityId: loser.entity_id,
+      mergedInto: keeper.entity_id,
+      workspaceId: loser.workspace_id,
+      agentId: loser.agent_id,
+      at: now,
+    })
   }
 
   /** ③：挑出可以修剪的实体 id。 */

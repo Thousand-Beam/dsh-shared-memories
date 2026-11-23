@@ -22,24 +22,12 @@ import type {
   Author,
   DistillStatus,
   EmotionAttribution,
-  EmotionLabel,
   EntityRow,
   MemoryKind,
   SqlDriver,
   VersionRow,
 } from '../../shared/types.js'
-
-/** 情感标签白名单，与 DDL 的 CHECK 约束保持一致。 */
-const EMOTION_LABELS: readonly EmotionLabel[] = [
-  'joy',
-  'anxiety',
-  'frustration',
-  'pride',
-  'curiosity',
-  'anger',
-  'sadness',
-  'neutral',
-]
+import { EMOTION_LABELS } from '../../shared/types.js'
 
 /** 打开（或新建）一个版本时的输入。 */
 export interface OpenVersionInput {
