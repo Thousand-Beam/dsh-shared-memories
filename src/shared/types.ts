@@ -103,6 +103,8 @@ export interface EntityRow {
   created_at: number
   updated_at: number
   device_id: string
+  /** 复现计数：同 subject 再次写入时 +1，封顶 64。召回权重 log2(1+rc)/2 用它。 */
+  reinforce_count: number
 }
 
 /** memory_version 行，时间树的一段 [valid_from, valid_until)。 */

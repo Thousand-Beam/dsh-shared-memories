@@ -378,6 +378,7 @@ function EmotionDialog(props: {
     try {
       await api.fixEmotion({
         versionId: props.memory.versionId,
+        agentId: props.memory.agentId,
         label,
         subject: subject.trim() === '' ? undefined : subject.trim(),
         trigger: trigger.trim() === '' ? undefined : trigger.trim(),

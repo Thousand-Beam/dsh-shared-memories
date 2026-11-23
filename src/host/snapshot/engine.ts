@@ -23,6 +23,7 @@ import type { SkillBinding } from '../../shared/skills.js'
 import { normalizeBindings } from '../../shared/skills.js'
 import type { UserProfile } from '../../shared/user-profile.js'
 import type { PersonaIdentity } from '../../shared/persona-identity.js'
+import type { Journal } from '../../shared/journal.js'
 import {
   assertGitOk,
   backoffDelay,
@@ -106,6 +107,11 @@ export interface SnapshotEngineOptions {
   readonly clock?: () => number
   readonly onWarn?: (message: string) => void
   readonly sleep?: SleepFn
+  /**
+   * 日志实例（可选）：rollback 需要它追加「截断墓碑」（D-03）。不传时回退仍可用，
+   * 只是冷启动重放可能把回退点之后跨天写出的 untracked 分片又读回来。
+   */
+  readonly journal?: Journal
   /** 采集当前多智能体状态；缺省只快照磁盘上已有文件。 */
   readonly collectState?: () => Promise<SnapshotState> | SnapshotState
 }
@@ -156,6 +162,7 @@ export class SnapshotEngine {
   readonly #clock: () => number
   readonly #onWarn: (message: string) => void
   readonly #sleep: SleepFn
+  readonly #journal: Journal | undefined
   readonly #collectState: (() => Promise<SnapshotState> | SnapshotState) | undefined
 
   constructor(options: SnapshotEngineOptions) {
@@ -175,6 +182,7 @@ export class SnapshotEngine {
     this.#clock = options.clock ?? Date.now
     this.#onWarn = options.onWarn ?? (() => {})
     this.#sleep = options.sleep ?? defaultSleep
+    this.#journal = options.journal
     this.#collectState = options.collectState
   }
 
@@ -632,6 +640,13 @@ export class SnapshotEngine {
     const tag = `snap/${snapshotId}`
     const checkout = await this.#git.run(['checkout', tag, '--', '.'])
     assertGitOk(checkout, ['checkout', tag], 'git-checkout-failed')
+
+    // D-03：回退点之后跨天写出的 journal 分片是 untracked 文件，上面的 checkout 不会删它，
+    // #stageLocal 的 `git add -A` 反而会把它收进 revert 提交——冷启动 readMerged 全量重读
+    // 所有分片，回退点之后的记忆又「复活」。这里追加一条截断墓碑，标记本机在回退点的
+    // seq 高水位，readMerged 重放时据此丢弃本机 seq 更大的记录。
+    await this.#appendTruncateTombstone(snapshotId)
+
     // checkout 会把「目标快照里不存在」的外设备账本从工作区抹掉，若直接 add -A，
     // revert 提交会顺手删除他机文件（P1-④ 同源）。用 #stageLocal：本机回退本机的，
     // 外设备索引条目恢复原状。
@@ -669,6 +684,35 @@ export class SnapshotEngine {
     for (const name of ['memory.db', 'memory.db-wal', 'memory.db-shm']) {
       await rm(join(this.#root, name), { force: true })
     }
+  }
+
+  /**
+   * D-03：回退时追加截断墓碑。标记「本机在回退点的 seq 高水位」，冷启动 readMerged
+   * 据此丢弃本机 seq 更大的记录，堵住「回退点之后跨天写出的 untracked 分片被 add -A
+   * 收进 revert 提交 → 全量重放复活」的洞。读不到 manifest 不阻断回退（墓碑写不出最多
+   * 是回退假成功，比回退直接失败轻得多），只告警。
+   */
+  async #appendTruncateTombstone(snapshotId: string): Promise<void> {
+    if (!this.#journal) return
+    let floor = 0
+    let createdAt = this.#clock()
+    try {
+      const manifest = await readManifest(this.#root, snapshotId)
+      floor = manifest.journalSeq?.[this.#deviceId] ?? 0
+      createdAt = manifest.createdAt ?? createdAt
+    } catch (error) {
+      this.#onWarn(
+        `回退截断墓碑读取快照水位失败（${error instanceof Error ? error.message : String(error)}）：` +
+          '回退仍继续，但回退点之后跨天写出的记忆可能在下次冷启动复活。',
+      )
+      return
+    }
+    await this.#journal.append({
+      op: 'journal.truncate',
+      truncateSeq: floor,
+      truncateAt: createdAt,
+      snapshotId,
+    })
   }
 
   // ── 内部 ────────────────────────────────────────────────────────────────

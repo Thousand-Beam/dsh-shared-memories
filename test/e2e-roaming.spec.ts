@@ -117,6 +117,8 @@ async function bootDeviceA(t: TestContext, bare: string): Promise<DeviceA | unde
     // 真等待会让 push 首次失败时把测试时间拖到秒级，CI 上更会因事件循环短暂
     // 变空被 node:test 判为挂起而取消。
     sleep: async () => {},
+    // D-03：rollback 追加截断墓碑需要 journal 引用。
+    journal,
     // 多智能体：两个 Agent 的人格与会话指针都要进快照。
     collectState: () => ({
       agents: [
@@ -365,6 +367,88 @@ test('rollback 后删除派生库 memory.db，强制下次冷启动全量重放'
     .then(() => true)
     .catch(() => false)
   assert.equal(leftover, false, 'rollback 后 memory.db 必须被删除，否则旧库与旧 journal 不一致会锁死只读')
+})
+
+test('D-03：rollback 后冷启动重放回到回退点，晚于快照的记忆不复现', async (t) => {
+  const bare = await makeBareRemote(t)
+  const a = await bootDeviceA(t, bare)
+  if (!a) return
+
+  // 快照 S1（含 lead/coder 的初始记忆）
+  const snap = await a.engine.snapshot('shutdown')
+  assert.equal(snap.pushed, true, '回退点的快照必须先推上去')
+
+  // 快照之后写一条新记忆（模拟跨天 import：at 落在晚于 S1 的 UTC 日期，
+  // journal 按日期分片会写进一个新的、S1 树里不存在的分片文件）。
+  const lateAt = Date.UTC(2099, 0, 1, 0, 0, 0)
+  const lateEntityId = 'ent-rollback-late'
+  await a.journal.append({
+    op: 'entity.upsert',
+    at: lateAt,
+    entityId: lateEntityId,
+    workspaceId: WORKSPACE,
+    agentId: 'lead',
+    kind: 'fact',
+    subjectKey: 'rollback.late-memory',
+    canonical: '这条记忆晚于回退点，不该复活',
+    salience: 0.5,
+    trust: 0.6,
+    status: 'active',
+    contentHash: 'rollback-late-hash',
+    deviceId: DEVICE_A,
+  })
+  await a.journal.append({
+    op: 'version.open',
+    at: lateAt,
+    entityId: lateEntityId,
+    workspaceId: WORKSPACE,
+    agentId: 'lead',
+    versionId: 'ver-rollback-late',
+    seq: 1,
+    validFrom: lateAt,
+    validUntil: null,
+    text: '这条记忆晚于回退点，不该复活',
+    distillStatus: 'raw',
+    author: 'user',
+    deviceId: DEVICE_A,
+  })
+  await a.journal.flush()
+
+  // rollback 到 S1
+  await a.engine.rollback(snap.manifest.snapshotId)
+
+  // 冷启动重放：新 db + 新 journal 实例，但同一 root（同仓库第二次启动场景）
+  const db2 = await openTestDb(t)
+  if (!db2) return
+  const journal2 = new Journal({ root: a.root, deviceId: DEVICE_A })
+  const barrier2 = new RestoreBarrier()
+  const restore = new RestoreEngine({
+    root: a.root,
+    db: db2,
+    journal: journal2,
+    barrier: barrier2,
+    git: new ExecGitRunner({ cwd: a.root }),
+    remote: bare,
+    branch: 'main',
+  })
+  const outcome = await restore.restoreOnBoot()
+  assert.equal(
+    outcome.status,
+    'ready',
+    `rollback 后冷启动应 ready，实际 ${outcome.status} / ${outcome.code ?? ''} / ${outcome.error instanceof Error ? outcome.error.message : ''}`,
+  )
+
+  // 断言：晚于快照的记忆不复现
+  const texts = db2.all<{ text: string }>('SELECT text FROM memory_version WHERE valid_until IS NULL')
+  assert.ok(
+    !texts.some((row) => row.text.includes('晚于回退点')),
+    `晚于回退点的记忆不应复活，实际版本：${texts.map((row) => row.text).join(' | ')}`,
+  )
+  // 回退点之前的记忆仍在（回退不是清空）
+  assert.ok(
+    texts.some((row) => row.text.includes('pytest')),
+    '回退点之前的记忆应该保留',
+  )
 })
 
 test('空远端（裸仓库无任何提交）→ 冷启动按首次播种处理，不降级', async (t) => {

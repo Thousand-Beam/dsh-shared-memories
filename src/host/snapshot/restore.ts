@@ -566,6 +566,8 @@ export class ReplayApplier {
     // 指纹在写入侧算好；这里用 entityId 兜底，保证 NOT NULL 约束不炸。
     const contentHash = str(record.contentHash) ?? entityId
     const device = str(record.deviceId) ?? record.device
+    // D-18/D-30：复现计数随 journal 漫游；旧记录无此字段时回退 1（老 journal 重放后 rc 归 1 是已知边界）。
+    const reinforce = num(record.reinforceCount) ?? 1
 
     // P1-6：跨设备同 subject 双建实体。两台设备各自为同一 (workspace, agent, content_hash)
     // 生成不同的 entityId（uuid），第二条 INSERT 若只写 `ON CONFLICT(entity_id)` 会撞
@@ -583,24 +585,47 @@ export class ReplayApplier {
       // 合并到已有实体：内容取后写的（重放按 lc 因果序，后到的是更新）。
       this.#run(
         `UPDATE memory_entity SET
-           canonical = ?, salience = ?, trust = ?, status = ?, updated_at = ?
+           canonical = ?, salience = ?, trust = ?, status = ?, updated_at = ?,
+           reinforce_count = MAX(reinforce_count, ?)
          WHERE entity_id = ?`,
-        [canonical, salience, trust, status, record.at, existing.entity_id],
+        [canonical, salience, trust, status, record.at, reinforce, existing.entity_id],
       )
       return
+    }
+
+    if (!existing) {
+      // D-01 防御：旧 journal 的 entity.upsert 不写 contentHash，重放侧 contentHash 兜底成
+      // entityId，三元组查询（workspace+agent+entityId）不命中本机 db 里「真实指纹」的实体。
+      // 这里再按主键 entity_id 兜底查一次：命中说明是同一条实体的旧 journal 重放，走 UPDATE
+      // 幂等，而不是 INSERT 撞主键让整个重放事务回滚 degraded。
+      const byPk = this.#db.one<{ entity_id: string }>(
+        `SELECT entity_id FROM memory_entity WHERE entity_id = ?`,
+        [entityId],
+      )
+      if (byPk) {
+        this.#run(
+          `UPDATE memory_entity SET
+             canonical = ?, salience = ?, trust = ?, status = ?, updated_at = ?,
+             reinforce_count = MAX(reinforce_count, ?)
+           WHERE entity_id = ?`,
+          [canonical, salience, trust, status, record.at, reinforce, entityId],
+        )
+        return
+      }
     }
 
     this.#run(
       `INSERT INTO memory_entity (
          entity_id, workspace_id, agent_id, kind, subject_key, canonical,
-         salience, trust, status, content_hash, created_at, updated_at, device_id
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+         salience, trust, status, content_hash, created_at, updated_at, device_id, reinforce_count
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(workspace_id, agent_id, content_hash) DO UPDATE SET
          canonical = excluded.canonical,
          salience  = excluded.salience,
          trust     = excluded.trust,
          status    = excluded.status,
-         updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at,
+         reinforce_count = MAX(memory_entity.reinforce_count, excluded.reinforce_count)`,
       [
         entityId,
         workspaceId,
@@ -615,6 +640,7 @@ export class ReplayApplier {
         record.at,
         record.at,
         device,
+        reinforce,
       ],
     )
   }

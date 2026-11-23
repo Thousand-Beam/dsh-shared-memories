@@ -18,10 +18,11 @@ import { SessionPolicyStore, ephemeralLeaks } from '../src/host/memory/session-p
 import { DistillService } from '../src/host/distill/service.js'
 import { DistillJobs } from '../src/host/distill/jobs.js'
 import { chunkTurns, DEFAULT_CHUNK_SIZE, estimateTokens, renderChunk } from '../src/host/distill/chunker.js'
-import { heuristicCandidates, parseCandidates, slug } from '../src/host/distill/extract.js'
+import { heuristicCandidates, MAP_SYSTEM, parseCandidates, slug } from '../src/host/distill/extract.js'
 import { dedupe } from '../src/host/distill/service.js'
 import type { ChatTurn } from '../src/host/distill/chunker.js'
 import { ScopedQuery } from '../src/host/memory/scoped-query.js'
+import { EMOTION_LABELS } from '../src/shared/types.js'
 
 const WORKSPACE = 'ws-test-distill'
 const DEVICE = 'dev-a'
@@ -85,6 +86,14 @@ test('parseCandidates 容忍围栏与解释，dedupe 按 subjectKey 留最长', 
   assert.equal(deduped.length, 1)
   assert.match(deduped[0]?.text ?? '', /CI/)
   assert.equal(slug('  Hello, World!  '), 'hello-world')
+})
+
+test('D-04 MAP_SYSTEM 情绪标签单一来源：12 个标签全部进入提示词', () => {
+  // 修复前 MAP_SYSTEM 手抄 8 个（漏 fear/surprise/gratitude/loneliness），LLM 不被引导输出这 4 个。
+  // 现在由 EMOTION_LABELS.join('|') 生成——只要 12 个都在提示词里，改常量即同步。
+  for (const label of EMOTION_LABELS) {
+    assert.ok(MAP_SYSTEM.includes(label), `MAP_SYSTEM 必须包含情绪标签 ${label}`)
+  }
 })
 
 test('heuristicCandidates 能从"必须/千万别/报错"里抽到候选', () => {

@@ -69,6 +69,8 @@ export interface DoctorOptions {
   readonly keep?: number
   /** 配置的远端地址（空 = 纯本地模式）。 */
   readonly remote?: string
+  /** 配置的目标分支（D-05：与仓库实际 HEAD 分支比对，错位时 save 会持续 409）。 */
+  readonly branch?: string
   /** 配置的 commit 署名（引擎 commit/tag 用）。 */
   readonly authorName?: string
   readonly authorEmail?: string
@@ -362,6 +364,41 @@ export async function runDoctor(options: DoctorOptions): Promise<DoctorReport> {
         severity: 'ok',
         title: '远端配置',
         detail: configuredRemote ? `origin = ${configuredRemote}，与配置一致。` : '纯本地模式（无 remote）。',
+      })
+    }
+  }
+
+  // 5b. 分支一致性（D-05）：仓库实际 HEAD 分支 vs 配置 branch。错位时 push 到
+  // origin/<config.branch> 永远追不上本机在 master 上的 commit，save 会持续 409
+  // push-failed，而表面看 doctor 一片全绿——这就是「静默失败」。
+  if (repoExists && gitAvailable && options.branch) {
+    const headBranch =
+      (await attempt(findings, 'branch-head', '当前分支', async () => {
+        const r = await runner.run(['symbolic-ref', '--short', 'HEAD'])
+        return r.code === 0 ? r.stdout.trim() : ''
+      })) ?? ''
+    if (headBranch === '') {
+      findings.push({
+        id: 'branch',
+        severity: 'warn',
+        title: '无法读取当前分支',
+        detail: `配置 branch=${options.branch}，但 HEAD 处于 detached（或读分支失败）。`,
+        fix: `确认数据仓库 HEAD 指向分支 ${options.branch}：\`git checkout ${options.branch}\`。`,
+      })
+    } else if (headBranch !== options.branch) {
+      findings.push({
+        id: 'branch',
+        severity: 'error',
+        title: '仓库分支与配置不匹配',
+        detail: `仓库当前分支是 ${headBranch}，但配置 branch=${options.branch}。快照会提交到 ${headBranch} 却试图推送到 origin/${options.branch}，导致保存持续 409。`,
+        fix: `\`git -C "${root}" checkout ${options.branch}\`，或把配置 branch 改成 ${headBranch}。`,
+      })
+    } else {
+      findings.push({
+        id: 'branch',
+        severity: 'ok',
+        title: '分支配置',
+        detail: `当前分支 ${headBranch} 与配置 branch 一致。`,
       })
     }
   }

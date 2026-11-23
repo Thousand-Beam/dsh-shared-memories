@@ -237,7 +237,11 @@ export function ephemeralLeaks(
     probe(`SELECT DISTINCT agent_id FROM memory_entity WHERE workspace_id = ? AND agent_id IN (${marks})`)
     probe(`SELECT DISTINCT agent_id FROM pitfall WHERE workspace_id = ? AND agent_id IN (${marks})`)
     probe(`SELECT DISTINCT agent_id FROM quarantine WHERE workspace_id = ? AND agent_id IN (${marks})`)
-    probe(`SELECT DISTINCT agent_id FROM persona_identity WHERE workspace_id = ? AND agent_id IN (${marks})`)
+    // D-08：persona_identity 的「会话→人格」绑定**不算**记忆痕迹。它是无痕会话
+    // 能读到锚点人格（可读不写）所必需的路标，本身不记录"聊了什么"。把它也算泄漏
+    // 会让"先正常用、后切无痕"的会话永久停摆——persona.bind 在会话创建时必然产生，
+    // 而 forgetSessionTraces 只有在名下无 memory_entity 时才敢删绑定（有记忆时删绑定
+    // 会让切回非无痕后读不到旧记忆）。所以这里只探真·记忆痕迹三张表。
   } catch {
     // 老库缺表：没有那些表就没有那条泄漏通道。
   }

@@ -105,6 +105,7 @@ export const api = {
   /** 修正情感标签（PRD 6 的用户纠错入口）。 */
   fixEmotion: (body: {
     versionId: string
+    agentId: string
     label: string
     subject?: string
     trigger?: string

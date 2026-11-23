@@ -49,6 +49,7 @@ export type JournalOp =
   | 'user_profile.set'
   | 'persona.bind'
   | 'persona.update'
+  | 'journal.truncate'
 
 /** 磁盘上的完整记录（含信封字段）。 */
 export interface JournalRecord {
@@ -277,12 +278,39 @@ export class Journal {
         if (record.at >= sinceAt) out.push(record)
       }
     }
-    out.sort((a, b) => {
+
+    // D-03：rollback 截断墓碑。`journal.truncate`（rollback 时本机追加）标记「该设备
+    // 在回退点的 seq 高水位」，之后（seq 更大）的记录是回退点之后写的，重放时必须丢弃，
+    // 否则 rollback 后重启这些记录又被全量重放「复活」。journal 按 UTC 日期分片，回退点
+    // 之后跨天写出的新分片是 untracked 文件，`git checkout <tag> -- .` 不会删它，只能靠
+    // 墓碑在重放层截断。按 device 维度生效（本机回退本机的）；多次回退取「seq 最大（即
+    // 最后写入）的那条墓碑」的水位，语义上「回退到更早快照」覆盖「回退到更晚快照」。
+    const truncateFloor = new Map<string, { seq: number; floor: number }>()
+    for (const record of out) {
+      if (record.op !== 'journal.truncate') continue
+      const floor = typeof record.truncateSeq === 'number' ? record.truncateSeq : -1
+      if (floor < 0) continue
+      const device = typeof record.device === 'string' ? record.device : ''
+      const prev = truncateFloor.get(device)
+      if (!prev || record.seq > prev.seq) {
+        truncateFloor.set(device, { seq: record.seq, floor })
+      }
+    }
+    const visible = truncateFloor.size > 0
+      ? out.filter((record) => {
+          if (record.op === 'journal.truncate') return true // 墓碑保留，apply 层走 default 只统计
+          const device = typeof record.device === 'string' ? record.device : ''
+          const cut = truncateFloor.get(device)
+          return cut === undefined || record.seq <= cut.floor
+        })
+      : out
+
+    visible.sort((a, b) => {
       const la = typeof a.lc === 'number' ? a.lc : 0
       const lb = typeof b.lc === 'number' ? b.lc : 0
       return la - lb || a.at - b.at || a.device.localeCompare(b.device) || a.seq - b.seq
     })
-    return out
+    return visible
   }
 
   /** 列出所有写入过日志的设备（用于多端合并与冲突面板）。 */

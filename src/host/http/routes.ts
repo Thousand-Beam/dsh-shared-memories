@@ -85,6 +85,14 @@ export interface ConnectionLike {
   requestRejection?(req: IncomingMessage): number | undefined
 }
 
+/**
+ * D-06：audit_id 主键不能只用毫秒时间戳——并发请求同毫秒会撞 PRIMARY KEY 抛异常，
+ * 让读路由（GET /memories）里的审计写把整个请求打成 500。加一段随机尾缀消碰撞。
+ */
+function auditId(now = Date.now()): string {
+  return `aud_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+}
+
 /** 路由需要的一切，全部用 accessor 传进来——避免和 index.ts 循环引用。 */
 export interface MemoriesApiDeps {
   readonly config: SharedConfig
@@ -232,9 +240,11 @@ async function dispatch(
 
   // P0（评价三）：宿主的 webServer.register 会静默忽略 route.policy（token-write 从不
   // 被检查），所以「彻底销毁」这类破坏性写操作对任何能摸到本机端口的人都是裸奔的。
-  // 这里对写操作补一道宿主 connection 鉴权（cookie / API 令牌 / Host-Origin 栅栏）。
-  // 读接口保持开放（面板要能读）；connection 拿不到时跳过（无 webServer 的 profile）。
-  if (method !== 'GET' && method !== 'HEAD' && typeof deps.connection?.requestRejection === 'function') {
+  // 这里对所有请求（含读）补一道宿主 connection 鉴权（cookie / API 令牌 / Host-Origin
+  // 栅栏）——读接口同样泄露全部记忆、快照清单与隔离区数据，不能只护写不护读（终审
+  // D-07）。面板是同源 fetch（默认带 cookie），能正常通过；裸 curl 无 cookie 会被拒。
+  // connection 拿不到时跳过（无 webServer 的 headless profile 本就没有 HTTP 面）。
+  if (typeof deps.connection?.requestRejection === 'function') {
     const rejection = deps.connection.requestRejection(req)
     if (rejection !== undefined) {
       const status = rejection === 403 ? 403 : 401
@@ -471,6 +481,8 @@ async function dispatch(
       return sendJson(res, 200, ok(result))
     }
     if (method === 'POST' && path === '/snapshots/pin') {
+      // D-21：pin 是写操作（改 pinned 状态），恢复期禁止——与 RestoreEngine 并发读写会污染快照簿记。
+      deps.barrier.assertWritable('snapshot-pin')
       const body = await readJson(req)
       const snapshotId = reqStr(body, 'snapshotId')
       const pinned = body.pinned === true
@@ -478,6 +490,8 @@ async function dispatch(
       return sendJson(res, 200, ok({ snapshotId, pinned }))
     }
     if (method === 'POST' && path === '/snapshots/rollback') {
+      // D-21：回退在恢复期禁止——revert 提交 + 清派生库 + 写墓碑，必须等 restoreOnBoot 完成后才安全。
+      deps.barrier.assertWritable('snapshot-rollback')
       const body = await readJson(req)
       const snapshotId = reqStr(body, 'snapshotId')
       const rolled = await deps.snapshots()?.rollback(snapshotId)
@@ -523,6 +537,8 @@ async function dispatch(
       const body = await readJson(req)
       const seconds = num(body.intervalSec) ?? 0
       if (seconds < 30) throw new ApiError('bad-interval', '同步间隔不能小于 30 秒')
+      // D-15：上限与 config Schema（max 86_400）对齐，此前 86401 也能写入、Schema 校验形同虚设。
+      if (seconds > 86_400) throw new ApiError('bad-interval', '同步间隔不能大于 86400 秒（24 小时）')
       deps.setIntervalSec(seconds)
       return sendJson(res, 200, ok({ intervalSec: seconds }))
     }
@@ -695,7 +711,7 @@ function listMemories(deps: MemoriesApiDeps, url: URL): MemoryCard[] {
     db.run(
       `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
        VALUES (?,?,?,?,?,?)`,
-      [`aud_${now.toString(36)}`, deps.workspaceId, agentId, 'memory.global-search', global.reason, now],
+      [auditId(now), deps.workspaceId, agentId, 'memory.global-search', global.reason, now],
     )
   }
   return rows
@@ -1155,7 +1171,7 @@ async function writeUserProfile(
       `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
        VALUES (?,?,?,?,?,?)`,
       [
-        `aud_${Date.now().toString(36)}`,
+        auditId(),
         deps.workspaceId,
         '',
         'user-profile.update',
@@ -1210,6 +1226,10 @@ function writeSkills(deps: MemoriesApiDeps, body: Record<string, unknown>): Skil
       },
     })
   const action = str(body.action) ?? 'bind'
+  // D-16：action 只接受 bind/unbind/toggle，非法值（如 "nuke"）此前静默按 bind 执行。
+  if (action !== 'bind' && action !== 'unbind' && action !== 'toggle') {
+    throw new ApiError('bad-skill-action', '技能操作只能是 bind、unbind 或 toggle', 400)
+  }
   const skillId = normalizeSkillId(str(body.skillId))
   if (skillId === '') {
     throw new ApiError('bad-skill-id', '技能 id 只能是 1-64 位的字母、数字、点、下划线或连字符', 400)
@@ -1297,11 +1317,24 @@ async function writePersona(deps: MemoriesApiDeps, body: Record<string, unknown>
   const db = deps.db()
   if (!db) throw new ApiError('not-ready', '记忆库尚未就绪', 503)
   const rawAgentId = str(body.agentId) ?? 'default'
+  // D-09：非法 agentId（如 ../../etc 路径穿越）入库后，重启时 buildPrompt→ScopedQuery
+  // 的 assertScope 会抛 invalid-agent-id 把整个宿主炸到起不来。写入前先拦，脏数据不落库。
+  if (!isSafeScopeToken(rawAgentId)) {
+    throw new ApiError('invalid-agent-id', 'agentId 含非法字符，拒绝写入', 400)
+  }
   // P1-D：与 readPersona 对称，同样把会话 id 解析成人格 id 再写，否则前端传
   // 会话 id 时会在 persona_state 里另起一行（跟 ensureAgentRow 写的人格 id 对不上）。
   const agentId = resolvePersonaId(db, rawAgentId)
+  if (!isSafeScopeToken(agentId)) {
+    throw new ApiError('invalid-agent-id', '解析后的人格 id 含非法字符，拒绝写入', 400)
+  }
   const name = (str(body.name) ?? agentId).slice(0, 40)
   const age = Math.min(999, Math.max(1, Math.round(num(body.age) ?? 10)))
+  // D-14：traits 必须是「纯对象」。数组此前被误当 {0:x,1:y} 处理、字符串被静默丢弃成 {}，
+  // 用户以为写进去了其实没有——这里直接 400，坏数据不落库也不装成功。
+  if (body.traits !== undefined && body.traits !== null && (typeof body.traits !== 'object' || Array.isArray(body.traits))) {
+    throw new ApiError('bad-traits', 'traits 必须是对象，形如 {"好奇心": 0.8}', 400)
+  }
   const traits: Record<string, number> = {}
   for (const [key, value] of Object.entries(parseTraitsInput(body.traits))) {
     traits[key.slice(0, 32)] = Math.min(1, Math.max(0, value))
@@ -1328,7 +1361,7 @@ async function writePersona(deps: MemoriesApiDeps, body: Record<string, unknown>
     `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
      VALUES (?,?,?,?,?,?)`,
     [
-      `aud_${now.toString(36)}`,
+      auditId(now),
       deps.workspaceId,
       agentId,
       'persona.edit',

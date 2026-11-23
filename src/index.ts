@@ -23,7 +23,7 @@ import { readdir, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { Config, isLocalOnly, type Config as SharedConfig } from './config.js'
 import { Journal } from './shared/journal.js'
-import { deriveWorkspaceId, type Scope } from './shared/scope.js'
+import { deriveWorkspaceId, isSafeScopeToken, type Scope } from './shared/scope.js'
 import type { SqlDriver } from './shared/types.js'
 import type { SkillBinding } from './shared/skills.js'
 import { normalizeBindings } from './shared/skills.js'
@@ -346,10 +346,17 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
       const ghosts = runtime.policies?.ephemeralSessions(workspaceId) ?? []
       const leaked = ghosts.length > 0 && runtime.db ? ephemeralLeaks(runtime.db, workspaceId, ghosts) : []
       if (leaked.length > 0) {
-        warn(`无痕会话出现记忆痕迹（${leaked.join(',')}），已跳过 ${trigger} 快照；请先清理再保存`)
+        // D-08：manual 时把泄漏清单带回 400（SnapshotError → statusOf 400），别让用户
+        // 面对一句"保存失败"却不知道是哪几个会话在漏。其他触发源（关机/定时/空闲）
+        // 不是用户主动操作，抛错会打断链路，仍只 warn + 跳过。
+        const detail =
+          `无痕会话出现记忆痕迹（${leaked.join(', ')}）；请先清理这些会话的记忆，或关闭其无痕状态后再保存`
+        if (trigger === 'manual') throw new SnapshotError('ephemeral-leak', detail)
+        warn(`${detail}，已跳过 ${trigger} 快照`)
         return Promise.resolve(undefined)
       }
     } catch (cause) {
+      if (cause instanceof SnapshotError) throw cause
       warn(`无痕巡检失败，跳过 ${trigger} 快照以求稳：${cause instanceof Error ? cause.message : String(cause)}`)
       return Promise.resolve(undefined)
     }
@@ -485,6 +492,8 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         authorName: config.repo.authorName,
         authorEmail: config.repo.authorEmail,
         onWarn: warn,
+        // D-03：rollback 追加截断墓碑需要 journal 引用。
+        journal,
         collectState: () => ({
           agents: collectAgents(runtime),
           userProfiles: collectProfiles(runtime),
@@ -635,7 +644,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           | undefined
         const snapshotId = result?.manifest?.snapshotId
         if (!snapshotId) {
-          throw new SnapshotError('snapshot-failed', '手动保存未生成快照（manual 触发开关已关闭、恢复未就绪、无痕巡检跳过或引擎失败）')
+          throw new SnapshotError('snapshot-failed', '手动保存未生成快照（manual 触发开关已关闭、恢复未就绪或引擎失败）')
         }
         // P0-③：把推送结果冒到 API/前端。本机 commit 成功后，若 push 分叉/失败，必须诚实
         // 暴露（pushed=false + pushReason），否则前端一直弹绿「已保存」，用户以为漫游已落地，
@@ -698,6 +707,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
           root,
           keep: config.snapshot.keep,
           remote: config.repo.remote,
+          branch: config.repo.branch,
           authorName: config.repo.authorName,
           authorEmail: config.repo.authorEmail,
           timeoutMs: config.sync.timeoutMs,
@@ -926,7 +936,7 @@ export const apply = (ctx: unknown, config: SharedConfig): void => {
         db.run(
           `INSERT INTO audit_log (audit_id, workspace_id, agent_id, action, detail, created_at)
            VALUES (?,?,?,?,?,?)`,
-          [`aud_${now.toString(36)}`, workspaceId, agentId, 'persona.edit', JSON.stringify(input), now],
+          [`aud_${now.toString(36)}_${Math.random().toString(36).slice(2, 10)}`, workspaceId, agentId, 'persona.edit', JSON.stringify(input), now],
         )
         return {
           agentId,
@@ -1514,6 +1524,9 @@ export function buildPrompt(runtime: Runtime, config: SharedConfig, agentId: str
   const db = runtime.db
   // refreshPrompt 里已经挡过一次，但渲染期现算的入口也要自己挡：没库就当没有记忆。
   if (db === undefined) return ''
+  // D-09 防御纵深：脏 agentId（如历史遗留的 ../../etc）不该在渲染期让 ScopedQuery
+  // 的 assertScope 抛 ScopeViolation 把整个宿主炸到起不来。写入侧已拦截，这里容错跳过。
+  if (!isSafeScopeToken(agentId)) return ''
   const scope: Scope = {
     workspaceId: runtime.workspaceId,
     agentId,

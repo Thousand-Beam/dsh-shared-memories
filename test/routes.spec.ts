@@ -453,6 +453,29 @@ test('POST /sync-interval：<30 秒被拒，合法值回显', async (t) => {
   })
   assert.equal(good.status, 200)
   assert.equal(good.body.data?.intervalSec, 120)
+
+  // D-15：上限 86400 与 config Schema 对齐，此前 86401 也写入成功。
+  const over = await call(h.base, '/sync-interval', { method: 'POST', body: { intervalSec: 86_401 } })
+  assert.equal(over.status, 400)
+  assert.equal(over.body.error?.code, 'bad-interval')
+})
+
+test('POST /skills：非法 action 400，合法 action 走绑定（D-16）', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  const bad = await call(h.base, '/skills', {
+    method: 'POST',
+    body: { agentId: AGENT, action: 'nuke', skillId: 'foo' },
+  })
+  assert.equal(bad.status, 400)
+  assert.equal(bad.body.error?.code, 'bad-skill-action')
+
+  const good = await call(h.base, '/skills', {
+    method: 'POST',
+    body: { agentId: AGENT, action: 'bind', skillId: 'foo.bar' },
+  })
+  assert.equal(good.status, 200)
 })
 
 test('POST /import：空内容 400，有内容走导入器', async (t) => {
@@ -543,6 +566,26 @@ test('POST /snapshots/pin|rollback：越界快照 id 一律 404 snapshot-not-fou
   assert.equal(rollback.body.error?.code, 'snapshot-not-found')
 })
 
+test('D-21：恢复未就绪时 rollback/pin 被 assertWritable 拦住（423）', async (t) => {
+  const h = await makeHarness(t, { ready: false })
+  if (!h) return
+
+  // 修复前 rollback/pin 不调 assertWritable，恢复期也能执行，与 RestoreEngine 并发读写。
+  const pin = await call(h.base, '/snapshots/pin', {
+    method: 'POST',
+    body: { snapshotId: 'snap_x', pinned: true },
+  })
+  assert.equal(pin.status, 423)
+  assert.equal(pin.body.error?.code, 'restore-blocked')
+
+  const rollback = await call(h.base, '/snapshots/rollback', {
+    method: 'POST',
+    body: { snapshotId: 'snap_x' },
+  })
+  assert.equal(rollback.status, 423)
+  assert.equal(rollback.body.error?.code, 'restore-blocked')
+})
+
 test('快照链路：保存 → 列表 → 钉住 → 回退并产生新 commit', async (t) => {
   const h = await makeHarness(t)
   if (!h) return
@@ -602,6 +645,14 @@ test('GET/POST /persona、GET /rules、未知路径 404', async (t) => {
   const reloaded = await call<PersonaDoc>(h.base, `/persona?agentId=${AGENT}`)
   assert.equal(reloaded.body.data?.name, '小狐狸')
   assert.equal(reloaded.body.data?.age, 12)
+
+  // D-14：traits 必须是对象，数组此前被误当 {0:x,1:y} 处理、字符串被静默丢弃成 {}。
+  const badTraits = await call(h.base, '/persona', {
+    method: 'POST',
+    body: { agentId: AGENT, name: '坏格式', age: 12, traits: ['curiosity', 'anger'] },
+  })
+  assert.equal(badTraits.status, 400)
+  assert.equal(badTraits.body.error?.code, 'bad-traits')
 
   const rules = await call<RulesBundle>(h.base, `/rules?agentId=${AGENT}`)
   assert.equal(rules.status, 200)
@@ -721,15 +772,16 @@ test('POST /rules/delete：物理删除踩坑并写审计', async (t) => {
   assert.equal(again.body.data?.deleted, false, '重复删应是幂等 false')
 })
 
-test('P0 鉴权：写操作被 connection 拒绝时返回 401/403，读接口不拦', async (t) => {
+test('P0 鉴权：connection 拒绝时读/写都被拦（终审 D-07）', async (t) => {
   const h = await makeHarness(t, {
     connection: { requestRejection: () => 401 },
   })
   if (!h) return
 
-  // 读接口：connection 拦不到 GET，正常返回。
+  // 读接口：GET /memories 泄露全部记忆，同样被 connection 鉴权拦截（D-07）。
   const read = await call<MemoryCard[]>(h.base, `/memories?agentId=${AGENT}`)
-  assert.equal(read.status, 200, '读接口不应被 connection 鉴权拦截')
+  assert.equal(read.status, 401, '读接口也应被 connection 鉴权拦截')
+  assert.equal(read.body.error?.code, 'unauthorized')
 
   // 写接口：requestRejection 返回 401 → 401 拒绝，handler 根本不执行。
   const denied = await call(h.base, '/emotion', {

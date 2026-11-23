@@ -321,12 +321,13 @@ export class TemporalTree {
       created_at: now,
       updated_at: now,
       device_id: deviceOf(scope),
+      reinforce_count: 1,
     }
     this.#db.run(
       `INSERT INTO memory_entity (
          entity_id, workspace_id, agent_id, kind, subject_key, canonical,
-         salience, trust, status, content_hash, created_at, updated_at, device_id
-       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         salience, trust, status, content_hash, created_at, updated_at, device_id, reinforce_count
+       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         entity.entity_id,
         entity.workspace_id,
@@ -341,6 +342,7 @@ export class TemporalTree {
         entity.created_at,
         entity.updated_at,
         entity.device_id,
+        entity.reinforce_count,
       ],
     )
     return entity
@@ -564,6 +566,12 @@ function buildJournalOps(
       salience: entity.salience,
       trust: entity.trust,
       status: entity.status,
+      // D-01：journal 必须带真实指纹与设备号，否则重放侧 contentHash 兜底成 entityId
+      // 三元组查询不命中本机已有实体，INSERT 同 entity_id 撞主键 → 整个重放事务回滚 → degraded。
+      contentHash: entity.content_hash,
+      deviceId: entity.device_id,
+      // D-18/D-30：复现计数随 entity.upsert 漫游，否则跨设备重放后 rc 归 1（召回权重 log2(rc) 漂移）。
+      reinforceCount: entity.reinforce_count,
     },
   ]
   if (result.deduped) return ops

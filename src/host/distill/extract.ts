@@ -8,7 +8,7 @@
  * 用户看到的就是"聊了半天记忆还是 0 条"，这正是我们要修的 bug。
  */
 
-import type { MemoryKind } from '../../shared/types.js'
+import { EMOTION_LABELS, type MemoryKind } from '../../shared/types.js'
 import type { ChatTurn } from './chunker.js'
 
 export interface DistillCandidate {
@@ -29,7 +29,9 @@ export const MAP_SYSTEM = [
   '你是一个记忆提炼器。用户会给你一段 AI 与用户的对话片段。',
   '你的任务是抽取「值得长期记住」的事实，不要复述整段对话。',
   '只输出 JSON 数组，不要解释、不要代码围栏。数组每一项形如：',
-  '{"kind":"fact|preference|decision|pitfall|episode","subjectKey":"短横线小写词组","text":"一句话，第三人称，不超过 80 字","emotion":{"label":"joy|anxiety|frustration|pride|curiosity|anger|sadness|neutral","subject":"情绪指向的对象（谁/什么，非空）","trigger":"触发原因（非空）","intensity":0到1}}',
+  // D-04：情绪标签单一来源——直接由 EMOTION_LABELS 生成，改常量即同步提示词，
+  // 不再手抄一份（此前只列 8 个，fear/surprise/gratitude/loneliness 形同虚设）。
+  `{"kind":"fact|preference|decision|pitfall|episode","subjectKey":"短横线小写词组","text":"一句话，第三人称，不超过 80 字","emotion":{"label":"${EMOTION_LABELS.join('|')}","subject":"情绪指向的对象（谁/什么，非空）","trigger":"触发原因（非空）","intensity":0到1}}`,
   '规则：',
   '1. 只记用户明确表达过、或调试中确认过的结论；推测不要写。',
   '2. preference 记用户的稳定偏好；decision 记已定的方案；pitfall 记踩过的坑和正确做法。',
@@ -53,7 +55,6 @@ export function reducePrompt(candidates: readonly DistillCandidate[]): string {
 }
 
 const KINDS: readonly MemoryKind[] = ['fact', 'preference', 'decision', 'pitfall', 'persona', 'episode']
-const EMOTIONS: readonly string[] = ['joy', 'anxiety', 'frustration', 'pride', 'curiosity', 'anger', 'sadness', 'neutral', 'fear', 'surprise', 'gratitude', 'loneliness']
 
 function asKind(value: unknown): MemoryKind {
   return typeof value === 'string' && (KINDS as readonly string[]).includes(value) ? (value as MemoryKind) : 'fact'
@@ -84,7 +85,7 @@ export function parseCandidates(raw: string, limit = 8): DistillCandidate[] {
     let emotion: DistillCandidate['emotion']
     if (emotionRaw !== null && typeof emotionRaw === 'object') {
       const emo = emotionRaw as Record<string, unknown>
-      const label = typeof emo.label === 'string' && EMOTIONS.includes(emo.label) ? emo.label : undefined
+      const label = typeof emo.label === 'string' && (EMOTION_LABELS as readonly string[]).includes(emo.label) ? emo.label : undefined
       if (label !== undefined) {
         const intensity = typeof emo.intensity === 'number' ? Math.min(1, Math.max(0, emo.intensity)) : 0.6
         const subject = typeof emo.subject === 'string' ? emo.subject.trim() : ''

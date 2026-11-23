@@ -555,3 +555,57 @@ test('P2-9 entity.merge 重放：merged 状态、版本关闭、supersedes 跨�
   assert.equal(keeperVer?.supersedes, 'm-lose', 'keeper 的 supersedes 必须指向 loser')
   assert.equal(stats.merged, 1)
 })
+
+test('D-18 reinforceCount 随 journal 漫游：重放恢复计数，跨设备合并取 MAX', async (t) => {
+  const db = await openTestDb(t)
+  if (!db) return
+
+  // devA 复现 3 次、devB 复现 1 次（同一 subject，contentHash 相同 → 重放合并到同一实体）。
+  // 修复前 journal 不带 reinforceCount，重放侧回退 1；修复后带字段，且合并取 MAX 保留较大值。
+  const records: JournalRecord[] = [
+    record({
+      op: 'entity.upsert',
+      lc: 1,
+      at: 1000,
+      device: 'devA',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      entityId: 'rc-1',
+      contentHash: 'rc-hash',
+      kind: 'fact',
+      subjectKey: 'lead.rc',
+      canonical: '复现三次',
+      salience: 0.5,
+      trust: 0.6,
+      status: 'active',
+      reinforceCount: 3,
+    }),
+    record({
+      op: 'entity.upsert',
+      lc: 2,
+      at: 2000,
+      device: 'devB',
+      workspaceId: WORKSPACE,
+      agentId: LEAD,
+      entityId: 'rc-2',
+      contentHash: 'rc-hash',
+      kind: 'fact',
+      subjectKey: 'lead.rc',
+      canonical: '复现三次',
+      salience: 0.5,
+      trust: 0.6,
+      status: 'active',
+      reinforceCount: 1,
+    }),
+  ]
+
+  const applier = new ReplayApplier(db)
+  const stats = applier.apply(records)
+
+  const row = db.one<{ reinforce_count: number }>(
+    `SELECT reinforce_count FROM memory_entity WHERE workspace_id = ? AND agent_id = ? AND content_hash = 'rc-hash'`,
+    [WORKSPACE, LEAD],
+  )
+  assert.equal(row?.reinforce_count, 3, '合并后复现计数必须保留较大值 3，而不是被另一设备的 1 覆盖')
+  assert.equal(stats.entities, 2, '两条 entity.upsert 都算数')
+})

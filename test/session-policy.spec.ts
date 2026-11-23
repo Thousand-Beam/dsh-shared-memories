@@ -17,7 +17,7 @@ import { openTestDb, tempRoot } from './helpers/db.js'
 import { Journal } from '../src/shared/journal.js'
 import { TemporalTree } from '../src/host/memory/timetree.js'
 import { PersonaIdentityStore } from '../src/host/memory/persona-identity.js'
-import { forgetSessionTraces } from '../src/host/memory/session-policy.js'
+import { forgetSessionTraces, ephemeralLeaks } from '../src/host/memory/session-policy.js'
 
 const WORKSPACE = 'ws-session-policy'
 const DEVICE = 'dev-a'
@@ -103,4 +103,36 @@ test('无痕补刀：空 sessionId 直接返回 0（别让脏参数删库）', a
   const f = await fixture(t)
   if (f === undefined) return
   assert.equal(forgetSessionTraces(f.db, WORKSPACE, ''), 0)
+})
+
+test('D-08：ephemeralLeaks 不把 persona_identity 绑定当泄漏，但真实记忆仍算泄漏', async (t) => {
+  const f = await fixture(t)
+  if (f === undefined) return
+
+  const agentId = 'session-ephemeral-bound'
+  // 会话创建时必然产生的 persona.bind：写 persona_identity 绑定（会话→人格）。
+  await f.identity.touch(agentId, WORKSPACE)
+
+  // 只有绑定、没有 memory_entity/pitfall/quarantine → 不算泄漏（否则"先正常用后切无痕"
+  // 的会话会让快照永久停摆）。
+  assert.deepEqual(
+    ephemeralLeaks(f.db, WORKSPACE, [agentId]),
+    [],
+    'persona_identity 绑定是读锚点人格的路标，不是"聊了什么"的记忆痕迹',
+  )
+
+  // 真写一条记忆 → 仍然算泄漏（无痕会话名下不该有 memory_entity）。
+  await f.tree.openVersion({
+    scope: { workspaceId: WORKSPACE, agentId, deviceId: DEVICE },
+    kind: 'fact',
+    subjectKey: 'leak',
+    text: '无痕会话不该留下的记忆',
+    author: 'user',
+    trust: 0.8,
+  })
+  assert.deepEqual(
+    ephemeralLeaks(f.db, WORKSPACE, [agentId]),
+    [agentId],
+    'memory_entity 是真实记忆痕迹，必须判泄漏',
+  )
 })
