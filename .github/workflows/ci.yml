@@ -24,5 +24,8 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Assert client bundle exists
+        run: test -f lib/client.js
+
       - name: Test
         run: npm test

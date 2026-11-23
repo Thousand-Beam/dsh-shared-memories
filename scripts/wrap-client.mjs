@@ -54,7 +54,10 @@ main().catch((error) => {
 })
 
 async function main() {
-  const pkg = JSON.parse(await readFile(resolve(ROOT, 'package.json'), 'utf8'))
+  // T2：剥 UTF-8 BOM。readFile(...,'utf8') 不剥 BOM，历史上 package.json 被
+  // 存成带 BOM 时 JSON.parse 直接抛 "Unexpected token '﻿'"；这里做防御，
+  // 根上修法是 package.json 本身以 UTF-8 无 BOM 保存。
+  const pkg = JSON.parse((await readFile(resolve(ROOT, 'package.json'), 'utf8')).replace(/^\uFEFF/, ''))
   const id = String(pkg.name)
 
   if (check) {
