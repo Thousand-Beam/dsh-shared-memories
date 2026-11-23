@@ -887,3 +887,16 @@ test('P0 鉴权：connection 缺失时不鉴权（无 webServer 的 profile）',
   })
   assert.equal(ok.status, 200, 'connection 拿不到时写操作不鉴权（保持旧行为）')
 })
+
+test('T7-1：POST /identity personaId 脏值 400（补 personaId 校验）', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  // personaId 会拼进 persona/<id>.json 文件路径，脏值（路径穿越）落库后重启时炸宿主。
+  const dirty = await call(h.base, '/identity', {
+    method: 'POST',
+    body: { agentId: AGENT, personaId: '../../etc/passwd', action: 'bind' },
+  })
+  assert.equal(dirty.status, 400)
+  assert.equal(dirty.body.error?.code, 'invalid-persona-id')
+})

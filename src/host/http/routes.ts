@@ -1134,6 +1134,11 @@ async function writeIdentity(deps: MemoriesApiDeps, body: Record<string, unknown
     await store.bindTo(agentId, deps.workspaceId, agentId, 'user')
   } else {
     const personaId = str(body.personaId) || store.resolve(agentId)
+    // T7-1：personaId 会拼进 persona/<id>.json 文件路径，脏值（路径穿越）落库后
+    // 重启时炸宿主。与 agentId 同规则，先过 scope 令牌校验再写。
+    if (!isSafeScopeToken(personaId)) {
+      throw new ApiError('invalid-persona-id', 'personaId 含非法字符，拒绝写入', 400)
+    }
     await store.bindTo(agentId, deps.workspaceId, personaId, 'user')
   }
   return readIdentities(deps)
