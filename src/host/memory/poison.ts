@@ -168,7 +168,14 @@ export class PoisonGuard {
     deviation = clamp01(deviation)
     const trust = clamp01(this.#trust[input.source] ?? 0.25)
     // 用户自己说的话永远走 accept：人不该被自己的记忆插件拦。
-    const risk = input.source === 'user' ? 0 : clamp01(deviation * (1 - trust * 0.6))
+    const baseRisk = input.source === 'user' ? 0 : clamp01(deviation * (1 - trust * 0.6))
+    // 身份覆盖是替换存在前提的注入，威胁不随来源可信度打折：agent 也可能在
+    // 蒸馏时把外部注入的「你其实是 X」当成自己的记忆。单独抬到隔离线之上。
+    // （T3：external=review 0.425 / agent=accept 0.32 与「身份覆盖 → 高危」宣称不符）
+    const risk =
+      reasons.includes('identity-override') && input.source !== 'user'
+        ? Math.max(baseRisk, 0.6)
+        : baseRisk
     const action: PoisonAction =
       risk >= this.#quarantineGate ? 'quarantine' : risk >= this.#reviewGate ? 'review' : 'accept'
     return { trust, deviation, risk, action, reasons }
