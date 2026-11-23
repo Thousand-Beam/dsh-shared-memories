@@ -27,6 +27,7 @@ import { createReadStream } from 'node:fs'
 import { mkdir, open, readFile, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 /** 日志格式版本；不兼容变更时递增，并在 replay 层做迁移。 */
 export const JOURNAL_VERSION = 1
@@ -111,8 +112,12 @@ export class Journal {
   #gate: Promise<void> = Promise.resolve()
   /** 闸门互斥锁：同一时刻只允许一个 withGate 在跑（purge 改 journal vs 快照 capture 互斥）。 */
   #mutex: Promise<void> = Promise.resolve()
-  /** 防重入标志：withGate 里再调 withGate 会死锁（#mutex 已被自己占用），直接抛错。 */
-  #inGate = false
+  /**
+   * 防重入上下文：用 AsyncLocalStorage 区分「同一条调用链的嵌套」与「另一条并发调用链」。
+   * 嵌套（fn 里再调 withGate）会继承 store → 抛错防死锁；并发调用不会继承 → 排队等待互斥。
+   * 不能用布尔标志：布尔是进程级的，会把「并发调用」误判成「嵌套」直接抛错（T4）。
+   */
+  #gateContext = new AsyncLocalStorage<boolean>()
 
   constructor(options: JournalOptions) {
     if (!DEVICE_ID_RE.test(options.deviceId)) {
@@ -210,11 +215,11 @@ export class Journal {
     if (typeof fn !== 'function') {
       throw new TypeError('journal.withGate(fn): fn 必须是函数')
     }
-    // 防重入：withGate 里再调 withGate 会拿不到 #mutex（被自己占着）而永远挂起。
-    if (this.#inGate) {
+    // 防重入：用 AsyncLocalStorage 区分「同一条调用链的嵌套」与「另一条并发调用链」。
+    // 嵌套（fn 里再调 withGate）会继承 store → 抛错防死锁；并发调用不会继承 → 排队互斥。
+    if (this.#gateContext.getStore() === true) {
       throw new Error('journal.withGate() 不允许嵌套调用：外层闸门尚未释放')
     }
-    this.#inGate = true
     // 等所有已排队的写入落盘，避免闸门内还有半截 append 在飞。
     await this.#queue
     // 互斥：同一时刻只允许一个 withGate 在跑。purge 会原子重写 journal 文件，
@@ -229,13 +234,15 @@ export class Journal {
     this.#gate = new Promise((resolve) => {
       release = resolve
     })
-    try {
-      return await fn()
-    } finally {
-      release()
-      releaseMutex()
-      this.#inGate = false
-    }
+    // fn 在 gate 上下文里跑：fn 里再调 withGate 会继承 store=true → 抛嵌套错误。
+    return this.#gateContext.run(true, async () => {
+      try {
+        return await fn()
+      } finally {
+        release()
+        releaseMutex()
+      }
+    })
   }
 
   /**

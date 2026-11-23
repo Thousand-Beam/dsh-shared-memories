@@ -239,3 +239,39 @@ test('V62-01：墓碑过滤窗口语义——回退点后丢弃、墓碑后新�
   const ids = merged.filter((record) => record.op === 'entity.upsert').map((record) => record.entityId)
   assert.deepEqual(ids, ['e1', 'e2', 'e3', 'after1', 'after2'], 'late1/late2 应被墓碑丢弃，after1/after2 应保留')
 })
+
+test('T4：withGate 并发调用排队互斥，不误判为嵌套', async (t) => {
+  const root = await tempRoot(t)
+  const journal = new Journal({ root, deviceId: 'devA', durable: false, clock: () => DAY })
+  await journal.open()
+
+  const order: string[] = []
+  // 两条独立调用链同时发起：第二条应排队等第一条释放，而不是被 #inGate 误判成嵌套。
+  const p1 = journal.withGate(async () => {
+    order.push('a-start')
+    await new Promise((r) => setTimeout(r, 20))
+    order.push('a-end')
+    return 'a'
+  })
+  const p2 = journal.withGate(async () => {
+    order.push('b-start')
+    await new Promise((r) => setTimeout(r, 5))
+    order.push('b-end')
+    return 'b'
+  })
+  const [r1, r2] = await Promise.all([p1, p2])
+  assert.equal(r1, 'a')
+  assert.equal(r2, 'b')
+  assert.deepEqual(order, ['a-start', 'a-end', 'b-start', 'b-end'], '闸门应串行互斥：a 完整结束后 b 才开始')
+})
+
+test('T4：withGate 真正的嵌套调用（fn 里再调 withGate）仍抛错防死锁', async (t) => {
+  const root = await tempRoot(t)
+  const journal = new Journal({ root, deviceId: 'devA', durable: false, clock: () => DAY })
+  await journal.open()
+
+  await assert.rejects(
+    journal.withGate(async () => journal.withGate(async () => 'inner')),
+    /不允许嵌套调用/,
+  )
+})
