@@ -1327,7 +1327,9 @@ function readPersona(deps: MemoriesApiDeps, url: URL): PersonaDoc {
   return {
     agentId,
     workspaceId: deps.workspaceId,
-    name: row.name || agentId,
+    // T7-2：读侧如实返回。空串是合法值（历史脏数据/其他写入路径），不能悄悄回退成
+    // agentId，否则用户会误以为名字还在——写侧（V62-14）已保证缺 name 不抹回。
+    name: row.name ?? agentId,
     age: row.age,
     traits: parseTraits(row.traits),
     baselineHash: row.baseline_hash,

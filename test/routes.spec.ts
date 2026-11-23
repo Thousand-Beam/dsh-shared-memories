@@ -900,3 +900,21 @@ test('T7-1：POST /identity personaId 脏值 400（补 personaId 校验）', asy
   assert.equal(dirty.status, 400)
   assert.equal(dirty.body.error?.code, 'invalid-persona-id')
 })
+
+test('T7-2：GET /persona 空名如实返回空串，不回退成 agentId', async (t) => {
+  const h = await makeHarness(t)
+  if (!h) return
+
+  // 直接写一个空名行（模拟历史脏数据/其他写入路径），读侧不该悄悄把空名回退成 agentId，
+  // 否则用户会误以为名字还在（V62-14 只修了写侧「缺 name 不抹回」，读侧 || 回退是另一处）。
+  h.db.run(
+    `INSERT INTO persona_state (agent_id, workspace_id, name, age, traits, baseline_hash, updated_at)
+     VALUES (?,?,?,?,?,?,?)
+     ON CONFLICT(agent_id, workspace_id) DO UPDATE SET name = excluded.name`,
+    ['empty-name', WORKSPACE, '', 10, '{}', '', Date.now()],
+  )
+
+  const got = await call<PersonaDoc>(h.base, '/persona?agentId=empty-name')
+  assert.equal(got.status, 200)
+  assert.equal(got.body.data?.name, '', '空名必须如实返回空串，不能回退成 agentId')
+})
