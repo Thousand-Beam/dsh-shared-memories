@@ -996,6 +996,7 @@ export class RestoreEngine {
       db: this.#db,
       root: this.#root,
       onWarn: this.#onWarn,
+      capturedAt: verified.createdAt,
     })
     if (personas.agents > 0) {
       this.#onWarn(`人格回灌：${personas.agents} 个 Agent / ${personas.personas} 条工作区人格`)
@@ -1078,9 +1079,22 @@ export class RestoreEngine {
     const stats = applier.apply(records)
 
     // 人格/技能/画像/身份也回灌一遍：别的设备可能在这段时间改过它们。
-    await rehydratePersonaFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    // 回灌的时间守卫必须用"快照自己的时刻"，不能用现在：上一行刚把 journal 全量重放完，
+    // 本地行可能已经比快照新，用 now 当守卫会让旧快照把新数据打回去（守卫恒真）。
+    const snapshotAt = await this.#latestSnapshotCreatedAt()
+    await rehydratePersonaFromRepo({
+      db: this.#db,
+      root: this.#root,
+      onWarn: this.#onWarn,
+      capturedAt: snapshotAt,
+    })
     await rehydrateSkillsFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
-    await rehydrateUserProfilesFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    await rehydrateUserProfilesFromRepo({
+      db: this.#db,
+      root: this.#root,
+      onWarn: this.#onWarn,
+      capturedAt: snapshotAt,
+    })
     await rehydratePersonaIdentitiesFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
     // 关键：pull 回远端记录后必须 realignClock 对齐 lc 水位（open() 在已加载时直接
     // return，不会重对齐）。否则本设备接下来写的新事件 lc 低于远端，readMerged 排序时
@@ -1365,6 +1379,24 @@ export class RestoreEngine {
       const ids = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort()
       return ids.at(-1)
     } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 最新快照的捕获时刻。运行期 sync 用它做回灌守卫——只读 manifest，不算逐文件
+   * sha256（那是校验路径的事，每个 sync 周期跑一遍太贵）。
+   */
+  async #latestSnapshotCreatedAt(): Promise<number | undefined> {
+    try {
+      const snapshotId = await this.#latestSnapshotId()
+      if (!snapshotId) return undefined
+      const manifest = await readManifest(this.#root, snapshotId)
+      return manifest.createdAt
+    } catch (error) {
+      // 读不到就让调用方退回本机时钟：宁可这次守卫偏松，也不要因为读 manifest
+      // 失败把整个 sync 打成异常。
+      this.#onWarn(`读取快照捕获时刻失败（回灌按本机时钟判断，可能偏松）：${describe(error)}`)
       return undefined
     }
   }

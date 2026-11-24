@@ -55,10 +55,18 @@ export async function rehydratePersonaFromRepo(options: {
   db: SqlDriver
   root: string
   clock?: () => number
+  /**
+   * 快照捕获时刻（manifest.createdAt）。人格文件本身不带 updatedAt
+   * （collectAgents 只物化 name/age/traits/baselineHash），所以回灌时
+   * 必须由调用方给出"这份文件代表哪一刻"，否则只能退回本机时钟——
+   * 那样 WHERE 守卫恒真，旧快照每次 sync 都会把刚重放出来的新人格打回去。
+   */
+  capturedAt?: number
   onWarn?: (message: string) => void
 }): Promise<RehydrateResult> {
   const onWarn = options.onWarn ?? (() => {})
   const now = options.clock?.() ?? Date.now()
+  const fallbackAt = options.capturedAt ?? now
 
   // 多设备格式：state/<deviceId>/agents.json 每台设备一份，按 agentId LWW 合并；
   // 老单文件格式：state/agents.json（readStateFiles 兜底读）。
@@ -102,7 +110,7 @@ export async function rehydratePersonaFromRepo(options: {
              baseline_hash = excluded.baseline_hash,
              updated_at = MAX(persona_state.updated_at, excluded.updated_at)
            WHERE excluded.updated_at >= persona_state.updated_at`,
-          [agentId, workspaceId, name, age, traits, baselineHash, num(persona?.updatedAt) ?? now],
+          [agentId, workspaceId, name, age, traits, baselineHash, num(persona?.updatedAt) ?? fallbackAt],
         )
         personas++
       } catch (error) {
