@@ -1009,6 +1009,7 @@ export class RestoreEngine {
       db: this.#db,
       root: this.#root,
       onWarn: this.#onWarn,
+      capturedAt: verified.createdAt,
     })
     if (skills.present) {
       this.#onWarn(`技能回灌：${skills.agents} 个 Agent / ${skills.bindings} 条绑定`)
@@ -1033,6 +1034,7 @@ export class RestoreEngine {
       db: this.#db,
       root: this.#root,
       onWarn: this.#onWarn,
+      capturedAt: verified.createdAt,
     })
     if (identities.present) {
       this.#onWarn(`身份绑定回灌：${identities.identities} 个会话`)
@@ -1088,14 +1090,24 @@ export class RestoreEngine {
       onWarn: this.#onWarn,
       capturedAt: snapshotAt,
     })
-    await rehydrateSkillsFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    await rehydrateSkillsFromRepo({
+      db: this.#db,
+      root: this.#root,
+      onWarn: this.#onWarn,
+      capturedAt: snapshotAt,
+    })
     await rehydrateUserProfilesFromRepo({
       db: this.#db,
       root: this.#root,
       onWarn: this.#onWarn,
       capturedAt: snapshotAt,
     })
-    await rehydratePersonaIdentitiesFromRepo({ db: this.#db, root: this.#root, onWarn: this.#onWarn })
+    await rehydratePersonaIdentitiesFromRepo({
+      db: this.#db,
+      root: this.#root,
+      onWarn: this.#onWarn,
+      capturedAt: snapshotAt,
+    })
     // 关键：pull 回远端记录后必须 realignClock 对齐 lc 水位（open() 在已加载时直接
     // return，不会重对齐）。否则本设备接下来写的新事件 lc 低于远端，readMerged 排序时
     // 被排到远端之前 → 跨设备乱序/复活。

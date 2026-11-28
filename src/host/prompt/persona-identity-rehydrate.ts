@@ -37,6 +37,11 @@ export async function rehydratePersonaIdentitiesFromRepo(options: {
   readonly db: SqlDriver
   readonly root: string
   readonly clock?: () => number
+  /**
+   * 这份快照代表哪一刻（manifest.createdAt）。回灌发生在 journal 全量重放之后，
+   * 若用它当守卫基准，"本机刚重放出来的绑定"就会输给旧快照；所以调用方必须传。
+   */
+  readonly capturedAt?: number
   readonly onWarn?: (message: string) => void
 }): Promise<PersonaIdentityRehydrateResult> {
   const warn = options.onWarn ?? (() => {})
@@ -62,6 +67,9 @@ export async function rehydratePersonaIdentitiesFromRepo(options: {
 
   const store = new PersonaIdentityStore({ db: options.db, clock: options.clock })
   const now = options.clock?.() ?? Date.now()
+  // 缺省退回本机时钟 = 修复前行为（老调用点语义不变），但带了 capturedAt 就必须用它：
+  // 文件里没写时间时，用"现在"会让守卫恒真，旧快照重新绑回旧人格（第五次同构缺陷）。
+  const fallbackAt = options.capturedAt ?? now
   let identities = 0
   let failed = 0
   for (const item of merged.values()) {
@@ -72,7 +80,7 @@ export async function rehydratePersonaIdentitiesFromRepo(options: {
       failed++
       continue
     }
-    const boundAt = typeof item.boundAt === 'number' && Number.isFinite(item.boundAt) ? item.boundAt : now
+    const boundAt = typeof item.boundAt === 'number' && Number.isFinite(item.boundAt) ? item.boundAt : fallbackAt
     const lastSeenAt =
       typeof item.lastSeenAt === 'number' && Number.isFinite(item.lastSeenAt) ? item.lastSeenAt : boundAt
     const identity: PersonaIdentity = { agentId, workspaceId, personaId, boundAt, lastSeenAt }

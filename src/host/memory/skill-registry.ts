@@ -138,15 +138,30 @@ export class SkillRegistry {
    *
    * 语义是"对齐"而不是"追加"：清单里没有的技能会被删掉 —— 因为快照代表的是
    * 那一刻的**完整状态**，如果只做并集，用户删过的技能会在每次恢复时复活。
+   *
+   * 但"对齐"必须带时间守卫，否则旧快照会把用户刚改的开关打回去：本机有任何一行
+   * 比 `capturedAt` 新，就整条不动（静默，这不是错误，是"这份快照过时了"）。
+   * 写入行的 updated_at 用 `capturedAt` 而不是现在 —— 否则每次回灌都把技能状态
+   * 盖上一个"刚刚改过"的新时间戳，下一次守卫就再也判不准了。
    */
-  async replaceAll(scope: Scope, bindings: readonly SkillBindInput[], by: SkillGrantSource = 'snapshot'): Promise<number> {
+  async replaceAll(
+    scope: Scope,
+    bindings: readonly SkillBindInput[],
+    by: SkillGrantSource = 'snapshot',
+    capturedAt?: number,
+  ): Promise<number> {
     assertScope(scope, 'SkillRegistry.replaceAll')
     const desired = normalizeBindings(bindings)
     const existing = readSkillBindings(this.#db, scope)
+    const at = capturedAt ?? this.#clock()
+    if (existing.length > 0) {
+      const newestLocal = Math.max(...existing.map((binding) => binding.updatedAt ?? 0))
+      if (newestLocal > at) return 0
+    }
     const desiredIds = new Set(desired.map((binding) => binding.skillId))
     let written = 0
     for (const binding of desired) {
-      this.#writeRow(scope, { ...binding, grantedBy: by, updatedAt: this.#clock() })
+      this.#writeRow(scope, { ...binding, grantedBy: by, updatedAt: at })
       written++
     }
     for (const stale of existing) {

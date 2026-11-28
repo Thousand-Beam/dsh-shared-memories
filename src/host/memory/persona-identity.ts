@@ -182,7 +182,15 @@ export class PersonaIdentityStore {
     return personaId
   }
 
-  /** 恢复时用：直接落库，**不写 journal**（重放自己不能再产生新事件）。 */
+  /**
+   * 恢复时用：直接落库，**不写 journal**（重放自己不能再产生新事件）。
+   *
+   * `persona_id` 是"这个会话归哪个人格"的绑定点，被旧快照改掉之后，用户看到的是
+   * "换了人格、模型却继续用旧人格的记忆回答"，而且没有报错。所以内容列必须有守卫：
+   * 以 `last_seen_at` 为准（它同时也是被 MAX 保护的列），旧快照整条 UPDATE 不执行。
+   *
+   * 守卫拒绝是静默的，这是有意为之——它不是错误，是"这份快照过时了"的正常结论。
+   */
   replace(identity: PersonaIdentity): void {
     this.#db.run(
       `INSERT INTO persona_identity (agent_id, workspace_id, persona_id, bound_at, last_seen_at)
@@ -190,7 +198,8 @@ export class PersonaIdentityStore {
        ON CONFLICT(agent_id) DO UPDATE SET
          workspace_id = excluded.workspace_id,
          persona_id = excluded.persona_id,
-         last_seen_at = MAX(persona_identity.last_seen_at, excluded.last_seen_at)`,
+         last_seen_at = MAX(persona_identity.last_seen_at, excluded.last_seen_at)
+       WHERE excluded.last_seen_at >= persona_identity.last_seen_at`,
       [identity.agentId, identity.workspaceId, identity.personaId, identity.boundAt, identity.lastSeenAt],
     )
   }

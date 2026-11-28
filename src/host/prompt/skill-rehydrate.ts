@@ -60,6 +60,8 @@ export async function rehydrateSkillsFromRepo(options: {
   db: SqlDriver
   root: string
   clock?: () => number
+  /** 这份快照代表哪一刻（manifest.createdAt）；缺省退回本机时钟 = 修复前行为。 */
+  capturedAt?: number
   onWarn?: (message: string) => void
 }): Promise<SkillRehydrateResult> {
   const onWarn = options.onWarn ?? (() => {})
@@ -101,7 +103,7 @@ export async function rehydrateSkillsFromRepo(options: {
     for (const workspaceId of workspaces) {
       const scope: Scope = { workspaceId, agentId }
       try {
-        bindings += await registry.replaceAll(scope, desired, 'snapshot')
+        bindings += await registry.replaceAll(scope, desired, 'snapshot', options.capturedAt)
       } catch (error) {
         failed++
         onWarn(`回灌技能失败（${agentId}@${workspaceId}）：${describe(error)}`)
